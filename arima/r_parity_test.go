@@ -28,8 +28,9 @@ func approxEq(got, want, atol, rtol float64) bool {
 //	logLik ≈  244.70
 //	AIC    ≈ -483.40
 //
-// We allow 1e-3 tolerance — well within R's documented precision and
-// reproducible across BFGS / Nelder-Mead optimizers.
+// Two assertions: the simple-differencing path matches statsmodels with
+// simple_differencing=True (which we already verified to 6 digits) and
+// the NonSimpleDifferencing path matches R's stats::arima exactly.
 func TestRParityAirlineLog(t *testing.T) {
 	ap := datasets.LoadAirPassengers()
 	logAp := make([]float64, len(ap))
@@ -62,6 +63,26 @@ func TestRParityAirlineLog(t *testing.T) {
 	}
 	if !approxEq(m.AIC(), -483.3930, 0.1, 0) {
 		t.Errorf("AIC = %v want -483.3930", m.AIC())
+	}
+
+	// NonSimpleDifferencing: should also reach R's optimum and reproduce
+	// R's reported logL (244.6965) within 0.005.
+	m2 := NewARIMA(Order{P: 0, D: 1, Q: 1})
+	m2.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+	m2.NonSimpleDifferencing = true
+	m2.MaxIter = 200
+	if err := m2.Fit(logAp, nil); err != nil {
+		t.Fatal(err)
+	}
+	if !approxEq(m2.LogLikelihood(), 244.6965, 0.005, 0) {
+		t.Errorf("NonSimple airline logL = %v want 244.6965 (R)", m2.LogLikelihood())
+	}
+	p2 := m2.Params()
+	if !approxEq(p2[0], -0.4018, 1e-3, 0) {
+		t.Errorf("NonSimple ma1 = %v want -0.4018", p2[0])
+	}
+	if !approxEq(p2[1], -0.5570, 1e-3, 0) {
+		t.Errorf("NonSimple sma1 = %v want -0.5570", p2[1])
 	}
 }
 

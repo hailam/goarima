@@ -77,6 +77,12 @@ func expandSMA(theta, Theta []float64, m int) []float64 {
 	return out
 }
 
+// PublicKalmanLL exposes kalmanARMALikelihood for cross-implementation parity
+// checks. Returns (negLogLik, sigma2_concentrated, innovations).
+func PublicKalmanLL(y, phi, theta []float64) (float64, float64, []float64) {
+	return kalmanARMALikelihood(y, phi, theta)
+}
+
 // armaCSS evaluates the Conditional Sum of Squares for an ARMA(p,q) model
 // over a (centered) series y. Returns negLogLik (proportional to log SSE) and
 // the estimated sigma^2.

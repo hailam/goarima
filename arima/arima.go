@@ -55,6 +55,19 @@ type ARIMA struct {
 	Lambda  *float64
 	Lambda2 float64 // additive shift before transform; ignored if Lambda is nil
 
+	// NonSimpleDifferencing fits via the integrated state-space form (R's
+	// `stats::arima` and statsmodels SARIMAX with simple_differencing=False).
+	// Default false → simple differencing (pre-difference y, fit ARMA),
+	// which matches statsmodels SARIMAX(simple_differencing=True) to
+	// numerical precision.
+	//
+	// EXPERIMENTAL: the non-simple integrated-state-space implementation
+	// uses a diffuse approximation that matches R exactly for pure-MA
+	// + differencing models (e.g. the canonical airline model) but can
+	// land on a different local optimum than R for AR-with-differencing
+	// models. For exact R parity in those cases, use simple differencing.
+	NonSimpleDifferencing bool
+
 	// Fitted state
 	phi   []float64 // non-seasonal AR
 	theta []float64 // non-seasonal MA
@@ -193,17 +206,49 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		return nil
 	}
 
-	// Initial guess: zeros for AR/MA + intercept; OLS for beta.
+	// Initial guess: Hannan-Rissanen for AR/MA, OLS for beta, zeros for the
+	// rest. HR yields ARMA params close to the MLE so the optimizer is much
+	// more likely to land at the same local maximum that R's `stats::arima`
+	// finds (which itself uses HR-style initial values via the CSS warm-up).
 	x0 := make([]float64, nFree)
-	if k > 0 {
-		// Warm-start beta via OLS on the differenced series. This is far
-		// closer to optimal than zero and dramatically improves convergence.
-		betaInit, err := olsFit(wX, ws, false)
-		if err == nil {
-			off := p + q + P + Q
-			if m.WithIntercept {
-				off++
+	{
+		// Build a "clean" residual series for HR: subtract intercept (zero
+		// initial guess) and OLS-projected exog before running HR on the
+		// differenced data.
+		resid := make([]float64, len(ws))
+		copy(resid, ws)
+		var betaInit []float64
+		if k > 0 {
+			if b, err := olsFit(wX, ws, false); err == nil {
+				betaInit = b
+				for i := range resid {
+					for j := 0; j < k; j++ {
+						resid[i] -= betaInit[j] * wX[i][j]
+					}
+				}
 			}
+		}
+		// Hannan-Rissanen on the non-seasonal AR/MA structure.
+		phiHR, thetaHR := hannanRissanen(resid, p, q)
+		// Convert to the unconstrained (transform-input) parameter space.
+		off := 0
+		if p > 0 && phiHR != nil {
+			raw := invertARTransform(phiHR)
+			copy(x0[off:off+p], raw)
+		}
+		off += p
+		if q > 0 && thetaHR != nil {
+			raw := invertMATransform(thetaHR)
+			copy(x0[off:off+q], raw)
+		}
+		off += q
+		// Seasonal AR/MA stay zero — pure-seasonal HR is rarely a big win and
+		// adds complexity. The CSS warm-up step further refines them.
+		off += P + Q
+		if m.WithIntercept {
+			off++
+		}
+		if k > 0 && betaInit != nil {
 			copy(x0[off:off+k], betaInit)
 		}
 	}
@@ -225,8 +270,50 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		return out
 	}
 
+	// For non-simple differencing the objective uses the full integrated
+	// state-space form on the un-differenced y (minus intercept and exog).
+	// We need the un-differenced data inside this closure; build it now.
+	yUndiff := append([]float64{}, m.yTrain...)
+	if m.Lambda != nil {
+		// Apply the same Box-Cox transform that yEff applied above.
+		t, err2 := boxCoxApply(yUndiff, *m.Lambda, m.Lambda2)
+		if err2 == nil {
+			yUndiff = t
+		}
+	}
+	xUndiff := m.xTrain
+
+	residOfFull := func(params []float64) []float64 {
+		_, _, _, _, c, beta := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
+		out := make([]float64, len(yUndiff))
+		for i, v := range yUndiff {
+			rr := v - c
+			if k > 0 {
+				for j := 0; j < k; j++ {
+					rr -= beta[j] * xUndiff[i][j]
+				}
+			}
+			out[i] = rr
+		}
+		return out
+	}
+
 	objective := func(params []float64) float64 {
 		phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
+		if m.NonSimpleDifferencing {
+			Dord := 0
+			mPer := 0
+			if m.Seasonal.Active() {
+				Dord = m.Seasonal.D
+				mPer = m.Seasonal.M
+			}
+			ll, _, _ := kalmanARIMAFull(residOfFull(params), m.Order.D, mPer, Dord,
+				phi, theta, sPhi, sTheta, 1e6)
+			if math.IsNaN(ll) || math.IsInf(ll, 0) {
+				return math.Inf(1)
+			}
+			return ll
+		}
 		fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
 		fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
 		r := residOf(params)
@@ -266,7 +353,21 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
 	fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
 	r := residOf(best)
-	negLL, sigma2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
+	var negLL, sigma2 float64
+	if m.NonSimpleDifferencing {
+		Dord := 0
+		mPer := 0
+		if m.Seasonal.Active() {
+			Dord = m.Seasonal.D
+			mPer = m.Seasonal.M
+		}
+		ll, s2, _ := kalmanARIMAFull(residOfFull(best), m.Order.D, mPer, Dord,
+			phi, theta, sPhi, sTheta, 1e6)
+		negLL, sigma2 = ll, s2
+	} else {
+		ll, s2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
+		negLL, sigma2 = ll, s2
+	}
 	if math.IsNaN(negLL) || math.IsInf(negLL, 0) {
 		_, sigma2, _ = armaCSS(r, fullPhi, fullTheta)
 		negLL = float64(len(r)) / 2 * math.Log(sigma2)
