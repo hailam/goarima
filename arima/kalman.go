@@ -1,10 +1,6 @@
 package arima
 
-import (
-	"math"
-
-	"gonum.org/v1/gonum/mat"
-)
+import "math"
 
 // expandSARMA combines (1 - phi B)(1 - Phi B^m) → AR polynomial of total order p + P*m.
 // Returns AR coefficients indexed 1..p+P*m (no intercept term).
@@ -155,21 +151,18 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		return float64(n) / 2 * (math.Log(2*math.Pi*s2) + 1), s2, nil
 	}
 
-	// T (companion form): T[i,0] = phi[i] for i<p; T[i,i+1] = 1 for i+1<r.
-	// At most p + (r-1) ≤ 2r-1 nonzero entries. Build a sparse list to skip
-	// the dense matmuls in the predict step.
-	Trow := make([]float64, r*r) // dense form (used only for stationaryCov bootstrap)
+	// T (companion form) as sparse triples: T[i,0] = phi[i] for i<p,
+	// T[i,i+1] = 1 for i+1<r. At most p + (r-1) ≤ 2r-1 nonzero entries.
 	nzT := make([]tNZ, 0, 2*r)
 	for i := 0; i < r; i++ {
 		if i < p && phi[i] != 0 {
-			Trow[i*r] = phi[i]
 			nzT = append(nzT, tNZ{i, 0, phi[i]})
 		}
 		if i+1 < r {
-			Trow[i*r+i+1] = 1
 			nzT = append(nzT, tNZ{i, i + 1, 1})
 		}
 	}
+	// R selection: (1, theta_1, ..., theta_{r-1}, 0...). Build RR' once.
 	Rvec := make([]float64, r)
 	Rvec[0] = 1
 	for j := 0; j < q; j++ {
@@ -189,20 +182,15 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		}
 	}
 
-	// Stationary initial covariance via gonum mat (rare allocation, only once).
-	Tmat := mat.NewDense(r, r, Trow)
-	RRtMat := mat.NewDense(r, r, RRt)
-	P0, ok := stationaryCov(Tmat, RRtMat, r)
+	// Initial stationary covariance via Gardner-Harvey-Phillips O(r³) algorithm.
+	// (Replaces the previous O(r⁶) Sylvester-style dense solve. For r=14 this
+	// is ~2700× fewer flops per kalman call.)
+	P0 := stationaryCovGardner(phi, theta)
 	P := make([]float64, r*r)
-	if ok {
-		for i := 0; i < r; i++ {
-			for j := 0; j < r; j++ {
-				P[i*r+j] = P0.At(i, j)
-			}
-		}
-	} else {
-		for i := 0; i < r; i++ {
-			P[i*r+i] = 1e6
+	pr, _ := P0.Dims()
+	for i := 0; i < pr; i++ {
+		for j := 0; j < pr; j++ {
+			P[i*r+j] = P0.At(i, j)
 		}
 	}
 
@@ -285,38 +273,3 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 	return negLL, s2, innov
 }
 
-// stationaryCov solves (I - T⊗T) vec(P) = vec(Q) → P.
-// Returns ok=false if singular.
-func stationaryCov(T, Q *mat.Dense, r int) (*mat.Dense, bool) {
-	n := r * r
-	A := mat.NewDense(n, n, nil)
-	for i := 0; i < r; i++ {
-		for j := 0; j < r; j++ {
-			row := i*r + j
-			A.Set(row, row, 1)
-			for k := 0; k < r; k++ {
-				for l := 0; l < r; l++ {
-					col := k*r + l
-					A.Set(row, col, A.At(row, col)-T.At(i, k)*T.At(j, l))
-				}
-			}
-		}
-	}
-	q := mat.NewVecDense(n, nil)
-	for i := 0; i < r; i++ {
-		for j := 0; j < r; j++ {
-			q.SetVec(i*r+j, Q.At(i, j))
-		}
-	}
-	var p mat.VecDense
-	if err := p.SolveVec(A, q); err != nil {
-		return nil, false
-	}
-	out := mat.NewDense(r, r, nil)
-	for i := 0; i < r; i++ {
-		for j := 0; j < r; j++ {
-			out.Set(i, j, p.AtVec(i*r+j))
-		}
-	}
-	return out, true
-}
