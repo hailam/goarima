@@ -22,6 +22,22 @@ const (
 	HQIC
 )
 
+// DiffuseConv tags which reference implementation the user wants to match.
+// Today both modes use the same likelihood form — `n_effective = n_std`,
+// observations during the diffuse phase are excluded — because both R's
+// stats::arima and statsmodels SARIMAX agree on that. The flag is kept
+// for forward-compat; differences between R and statsmodels for AR+seasonal-
+// differencing models stem from internal state-space implementation details
+// that do not change the likelihood formula.
+type DiffuseConv int
+
+const (
+	// DiffuseR matches R's stats::arima.
+	DiffuseR DiffuseConv = iota
+	// DiffuseStatsmodels matches statsmodels SARIMAX(simple_differencing=False).
+	DiffuseStatsmodels
+)
+
 // Method selects the fitting estimator.
 type Method int
 
@@ -56,22 +72,19 @@ type ARIMA struct {
 	Lambda2 float64 // additive shift before transform; ignored if Lambda is nil
 
 	// NonSimpleDifferencing fits via the integrated state-space form (R's
-	// `stats::arima` and statsmodels SARIMAX with simple_differencing=False).
-	// Default false → simple differencing (pre-difference y, fit ARMA),
-	// which matches statsmodels SARIMAX(simple_differencing=True) to
-	// numerical precision.
+	// `stats::arima` and statsmodels SARIMAX). Default false → simple
+	// differencing (pre-difference y, fit ARMA), which matches statsmodels
+	// SARIMAX(simple_differencing=True) exactly.
 	//
-	// EXPERIMENTAL: the implementation uses R's gain-threshold diffuse
-	// approximation (kappa=1e6, skip likelihood when prediction-variance
-	// gain >= 1e4). This matches R exactly for:
-	//   - pure non-seasonal ARIMA(p,d,q) models (e.g. AirPassengers (2,1,1))
-	//   - pure-MA seasonal models (e.g. canonical airline log)
-	// For AR + seasonal-differencing models on high-magnitude data
-	// (e.g. wineind), the optimizer may converge to a different local
-	// optimum than R because kappa-leakage interacts with the data scale.
-	// The exact Koopman-Durbin diffuse Kalman filter would close that gap;
-	// it is left as future work.
+	// When true, we use the exact diffuse Kalman filter of Durbin-Koopman
+	// (2003) with R's Gardner-Harvey-Phillips stationary covariance (getQ0).
+	// The likelihood convention is selectable via DiffuseConvention.
 	NonSimpleDifferencing bool
+
+	// DiffuseConvention selects the likelihood treatment of the diffuse
+	// (initial integrated-state) phase. Only matters when NonSimpleDifferencing
+	// is true.
+	DiffuseConvention DiffuseConv
 
 	// Fitted state
 	phi   []float64 // non-seasonal AR
@@ -312,8 +325,8 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 				Dord = m.Seasonal.D
 				mPer = m.Seasonal.M
 			}
-			ll, _, _ := kalmanARIMAFull(residOfFull(params), m.Order.D, mPer, Dord,
-				phi, theta, sPhi, sTheta, 1e6)
+			ll, _, _ := kalmanARIMAFullConv(residOfFull(params), m.Order.D, mPer, Dord,
+				phi, theta, sPhi, sTheta, 1e6, m.DiffuseConvention)
 			if math.IsNaN(ll) || math.IsInf(ll, 0) {
 				return math.Inf(1)
 			}
@@ -366,8 +379,8 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			Dord = m.Seasonal.D
 			mPer = m.Seasonal.M
 		}
-		ll, s2, _ := kalmanARIMAFull(residOfFull(best), m.Order.D, mPer, Dord,
-			phi, theta, sPhi, sTheta, 1e6)
+		ll, s2, _ := kalmanARIMAFullConv(residOfFull(best), m.Order.D, mPer, Dord,
+			phi, theta, sPhi, sTheta, 1e6, m.DiffuseConvention)
 		negLL, sigma2 = ll, s2
 	} else {
 		ll, s2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"runtime"
+	"sync"
 
 	"github.com/hailam/goarima/metrics"
 )
@@ -74,6 +76,11 @@ type AutoArimaOpts struct {
 
 	// MaxSteps caps the number of stepwise iterations (0 → 50).
 	MaxSteps int
+
+	// NJobs sets the goroutine concurrency for FullSearch mode. 0 → GOMAXPROCS.
+	// Mirrors pmdarima's `n_jobs`. R/Python require pickling+IPC for parallel
+	// auto.arima, but Go's goroutines are essentially free.
+	NJobs int
 }
 
 // AutoArima runs model selection over ARIMA(p,d,q)(P,D,Q,m).
@@ -333,20 +340,101 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 			rng.Shuffle(len(combos), func(i, j int) { combos[i], combos[j] = combos[j], combos[i] })
 			combos = combos[:opts.NFits]
 		}
+
+		// Build a per-candidate fit function that doesn't share the order
+		// cache (each goroutine fits independently). After fits complete,
+		// we merge results.
+		nJobs := opts.NJobs
+		if nJobs <= 0 {
+			nJobs = runtime.GOMAXPROCS(0)
+		}
+		if nJobs > len(combos) {
+			nJobs = len(combos)
+		}
+		if nJobs < 1 {
+			nJobs = 1
+		}
+
+		type result struct {
+			key   orderKey
+			model *ARIMA
+			score float64
+			err   error
+		}
+		jobs := make(chan orderKey, len(combos))
+		results := make(chan result, len(combos))
+		var wg sync.WaitGroup
+
+		// Independent per-fit fn (no shared cache → no contention).
+		independentFit := func(k orderKey) (*ARIMA, float64, error) {
+			if k.p+k.q+k.P+k.Q > opts.MaxOrder {
+				return nil, 0, fmt.Errorf("exceeds max_order sum")
+			}
+			ord := Order{P: k.p, D: d, Q: k.q}
+			var ssn SeasonalOrder
+			if opts.M > 1 && (k.P+k.Q+D > 0) {
+				ssn = SeasonalOrder{P: k.P, D: D, Q: k.Q, M: opts.M}
+			}
+			mdl := &ARIMA{
+				Order:         ord,
+				Seasonal:      ssn,
+				WithIntercept: withIntercept,
+				Method:        MethodCSSML,
+				MaxIter:       opts.MaxIter,
+			}
+			if err := mdl.Fit(yFit, xFit); err != nil {
+				return nil, 0, err
+			}
+			var score float64
+			if opts.OutOfSampleSize > 0 {
+				fc, _, _, perr := mdl.Predict(opts.OutOfSampleSize, 0, xHoldout)
+				if perr != nil {
+					return nil, 0, perr
+				}
+				s, serr := scoring(yHoldout, fc)
+				if serr != nil {
+					return nil, 0, serr
+				}
+				score = s
+			} else {
+				score = mdl.IC(opts.IC)
+			}
+			return mdl, score, nil
+		}
+
+		for w := 0; w < nJobs; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for k := range jobs {
+					mdl, score, err := independentFit(k)
+					results <- result{key: k, model: mdl, score: score, err: err}
+				}
+			}()
+		}
+		for _, c := range combos {
+			jobs <- c
+		}
+		close(jobs)
+		go func() { wg.Wait(); close(results) }()
+
 		var best *ARIMA
 		bestScore := math.Inf(1)
 		var firstErr error
-		for _, c := range combos {
-			cand, score, err := tryOrder(c.p, c.q, c.P, c.Q)
-			if err != nil {
-				if e := handleErr(err); e != nil && firstErr == nil {
+		for r := range results {
+			if r.err != nil {
+				if e := handleErr(r.err); e != nil && firstErr == nil {
 					firstErr = e
 				}
+				emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : fit failed: %v",
+					r.key.p, d, r.key.q, r.key.P, D, r.key.Q, opts.M, r.err))
 				continue
 			}
-			if score < bestScore {
-				bestScore = score
-				best = cand
+			emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : score=%.4f",
+				r.key.p, d, r.key.q, r.key.P, D, r.key.Q, opts.M, r.score))
+			if r.score < bestScore {
+				bestScore = r.score
+				best = r.model
 			}
 		}
 		if best == nil {

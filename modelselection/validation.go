@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 
 	"github.com/hailam/goarima/arima"
 	"github.com/hailam/goarima/metrics"
@@ -35,7 +37,9 @@ type ModelFactory func() *arima.ARIMA
 // CrossValScore runs the splitter, fits a fresh model per fold, scores each
 // fold's forecast vs the held-out portion, and returns per-fold scores.
 //
-// Mirrors pmdarima.model_selection.cross_val_score.
+// Mirrors pmdarima.model_selection.cross_val_score, but runs folds
+// concurrently via goroutines (R/Python need pickling for parallel CV;
+// Go's goroutines are essentially free).
 //
 //	y    = full series
 //	exog = optional exogenous matrix; pass nil if not used
@@ -43,6 +47,110 @@ type ModelFactory func() *arima.ARIMA
 //	mk   = model factory (builds a fresh ARIMA per fold)
 //	score = scoring function on (yTrue, yPred)
 func CrossValScore(y []float64, exog [][]float64, cv CrossValidator, mk ModelFactory, score Scorer) ([]float64, error) {
+	return CrossValScoreConcurrent(y, exog, cv, mk, score, 0)
+}
+
+// CrossValScoreConcurrent is like CrossValScore but with explicit concurrency.
+// nJobs <= 0 means GOMAXPROCS.
+func CrossValScoreConcurrent(y []float64, exog [][]float64, cv CrossValidator, mk ModelFactory, score Scorer, nJobs int) ([]float64, error) {
+	if cv == nil {
+		return nil, errors.New("cv must be non-nil")
+	}
+	if mk == nil {
+		return nil, errors.New("model factory must be non-nil")
+	}
+	if score == nil {
+		score = SMAPEScorer
+	}
+	if exog != nil && len(exog) != len(y) {
+		return nil, fmt.Errorf("exog rows (%d) != len(y) (%d)", len(exog), len(y))
+	}
+	splits, err := cv.Split(len(y))
+	if err != nil {
+		return nil, err
+	}
+	if len(splits) == 0 {
+		return nil, errors.New("cv produced no splits")
+	}
+	if nJobs <= 0 {
+		nJobs = runtime.GOMAXPROCS(0)
+	}
+	if nJobs > len(splits) {
+		nJobs = len(splits)
+	}
+	if nJobs < 1 {
+		nJobs = 1
+	}
+	out := make([]float64, len(splits))
+
+	type job struct {
+		idx int
+		s   Split
+	}
+	type res struct {
+		idx int
+		val float64
+		err error
+	}
+	jobs := make(chan job, len(splits))
+	results := make(chan res, len(splits))
+	var wg sync.WaitGroup
+	for w := 0; w < nJobs; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				yTrain := pickIdx(y, j.s.Train)
+				yTest := pickIdx(y, j.s.Test)
+				var xTrain, xTest [][]float64
+				if exog != nil {
+					xTrain = pickRows(exog, j.s.Train)
+					xTest = pickRows(exog, j.s.Test)
+				}
+				mdl := mk()
+				if mdl == nil {
+					results <- res{idx: j.idx, err: fmt.Errorf("fold %d: nil model", j.idx)}
+					continue
+				}
+				if e := mdl.Fit(yTrain, xTrain); e != nil {
+					results <- res{idx: j.idx, err: fmt.Errorf("fold %d fit: %w", j.idx, e)}
+					continue
+				}
+				fc, _, _, e := mdl.Predict(len(yTest), 0, xTest)
+				if e != nil {
+					results <- res{idx: j.idx, err: fmt.Errorf("fold %d predict: %w", j.idx, e)}
+					continue
+				}
+				sc, e := score(yTest, fc)
+				if e != nil {
+					results <- res{idx: j.idx, err: fmt.Errorf("fold %d score: %w", j.idx, e)}
+					continue
+				}
+				results <- res{idx: j.idx, val: sc}
+			}
+		}()
+	}
+	for i, s := range splits {
+		jobs <- job{idx: i, s: s}
+	}
+	close(jobs)
+	go func() { wg.Wait(); close(results) }()
+	var firstErr error
+	for r := range results {
+		if r.err != nil && firstErr == nil {
+			firstErr = r.err
+			continue
+		}
+		out[r.idx] = r.val
+	}
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	return out, nil
+}
+
+// CrossValScoreSequential keeps the legacy serial path for tests/reference.
+func CrossValScoreSequential(y []float64, exog [][]float64, cv CrossValidator, mk ModelFactory, score Scorer) ([]float64, error) {
 	if cv == nil {
 		return nil, errors.New("cv must be non-nil")
 	}

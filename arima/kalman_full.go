@@ -8,6 +8,17 @@ import (
 
 
 
+
+// kalmanARIMAFullConv runs the exact-diffuse Kalman filter with a selectable
+// likelihood convention.
+func kalmanARIMAFullConv(
+	y []float64, d, m, D int,
+	phi, theta, sPhi, sTheta []float64,
+	kappa float64, conv DiffuseConv,
+) (negLogLik, sigma2 float64, innovations []float64) {
+	return kalmanARIMAFullImpl(y, d, m, D, phi, theta, sPhi, sTheta, kappa, conv)
+}
+
 // kalmanARIMAFull computes the Gaussian log-likelihood for ARIMA(p,d,q)(P,D,Q,m)
 // using the full integrated state-space form (no pre-differencing).
 //
@@ -25,6 +36,14 @@ func kalmanARIMAFull(
 	y []float64, d, m, D int,
 	phi, theta, sPhi, sTheta []float64,
 	kappa float64,
+) (negLogLik, sigma2 float64, innovations []float64) {
+	return kalmanARIMAFullImpl(y, d, m, D, phi, theta, sPhi, sTheta, kappa, DiffuseR)
+}
+
+func kalmanARIMAFullImpl(
+	y []float64, d, m, D int,
+	phi, theta, sPhi, sTheta []float64,
+	kappa float64, conv DiffuseConv,
 ) (negLogLik, sigma2 float64, innovations []float64) {
 	if kappa == 0 {
 		kappa = 1e6
@@ -179,9 +198,12 @@ func kalmanARIMAFull(
 							invFinf*(Minf[i]*Mstar[j]+Mstar[i]*Minf[j]))
 				}
 			}
-			// R / stats::arima convention: diffuse-phase observations are
-			// excluded from the concentrated likelihood entirely. (DK 2003
-			// would include log(F_inf) here; for exact R parity we skip.)
+			// Both R's stats::arima and statsmodels SARIMAX use n_effective =
+			// n_std observations in the concentrated likelihood — diffuse-phase
+			// observations are excluded from logF and v²/F. The DiffuseConv
+			// flag is reserved for future variants that diverge here; today
+			// both conventions use the same likelihood form.
+			_ = conv
 		} else {
 			// === Standard step on P_* (no remaining diffuse rank) ===
 			diffuseDone = true
@@ -236,9 +258,11 @@ func kalmanARIMAFull(
 	if nu == 0 || sumVF <= 0 {
 		return math.Inf(1), 0, innov
 	}
-	// Standard concentrated-σ² Gaussian likelihood, R's stats::arima form.
+	// Standard concentrated-σ² Gaussian likelihood (R's stats::arima form;
+	// statsmodels SARIMAX uses the same formula via `nobs_effective = n_std`).
 	s2 := sumVF / float64(nu)
 	negLL := 0.5 * (float64(nu)*(math.Log(2*math.Pi*s2)+1) + logF)
+	_ = conv // both DiffuseR and DiffuseStatsmodels use this likelihood formula
 	return negLL, s2, innov
 }
 
