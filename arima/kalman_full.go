@@ -133,12 +133,12 @@ func kalmanARIMAFullImpl(
 	Pstar := make([]float64, rd2)
 	Pinf := make([]float64, rd2)
 	if r > 0 {
-		Pst := stationaryCovGardner(fullPhi, fullTheta)
-		pr, _ := Pst.Dims()
+		Pst, pr := stationaryCovGardner(fullPhi, fullTheta)
 		for i := 0; i < pr; i++ {
 			base := i * rd
+			src := i * pr
 			for j := 0; j < pr; j++ {
-				Pstar[base+j] = Pst.At(i, j)
+				Pstar[base+j] = Pst[src+j]
 			}
 		}
 	}

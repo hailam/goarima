@@ -184,15 +184,9 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 
 	// Initial stationary covariance via Gardner-Harvey-Phillips O(r³) algorithm.
 	// (Replaces the previous O(r⁶) Sylvester-style dense solve. For r=14 this
-	// is ~2700× fewer flops per kalman call.)
-	P0 := stationaryCovGardner(phi, theta)
-	P := make([]float64, r*r)
-	pr, _ := P0.Dims()
-	for i := 0; i < pr; i++ {
-		for j := 0; j < pr; j++ {
-			P[i*r+j] = P0.At(i, j)
-		}
-	}
+	// is ~2700× fewer flops per kalman call.) Output is already flat row-major
+	// of the correct size — alias it directly as P.
+	P, _ := stationaryCovGardner(phi, theta)
 
 	// Pre-allocated working buffers (reused every step).
 	a := make([]float64, r)

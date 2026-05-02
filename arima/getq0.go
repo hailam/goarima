@@ -1,17 +1,12 @@
 package arima
 
-import "gonum.org/v1/gonum/mat"
-
 // PublicGardner exposes Gardner's stationary cov for parity diagnostics.
 func PublicGardner(phi, theta []float64) [][]float64 {
-	m := stationaryCovGardner(phi, theta)
-	r, _ := m.Dims()
+	flat, r := stationaryCovGardner(phi, theta)
 	out := make([][]float64, r)
 	for i := 0; i < r; i++ {
 		row := make([]float64, r)
-		for j := 0; j < r; j++ {
-			row[j] = m.At(i, j)
-		}
+		copy(row, flat[i*r:(i+1)*r])
 		out[i] = row
 	}
 	return out
@@ -26,8 +21,9 @@ func PublicGardner(phi, theta []float64) [][]float64 {
 //
 // phi: non-seasonal AR coefficients (length p, fully expanded if seasonal)
 // theta: non-seasonal MA coefficients (length q, fully expanded if seasonal)
-// Returns an r×r mat.Dense where r = max(p, q+1).
-func stationaryCovGardner(phi, theta []float64) *mat.Dense {
+// Returns the flat row-major r×r covariance and r itself, where r = max(p, q+1).
+// The returned slice has length r*r; the caller can copy or alias as needed.
+func stationaryCovGardner(phi, theta []float64) ([]float64, int) {
 	p := len(phi)
 	q := len(theta)
 	r := p
@@ -35,7 +31,7 @@ func stationaryCovGardner(phi, theta []float64) *mat.Dense {
 		r = q + 1
 	}
 	if r == 0 {
-		return mat.NewDense(0, 0, nil)
+		return nil, 0
 	}
 	np := r * (r + 1) / 2
 	nrbar := np * (np - 1) / 2
@@ -75,8 +71,7 @@ func stationaryCovGardner(phi, theta []float64) *mat.Dense {
 		} else {
 			P[0] = 1 / (1 - phi[0]*phi[0])
 		}
-		out := mat.NewDense(1, 1, []float64{P[0]})
-		return out
+		return P, 1
 	}
 
 	if p > 0 {
@@ -224,15 +219,15 @@ func stationaryCovGardner(phi, theta []float64) *mat.Dense {
 		}
 	}
 
-	// Convert column-major P to a row-major mat.Dense.
-	out := mat.NewDense(r, r, nil)
+	// Convert column-major P to row-major and return flat.
+	out := make([]float64, r*r)
 	for i := 0; i < r; i++ {
 		for j := 0; j < r; j++ {
 			// P (column-major) at row i, col j: P[i + r*j]
-			out.Set(i, j, P[i+r*j])
+			out[i*r+j] = P[i+r*j]
 		}
 	}
-	return out
+	return out, r
 }
 
 // inclu2 is the Givens-rotation update used by stationaryCovGardner.

@@ -76,11 +76,11 @@ func kalmanSARIMAXAbs(
 	if kArma := rd - kStatesDiff; kArma > 0 {
 		fullPhi := expandSARMA(phi, sPhi, m)
 		fullTheta := expandSMA(theta, sTheta, m)
-		Pst := stationaryCovGardner(fullPhi, fullTheta)
-		pr, _ := Pst.Dims()
+		Pst, pr := stationaryCovGardner(fullPhi, fullTheta)
 		for i := 0; i < pr && kStatesDiff+i < rd; i++ {
+			src := i * pr
 			for j := 0; j < pr && kStatesDiff+j < rd; j++ {
-				P[(kStatesDiff+i)*rd+(kStatesDiff+j)] = sigma2 * Pst.At(i, j)
+				P[(kStatesDiff+i)*rd+(kStatesDiff+j)] = sigma2 * Pst[src+j]
 			}
 		}
 	}
@@ -223,11 +223,11 @@ func kalmanSARIMAX(
 	if kArma := rd - kStatesDiff; kArma > 0 {
 		fullPhi := expandSARMA(phi, sPhi, m)
 		fullTheta := expandSMA(theta, sTheta, m)
-		Pst := stationaryCovGardner(fullPhi, fullTheta)
-		pr, _ := Pst.Dims()
+		Pst, pr := stationaryCovGardner(fullPhi, fullTheta)
 		for i := 0; i < pr && kStatesDiff+i < rd; i++ {
+			src := i * pr
 			for j := 0; j < pr && kStatesDiff+j < rd; j++ {
-				P[(kStatesDiff+i)*rd+(kStatesDiff+j)] = Pst.At(i, j)
+				P[(kStatesDiff+i)*rd+(kStatesDiff+j)] = Pst[src+j]
 			}
 		}
 	}
