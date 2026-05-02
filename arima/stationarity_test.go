@@ -68,8 +68,16 @@ func matEq(a, b [][]float64) bool {
 }
 
 // Mirrors test_kpss for level and trend nulls.
+//
+// Pmdarima clips the p-value at the table extremes (rule=2), so a wrong stat
+// can still produce pval=0.01. We additionally check the underlying stat value
+// against pmdarima's own intermediate computation.
 func TestKPSS(t *testing.T) {
 	austres := datasets.LoadAustres()
+	wantStats := map[string]float64{
+		"level": 2.312205,
+		"trend": 0.538032,
+	}
 	for _, null := range []string{"level", "trend"} {
 		res, err := KPSSTest(austres, KPSSTestOpts{Alpha: 0.05, Null: null, LShort: true})
 		if err != nil {
@@ -80,6 +88,9 @@ func TestKPSS(t *testing.T) {
 		}
 		if math.Abs(res.PValue-0.01) > 1e-6 {
 			t.Errorf("%s austres pval = %v want 0.01", null, res.PValue)
+		}
+		if math.Abs(res.Stat-wantStats[null]) > 1e-4 {
+			t.Errorf("%s austres stat = %v want %v", null, res.Stat, wantStats[null])
 		}
 	}
 
@@ -132,7 +143,9 @@ func TestADFPValueSmall(t *testing.T) {
 }
 
 // Mirrors test_adf for austres on k=1, 2, default.
-// R-derived expected p-values: k=1 → 0.8488, k=2 → 0.7060, default ≈ 0.349.
+//
+// Expected p-values come from running pmdarima.ADFTest on the same input.
+// Tighter than R's published rounded values to catch silent numerical drift.
 func TestADFAustres(t *testing.T) {
 	austres := datasets.LoadAustres()
 	cases := []struct {
@@ -140,9 +153,8 @@ func TestADFAustres(t *testing.T) {
 		hasK   bool
 		expect float64
 	}{
-		{1, true, 0.8488036},
-		{2, true, 0.7060733},
-		{0, false, 0.3493465},
+		{1, true, 0.8488036035966902},
+		{2, true, 0.7060733181808536},
 	}
 	for _, c := range cases {
 		opts := ADFTestOpts{Alpha: 0.05, K: c.k, HasK: c.hasK}
@@ -150,12 +162,20 @@ func TestADFAustres(t *testing.T) {
 		if err != nil {
 			t.Fatalf("k=%d: %v", c.k, err)
 		}
-		if math.Abs(res.PValue-c.expect) > 0.005 {
-			t.Errorf("k=%d (hasK=%v): pval=%v want %v", c.k, c.hasK, res.PValue, c.expect)
+		if math.Abs(res.PValue-c.expect) > 1e-6 {
+			t.Errorf("k=%d: pval=%v want %v", c.k, res.PValue, c.expect)
 		}
 		if !res.ShouldDiff {
 			t.Errorf("k=%d should diff (pval > alpha)", c.k)
 		}
+	}
+	// Default k uses trunc((n-1)^(1/3)); should match R's published value too.
+	res, err := ADFTest(austres, ADFTestOpts{Alpha: 0.05})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.Abs(res.PValue-0.3493465) > 0.005 {
+		t.Errorf("default k: pval=%v want ≈0.3493", res.PValue)
 	}
 }
 
@@ -167,28 +187,27 @@ func TestADFCorner(t *testing.T) {
 }
 
 // Mirrors test_pp for austres in lshort=true and lshort=false.
+// Expected values come from pmdarima on the same input.
 func TestPPAustres(t *testing.T) {
 	austres := datasets.LoadAustres()
-	res, err := PPTest(austres, PPTestOpts{Alpha: 0.05, LShort: true})
-	if err != nil {
-		t.Fatal(err)
+	cases := []struct {
+		lshort bool
+		expect float64
+	}{
+		{true, 0.9786066224866204},
+		{false, 0.9514588685512652},
 	}
-	if !res.ShouldDiff {
-		t.Errorf("PP lshort=true should diff")
-	}
-	if math.Abs(res.PValue-0.9786066) > 1e-3 {
-		t.Errorf("PP lshort=true pval=%v want 0.9786", res.PValue)
-	}
-
-	res, err = PPTest(austres, PPTestOpts{Alpha: 0.05, LShort: false})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !res.ShouldDiff {
-		t.Errorf("PP lshort=false should diff")
-	}
-	if math.Abs(res.PValue-0.9514589) > 1e-3 {
-		t.Errorf("PP lshort=false pval=%v want 0.9515", res.PValue)
+	for _, c := range cases {
+		res, err := PPTest(austres, PPTestOpts{Alpha: 0.05, LShort: c.lshort})
+		if err != nil {
+			t.Fatalf("lshort=%v: %v", c.lshort, err)
+		}
+		if !res.ShouldDiff {
+			t.Errorf("lshort=%v should diff", c.lshort)
+		}
+		if math.Abs(res.PValue-c.expect) > 1e-6 {
+			t.Errorf("lshort=%v: pval=%v want %v", c.lshort, res.PValue, c.expect)
+		}
 	}
 }
 

@@ -81,6 +81,7 @@ var kpssTableP = []float64{0.01, 0.025, 0.05, 0.10}
 type KPSSResult struct {
 	PValue     float64
 	ShouldDiff bool
+	Stat       float64
 }
 
 // KPSSTestOpts groups the KPSS test parameters.
@@ -104,32 +105,42 @@ func KPSSTest(x []float64, opts KPSSTestOpts) (KPSSResult, error) {
 	n := len(x)
 	var t [][]float64
 	var table []float64
+	addIntercept := false
 	switch opts.Null {
 	case "level":
+		// x ~ 1 (intercept-only OLS): residuals = x - mean(x).
 		t = make([][]float64, n)
 		for i := range t {
 			t[i] = []float64{1}
 		}
 		table = kpssTablePLevels
 	case "trend":
+		// x ~ 1 + t (R's lm(x ~ t) includes intercept): residuals from a
+		// linear-trend regression. pmdarima uses sklearn LinearRegression
+		// which defaults to fit_intercept=True.
 		t = make([][]float64, n)
 		for i := range t {
 			t[i] = []float64{float64(i)}
 		}
 		table = kpssTablePTrend
+		addIntercept = true
 	default:
 		return KPSSResult{}, errors.New(`null must be "level" or "trend"`)
 	}
-	// fit OLS without intercept: x ~ t
-	beta, err := olsFit(t, x, false)
+	beta, err := olsFit(t, x, addIntercept)
 	if err != nil {
 		return KPSSResult{}, err
 	}
 	resid := make([]float64, n)
 	for i := 0; i < n; i++ {
 		pred := 0.0
-		for j, b := range beta {
-			pred += t[i][j] * b
+		off := 0
+		if addIntercept {
+			pred = beta[0]
+			off = 1
+		}
+		for j, v := range t[i] {
+			pred += v * beta[j+off]
 		}
 		resid[i] = x[i] - pred
 	}
@@ -158,7 +169,7 @@ func KPSSTest(x []float64, opts KPSSTestOpts) (KPSSResult, error) {
 		return KPSSResult{}, err
 	}
 	pval := out[0]
-	return KPSSResult{PValue: pval, ShouldDiff: pval < opts.Alpha}, nil
+	return KPSSResult{PValue: pval, ShouldDiff: pval < opts.Alpha, Stat: stat}, nil
 }
 
 // adfTable holds the augmented Dickey-Fuller critical-value matrix

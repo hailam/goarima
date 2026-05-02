@@ -335,14 +335,23 @@ func OCSBTest(x []float64, m int, lagMethod OCSBLagMethod, maxLag int) (int, err
 }
 
 // ocsbStat computes the OCSB Z5 t-statistic with the chosen lag method.
+//
+// When lag selection is enabled, mirrors R's `forecast::ocsb.test`:
+//
+//	id <- which.min(icvals)
+//	maxlag <- id - 1
+//	regression <- fitOCSB(x, maxlag, maxlag)
+//
+// i.e. after picking the AIC/BIC/AICc-best lag id (1-based), R pulls back
+// by one and refits at lag = id-1 with maxLag = id-1. We replicate this exactly.
 func ocsbStat(x []float64, m int, lagMethod OCSBLagMethod, maxLag int) (float64, error) {
 	if maxLag <= 0 {
 		return 0, errors.New("maxLag must be positive")
 	}
-	bestLag := maxLag
+	finalLag := maxLag
 	if lagMethod != OCSBFixed {
 		bestIC := math.Inf(1)
-		bestIdx := -1
+		bestID := -1 // 1-based, like R's `id`
 		for lag := 1; lag <= maxLag; lag++ {
 			ic, err := ocsbFitIC(x, m, lag, maxLag, lagMethod)
 			if err != nil {
@@ -350,15 +359,19 @@ func ocsbStat(x []float64, m int, lagMethod OCSBLagMethod, maxLag int) (float64,
 			}
 			if !math.IsNaN(ic) && ic < bestIC {
 				bestIC = ic
-				bestIdx = lag
+				bestID = lag
 			}
 		}
-		if bestIdx == -1 {
+		if bestID == -1 {
 			return 0, errors.New("all lag values produced singular matrices")
 		}
-		bestLag = bestIdx
+		// R's pull-back: maxlag <- id - 1. If that bottoms out at 0, fall back to id.
+		finalLag = bestID - 1
+		if finalLag < 1 {
+			finalLag = bestID
+		}
 	}
-	stat, _, err := ocsbFit(x, m, bestLag, maxLag)
+	stat, _, err := ocsbFit(x, m, finalLag, finalLag)
 	return stat, err
 }
 
@@ -375,175 +388,163 @@ func ocsbFit(x []float64, m, lag, maxLag int) (float64, float64, error) {
 }
 
 
-// ocsbFitFull mirrors OCSBTest._fit_ocsb and returns Z5's t-statistic plus the
-// requested information criterion.
+
+// ocsbFitFull mirrors forecast::ocsb.test fitOCSB closure (R reference).
+//
+// Differs from pmdarima's port: R fits the AR stage *without* an intercept
+// (`lm(y ~ 0 + .)`). Pmdarima added a constant as a workaround for a Python
+// statsmodels QR singularity that does not affect us. Returns Z5's t-statistic
+// and the requested IC value for the AR fit.
+//
+// Time-index alignment follows R's `na.omit(cbind(...))` semantics: a row at
+// absolute time t is included iff every value referenced from t (including
+// lagged regressors and lagged Z4/Z5) is defined.
 func ocsbFitFull(x []float64, m, lag, maxLag int, method OCSBLagMethod) (float64, float64, error) {
-	yfod := applyDiff(x, m, 1)
-	if len(yfod) == 0 {
-		return 0, math.NaN(), errors.New("not enough samples after seasonal differencing")
+	n := len(x)
+	if lag < 1 {
+		return 0, math.NaN(), errors.New("lag must be >= 1")
 	}
-	y := applyDiff(yfod, 1, 1)
-	ylag := genLags(y, lag)
-	if maxLag > -1 {
-		// y = y[max_lag:]
-		if maxLag >= len(y) {
-			return 0, math.NaN(), errors.New("max_lag exceeds y length")
+	if maxLag < lag {
+		return 0, math.NaN(), errors.New("maxLag must be >= lag")
+	}
+	// y_t = (1 - B)(1 - B^m) x_t = (x_t - x_{t-1}) - (x_{t-m} - x_{t-m-1})
+	// Defined for t >= m+1.
+	yAt := func(t int) float64 {
+		return (x[t] - x[t-1]) - (x[t-m] - x[t-m-1])
+	}
+	// y_z4 = (1 - B^m) x_t. Defined for t >= m.
+	z4At := func(t int) float64 {
+		return x[t] - x[t-m]
+	}
+	// y_z5 = (1 - B) x_t. Defined for t >= 1.
+	z5At := func(t int) float64 {
+		return x[t] - x[t-1]
+	}
+
+	// AR fit: y[t] ~ 0 + y[t-1] + ... + y[t-lag]
+	// y[t-k] requires t-k >= m+1, i.e., t >= m+1+k. Largest k is `lag`.
+	// R also drops the first `maxLag` rows of y so all lag.method models are
+	// fit on the same length: t >= m+1+maxLag.
+	arStart := m + 1 + maxLag
+	if arStart >= n {
+		return 0, math.NaN(), errors.New("series too short for OCSB AR fit")
+	}
+	arRows := n - arStart
+	if arRows < lag+2 {
+		return 0, math.NaN(), errors.New("not enough rows for OCSB AR fit")
+	}
+	yAR := make([]float64, arRows)
+	XAR := make([][]float64, arRows)
+	for i := 0; i < arRows; i++ {
+		t := arStart + i
+		yAR[i] = yAt(t)
+		row := make([]float64, lag)
+		for k := 1; k <= lag; k++ {
+			row[k-1] = yAt(t - k)
 		}
-		y = y[maxLag:]
+		XAR[i] = row
 	}
-	mf := ylag
-	if len(mf) > len(y) {
-		mf = mf[:len(y)]
-	}
-	// AR fit: y ~ const + mf
-	X := addConstantCol(mf)
-	beta, err := olsFit(X, y, false)
+	beta, err := olsFit(XAR, yAR, false)
 	if err != nil {
 		return 0, math.NaN(), err
 	}
 
-	// Z4
-	z4y := yfod[lag:]
-	z4lag := genLags(yfod, lag)
-	if len(z4lag) > len(z4y) {
-		z4lag = z4lag[:len(z4y)]
+	// Z4 residuals at time t: y_z4(t) - sum_k beta_k * y_z4(t - k).
+	// Defined when (t - k) >= m for all k=1..lag, i.e., t >= m + lag.
+	z4Resid := func(t int) float64 {
+		pred := 0.0
+		for k := 1; k <= lag; k++ {
+			pred += beta[k-1] * z4At(t-k)
+		}
+		return z4At(t) - pred
 	}
-	z4preds := predictLinear(addConstantCol(z4lag), beta)
-	z4 := make([]float64, len(z4y))
-	for i := range z4 {
-		z4[i] = z4y[i] - z4preds[i]
-	}
-
-	// Z5
-	z5y := applyDiff(x, 1, 1)
-	z5lag := genLags(z5y, lag)
-	z5y = z5y[lag:]
-	if len(z5lag) > len(z5y) {
-		z5lag = z5lag[:len(z5y)]
-	}
-	z5preds := predictLinear(addConstantCol(z5lag), beta)
-	z5 := make([]float64, len(z5y))
-	for i := range z5 {
-		z5[i] = z5y[i] - z5preds[i]
+	// Z5 residuals at time t. Defined when (t - k) >= 1 for k=1..lag, i.e., t >= 1 + lag.
+	z5Resid := func(t int) float64 {
+		pred := 0.0
+		for k := 1; k <= lag; k++ {
+			pred += beta[k-1] * z5At(t-k)
+		}
+		return z5At(t) - pred
 	}
 
-	// Final regression: y ~ mf + z4 + z5
-	mfRows := len(mf)
-	if len(z4) < mfRows {
-		mfRows = len(z4)
+	// Final regression: y[t] ~ 0 + y[t-1..t-lag] + Z4[t-1] + Z5[t-m]
+	// Z4[t-1] valid: (t-1) >= m + lag → t >= m + lag + 1
+	// Z5[t-m] valid: (t-m) >= 1 + lag → t >= m + lag + 1
+	// y[t-k] valid: same as before, t >= m + 1 + lag
+	// Combined with the maxLag drop: finalStart = max(arStart, m+lag+1).
+	finalStart := arStart
+	if m+lag+1 > finalStart {
+		finalStart = m + lag + 1
 	}
-	if len(z5) < mfRows {
-		mfRows = len(z5)
+	finalRows := n - finalStart
+	if finalRows < lag+3 {
+		return 0, math.NaN(), errors.New("not enough rows for OCSB final regression")
 	}
-	if mfRows < 3 {
-		return 0, math.NaN(), errors.New("too few rows for OCSB final regression")
+	yF := make([]float64, finalRows)
+	XF := make([][]float64, finalRows)
+	for i := 0; i < finalRows; i++ {
+		t := finalStart + i
+		yF[i] = yAt(t)
+		row := make([]float64, lag+2)
+		for k := 1; k <= lag; k++ {
+			row[k-1] = yAt(t - k)
+		}
+		row[lag] = z4Resid(t - 1)
+		row[lag+1] = z5Resid(t - m)
+		XF[i] = row
 	}
-	Xf := make([][]float64, mfRows)
-	for i := 0; i < mfRows; i++ {
-		row := make([]float64, len(mf[i])+2)
-		copy(row, mf[i])
-		row[len(mf[i])] = z4[i]
-		row[len(mf[i])+1] = z5[i]
-		Xf[i] = row
-	}
-	yf := y[:mfRows]
-	betaF, err := olsFit(Xf, yf, false)
+	betaF, err := olsFit(XF, yF, false)
 	if err != nil {
 		return 0, math.NaN(), err
 	}
-	residF := make([]float64, mfRows)
-	predF := predictLinear(Xf, betaF)
+	predF := predictLinear(XF, betaF)
+	residF := make([]float64, finalRows)
 	for i := range residF {
-		residF[i] = yf[i] - predF[i]
+		residF[i] = yF[i] - predF[i]
 	}
-	cols := len(Xf[0])
-	stdErr, err := olsStdErr(Xf, residF, cols-1)
+	cols := len(XF[0])
+	stdErr, err := olsStdErr(XF, residF, cols-1)
 	if err != nil {
 		return 0, math.NaN(), err
 	}
 	tZ5 := betaF[cols-1] / stdErr
 
-	// Compute IC for the AR fit (intercept + mf).
-	residAr := make([]float64, len(y))
-	predAr := predictLinear(X, beta)
-	for i := range residAr {
-		residAr[i] = y[i] - predAr[i]
+	// IC of the AR fit (used only for lag selection).
+	predAR := predictLinear(XAR, beta)
+	residAR := make([]float64, arRows)
+	for i := range residAR {
+		residAR[i] = yAR[i] - predAR[i]
 	}
 	sse := 0.0
-	for _, r := range residAr {
+	for _, r := range residAR {
 		sse += r * r
 	}
-	n := float64(len(y))
-	if n == 0 {
+	nf := float64(arRows)
+	if nf == 0 {
 		return tZ5, math.NaN(), nil
 	}
 	k := float64(len(beta))
-	sigma2 := sse / n
+	sigma2 := sse / nf
 	if sigma2 <= 0 {
 		return tZ5, math.NaN(), nil
 	}
-	logL := -0.5 * n * (math.Log(2*math.Pi*sigma2) + 1)
+	logL := -0.5 * nf * (math.Log(2*math.Pi*sigma2) + 1)
 	var ic float64
 	switch method {
 	case OCSBAIC:
 		ic = 2*k - 2*logL
 	case OCSBBIC:
-		ic = math.Log(n)*k - 2*logL
+		ic = math.Log(nf)*k - 2*logL
 	case OCSBAICc:
-		if n-k-1 <= 0 {
+		if nf-k-1 <= 0 {
 			ic = math.Inf(1)
 		} else {
-			ic = 2*k - 2*logL + 2*k*(k+1)/(n-k-1)
+			ic = 2*k - 2*logL + 2*k*(k+1)/(nf-k-1)
 		}
 	default:
 		ic = 0
 	}
 	return tZ5, ic, nil
-}
-
-// genLags returns the omit_na=true variant from OCSBTest._gen_lags / _do_lag.
-// For lag=1 returns x as a single column; for lag>1 returns the dropped-NA
-// matrix of overlapping windows.
-func genLags(y []float64, lag int) [][]float64 {
-	if lag <= 0 {
-		out := make([][]float64, len(y))
-		for i := range out {
-			out[i] = []float64{0}
-		}
-		return out
-	}
-	if lag == 1 {
-		out := make([][]float64, len(y))
-		for i, v := range y {
-			out[i] = []float64{v}
-		}
-		return out
-	}
-	n := len(y)
-	rows := n - lag + 1
-	if rows <= 0 {
-		return [][]float64{}
-	}
-	out := make([][]float64, rows)
-	for i := 0; i < rows; i++ {
-		row := make([]float64, lag)
-		for j := 0; j < lag; j++ {
-			row[j] = y[i+lag-1-j]
-		}
-		out[i] = row
-	}
-	return out
-}
-
-func addConstantCol(X [][]float64) [][]float64 {
-	out := make([][]float64, len(X))
-	for i, row := range X {
-		nr := make([]float64, len(row)+1)
-		nr[0] = 1
-		copy(nr[1:], row)
-		out[i] = nr
-	}
-	return out
 }
 
 func predictLinear(X [][]float64, beta []float64) []float64 {

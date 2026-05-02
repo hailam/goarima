@@ -146,24 +146,30 @@ func TestCHTestStatAustres(t *testing.T) {
 	}
 }
 
-// Mirrors test_ocsb_test_statistic for fixed-lag method.
+// Mirrors test_ocsb_test_statistic. Validates against R's `forecast::ocsb.test`
+// reference values to high precision. We follow the R algorithm directly
+// (no-intercept AR fit) rather than pmdarima's `add_constant` workaround,
+// so we can match R within float tolerance.
+//
+// Reference values: ocsb.test(austres, lag.method='fixed', maxlag=2)$stat = -5.673749
+// and similarly -5.632227 for maxlag=3.
 func TestOCSBStatAustresFixed(t *testing.T) {
 	austres := datasets.LoadAustres()
 	cases := []struct {
 		maxLag int
 		want   float64
 	}{
-		{2, -5.6737},
-		{3, -5.6280},
+		{2, -5.673749},
+		{3, -5.632227},
 	}
 	for _, c := range cases {
 		got, _, err := ocsbFit(austres, 4, c.maxLag, c.maxLag)
 		if err != nil {
 			t.Fatalf("maxLag=%d: %v", c.maxLag, err)
 		}
-		// pmdarima's test allows rtol=0.01.
-		if math.Abs(got-c.want)/math.Abs(c.want) > 0.01 {
-			t.Errorf("maxLag=%d: got %v want %v (rtol 1%%)", c.maxLag, got, c.want)
+		// Tight tolerance — within R's printed precision.
+		if math.Abs(got-c.want) > 1e-3 {
+			t.Errorf("maxLag=%d: got %v want %v", c.maxLag, got, c.want)
 		}
 	}
 }
