@@ -12,7 +12,7 @@ import (
 // produce forecasts.
 func TestAutoArimaAustres(t *testing.T) {
 	austres := datasets.LoadAustres()
-	mdl, err := AutoArima(austres, AutoArimaOpts{
+	mdl, err := AutoArima(austres, nil, AutoArimaOpts{
 		M:        4,
 		MaxP:     3,
 		MaxQ:     3,
@@ -37,7 +37,7 @@ func TestAutoArimaAustres(t *testing.T) {
 			mdl.Order, mdl.Seasonal)
 	}
 	// Forecast should not error.
-	fc, _, _, err := mdl.Predict(4, 0.05)
+	fc, _, _, err := mdl.Predict(4, 0.05, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -55,7 +55,7 @@ func TestAutoArimaAR1(t *testing.T) {
 	for i := 1; i < n; i++ {
 		y[i] = phi*y[i-1] + rng.NormFloat64()
 	}
-	mdl, err := AutoArima(y, AutoArimaOpts{
+	mdl, err := AutoArima(y, nil, AutoArimaOpts{
 		M:        0,
 		MaxP:     3,
 		MaxQ:     3,
@@ -76,7 +76,7 @@ func TestAutoArimaAR1(t *testing.T) {
 // auto_arima must accept a too-short series only with an error.
 func TestAutoArimaTooShort(t *testing.T) {
 	y := []float64{1, 2, 3}
-	if _, err := AutoArima(y, AutoArimaOpts{}); err == nil {
+	if _, err := AutoArima(y, nil, AutoArimaOpts{}); err == nil {
 		t.Error("expected error for very short series")
 	}
 }

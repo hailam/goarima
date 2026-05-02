@@ -37,7 +37,7 @@ func TestARIMA_AR1_Fit(t *testing.T) {
 	y := simulateAR1(500, 0.7, 1.0, 42)
 	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
 	m.MaxIter = 200
-	if err := m.Fit(y); err != nil {
+	if err := m.Fit(y, nil); err != nil {
 		t.Fatal(err)
 	}
 	params := m.Params()
@@ -53,7 +53,7 @@ func TestARIMA_MA1_Fit(t *testing.T) {
 	y := simulateMA1(500, 0.5, 1.0, 7)
 	m := NewARIMA(Order{P: 0, D: 0, Q: 1})
 	m.MaxIter = 200
-	if err := m.Fit(y); err != nil {
+	if err := m.Fit(y, nil); err != nil {
 		t.Fatal(err)
 	}
 	params := m.Params()
@@ -73,14 +73,14 @@ func TestARIMA_RandomWalk_010(t *testing.T) {
 		y[i] = y[i-1] + rng.NormFloat64()
 	}
 	m := NewARIMA(Order{P: 0, D: 1, Q: 0})
-	if err := m.Fit(y); err != nil {
+	if err := m.Fit(y, nil); err != nil {
 		t.Fatal(err)
 	}
 	if len(m.Params()) != 0 {
 		t.Errorf("(0,1,0) should have no params, got %v", m.Params())
 	}
 	// Forecast 5 ahead — for random walk, the forecast is the last value.
-	fc, _, _, err := m.Predict(5, 0)
+	fc, _, _, err := m.Predict(5, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,10 +96,10 @@ func TestARIMA_PredictLength(t *testing.T) {
 	y := simulateAR1(200, 0.6, 1.0, 1)
 	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
 	m.MaxIter = 100
-	if err := m.Fit(y); err != nil {
+	if err := m.Fit(y, nil); err != nil {
 		t.Fatal(err)
 	}
-	fc, lo, hi, err := m.Predict(7, 0.05)
+	fc, lo, hi, err := m.Predict(7, 0.05, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

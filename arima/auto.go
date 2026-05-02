@@ -38,11 +38,13 @@ type AutoArimaOpts struct {
 }
 
 // AutoArima runs a stepwise model selection over ARIMA(p,d,q)(P,D,Q,m).
+// exog is optional (nil for none); if provided, every fitted candidate
+// includes the same regressors and the chosen IC compares like-for-like.
 //
 // Mirrors a simplified subset of pmdarima.auto_arima: chooses d/D via unit-root
 // tests, then iteratively explores neighbors of the current order, keeping
 // the model with the lowest IC.
-func AutoArima(y []float64, opts AutoArimaOpts) (*ARIMA, error) {
+func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error) {
 	if len(y) < 10 {
 		return nil, fmt.Errorf("series too short: %d", len(y))
 	}
@@ -153,7 +155,7 @@ func AutoArima(y []float64, opts AutoArimaOpts) (*ARIMA, error) {
 			Method:        MethodCSSML,
 			MaxIter:       opts.MaxIter,
 		}
-		if err := mdl.Fit(y); err != nil {
+		if err := mdl.Fit(y, exog); err != nil {
 			cache[k] = nil
 			return nil, err
 		}

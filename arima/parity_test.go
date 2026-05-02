@@ -130,11 +130,11 @@ func TestSARIMAFitWineind(t *testing.T) {
 		Method:   MethodCSSML,
 		MaxIter:  100,
 	}
-	if err := mdl.Fit(wi); err != nil {
+	if err := mdl.Fit(wi, nil); err != nil {
 		t.Fatalf("SARIMA fit: %v", err)
 	}
 	// 24 forecasts (2 seasonal cycles).
-	fc, lo, hi, err := mdl.Predict(24, 0.05)
+	fc, lo, hi, err := mdl.Predict(24, 0.05, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestSARIMAFitWineind(t *testing.T) {
 // (`auto.arima(woolyrnq)` should return a valid ARIMA model).
 func TestAutoArimaWoolyrnq(t *testing.T) {
 	wq := datasets.LoadWoolyrnq()
-	mdl, err := AutoArima(wq, AutoArimaOpts{
+	mdl, err := AutoArima(wq, nil, AutoArimaOpts{
 		M:        4,
 		MaxP:     3,
 		MaxQ:     3,
@@ -188,7 +188,7 @@ func TestAutoArimaWoolyrnq(t *testing.T) {
 // for a tseries-grounded port, just different from R.
 func TestAutoArimaWWWusage(t *testing.T) {
 	wu := datasets.LoadWWWusage()
-	mdl, err := AutoArima(wu, AutoArimaOpts{
+	mdl, err := AutoArima(wu, nil, AutoArimaOpts{
 		M: 0, MaxP: 5, MaxQ: 5, MaxOrder: 5, MaxD: 2,
 		Alpha: 0.05, IC: AICc, MaxIter: 80,
 	})
@@ -198,7 +198,7 @@ func TestAutoArimaWWWusage(t *testing.T) {
 	if mdl == nil {
 		t.Fatal("auto_arima returned nil")
 	}
-	fc, _, _, err := mdl.Predict(10, 0)
+	fc, _, _, err := mdl.Predict(10, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

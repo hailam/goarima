@@ -34,16 +34,19 @@ const (
 	MethodCSSML
 )
 
-// ARIMA fits an ARIMA(p,d,q)(P,D,Q,m) time-series model.
+// ARIMA fits an ARIMA(p,d,q)(P,D,Q,m) model with optional exogenous regressors.
 //
-// API mirrors pmdarima.arima.ARIMA.
+// API mirrors pmdarima.arima.ARIMA. Exogenous regressors X enter the model as
+// linear predictors: y_t = X_t @ beta + u_t, where u_t follows the ARIMA
+// process. Beta is estimated jointly with the ARMA parameters by maximising
+// the Gaussian log-likelihood.
 type ARIMA struct {
 	// Configuration
 	Order         Order
 	Seasonal      SeasonalOrder
 	WithIntercept bool   // include constant term in differenced series
 	Method        Method // fitting method
-	MaxIter       int    // optimizer max iterations (default 50)
+	MaxIter       int    // optimizer max iterations (default 100)
 
 	// Fitted state
 	phi   []float64 // non-seasonal AR
@@ -52,14 +55,15 @@ type ARIMA struct {
 	Theta []float64 // seasonal MA
 	c     float64   // intercept (on differenced series)
 	mean  float64   // mean of differenced series (when no intercept)
+	beta  []float64 // exog coefficients (length = #exog cols)
 
 	sigma2  float64
 	logL    float64
 	nobs    int
 	resids  []float64
-	yTrain  []float64 // original y, for forecasts
-	dHead   []float64 // values consumed by non-seasonal differencing
-	sdHead  []float64 // values consumed by seasonal differencing
+	yTrain  []float64   // original y, for forecasts
+	xTrain  [][]float64 // original X, for forecasts (nil if not used)
+	nExog   int
 	fitted  bool
 	psiInf  []float64 // truncated MA(infinity) for forecast variance
 	psiInfN int
@@ -75,42 +79,65 @@ func NewARIMA(order Order) *ARIMA {
 	}
 }
 
-// Fit estimates the parameters from training data y.
-func (m *ARIMA) Fit(y []float64) error {
+// Fit estimates the parameters from training data y. exog is optional: pass
+// nil for no exogenous regressors, or a [n_obs][k] matrix for k regressors.
+func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	if len(y) == 0 {
 		return errors.New("y must be non-empty")
+	}
+	if exog != nil {
+		if len(exog) != len(y) {
+			return fmt.Errorf("exog rows (%d) must match len(y) (%d)", len(exog), len(y))
+		}
 	}
 	if m.MaxIter == 0 {
 		m.MaxIter = 100
 	}
 	m.yTrain = append([]float64{}, y...)
+	if exog != nil {
+		m.xTrain = cloneMat(exog)
+		m.nExog = len(exog[0])
+	} else {
+		m.xTrain = nil
+		m.nExog = 0
+	}
 
-	// Apply differencing.
-	ws := y
+	// Apply differencing to y (and X column-wise).
+	ws := append([]float64{}, y...)
+	var wX [][]float64
+	if exog != nil {
+		wX = cloneMat(exog)
+	}
 	if m.Order.D > 0 {
-		m.dHead = append([]float64{}, ws[:m.Order.D]...)
 		ws = applyDiff(ws, 1, m.Order.D)
+		if wX != nil {
+			wX = applyMatDiff(wX, 1, m.Order.D)
+		}
 	}
 	if m.Seasonal.Active() && m.Seasonal.D > 0 {
 		hd := m.Seasonal.D * m.Seasonal.M
-		if hd > len(ws) {
-			return fmt.Errorf("seasonal differencing %d exceeds data length %d", hd, len(ws))
+		if hd > len(ws)+m.Order.D {
+			return fmt.Errorf("seasonal differencing %d exceeds data length", hd)
 		}
-		m.sdHead = append([]float64{}, ws[:hd]...)
 		ws = applyDiff(ws, m.Seasonal.M, m.Seasonal.D)
+		if wX != nil {
+			wX = applyMatDiff(wX, m.Seasonal.M, m.Seasonal.D)
+		}
 	}
 	if len(ws) < 2 {
 		return errors.New("differenced series too short")
 	}
 
 	// Statsmodels behavior: no constant by default when d>0 or D>0.
-	// Only center on the mean when the series is fully un-differenced.
+	// Only center on the mean when the series is fully un-differenced and no
+	// intercept term is requested. (When exog is supplied, the regression
+	// soaks up the level; we still skip the explicit centering.)
 	mean := 0.0
 	totalDiff := m.Order.D
 	if m.Seasonal.Active() {
 		totalDiff += m.Seasonal.D
 	}
-	if !m.WithIntercept && totalDiff == 0 {
+	if !m.WithIntercept && totalDiff == 0 && exog == nil {
 		for _, v := range ws {
 			mean += v
 		}
@@ -122,16 +149,18 @@ func (m *ARIMA) Fit(y []float64) error {
 	m.mean = mean
 	m.nobs = len(ws)
 
-	// Define parameter layout: [phi*p, theta*q, Phi*P, Theta*Q, (intercept), log_sigma]
 	p, q := m.Order.P, m.Order.Q
 	P, Q := 0, 0
 	if m.Seasonal.Active() {
 		P, Q = m.Seasonal.P, m.Seasonal.Q
 	}
+	k := m.nExog
 	nFree := p + q + P + Q
 	if m.WithIntercept {
 		nFree++
 	}
+	nFree += k
+
 	if nFree == 0 {
 		// Pure white-noise / random walk after differencing
 		sse := 0.0
@@ -146,31 +175,49 @@ func (m *ARIMA) Fit(y []float64) error {
 		return nil
 	}
 
-	// Initial guess: zeros (transformed → near zero coefficients).
+	// Initial guess: zeros for AR/MA + intercept; OLS for beta.
 	x0 := make([]float64, nFree)
+	if k > 0 {
+		// Warm-start beta via OLS on the differenced series. This is far
+		// closer to optimal than zero and dramatically improves convergence.
+		betaInit, err := olsFit(wX, ws, false)
+		if err == nil {
+			off := p + q + P + Q
+			if m.WithIntercept {
+				off++
+			}
+			copy(x0[off:off+k], betaInit)
+		}
+	}
+
+	// Compute residual series given a parameter vector — applied identically
+	// inside CSS and Kalman objectives.
+	residOf := func(params []float64) []float64 {
+		_, _, _, _, c, beta := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
+		out := make([]float64, len(ws))
+		for i, v := range ws {
+			r := v - c
+			if k > 0 {
+				for j := 0; j < k; j++ {
+					r -= beta[j] * wX[i][j]
+				}
+			}
+			out[i] = r
+		}
+		return out
+	}
 
 	objective := func(params []float64) float64 {
-		phi, theta, sPhi, sTheta, c := unpackParams(params, p, q, P, Q, m.WithIntercept)
-		// Combine seasonal × non-seasonal AR/MA polynomials.
+		phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
 		fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
 		fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
-		// Subtract intercept (acts on the differenced series after centering)
-		if m.WithIntercept {
-			for i := range ws {
-				ws[i] -= c
-			}
-			defer func() {
-				for i := range ws {
-					ws[i] += c
-				}
-			}()
-		}
+		r := residOf(params)
 		switch m.Method {
 		case MethodCSS:
-			ll, _, _ := armaCSS(ws, fullPhi, fullTheta)
+			ll, _, _ := armaCSS(r, fullPhi, fullTheta)
 			return ll
-		default: // ML or CSSML — use exact Kalman likelihood
-			ll, _, _ := kalmanARMALikelihood(ws, fullPhi, fullTheta)
+		default:
+			ll, _, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
 			if math.IsNaN(ll) || math.IsInf(ll, 0) {
 				return math.Inf(1)
 			}
@@ -178,54 +225,38 @@ func (m *ARIMA) Fit(y []float64) error {
 		}
 	}
 
-	// CSS-ML: warm-start with CSS optimum
 	if m.Method == MethodCSSML {
 		cssObj := func(params []float64) float64 {
-			phi, theta, sPhi, sTheta, c := unpackParams(params, p, q, P, Q, m.WithIntercept)
+			phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
 			fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
 			fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
-			if m.WithIntercept {
-				adj := make([]float64, len(ws))
-				for i, v := range ws {
-					adj[i] = v - c
-				}
-				ll, _, _ := armaCSS(adj, fullPhi, fullTheta)
-				return ll
-			}
-			ll, _, _ := armaCSS(ws, fullPhi, fullTheta)
+			ll, _, _ := armaCSS(residOf(params), fullPhi, fullTheta)
 			return ll
 		}
 		x0 = minimize(cssObj, x0, m.MaxIter)
 	}
 
 	best := minimize(objective, x0, m.MaxIter)
-	phi, theta, sPhi, sTheta, c := unpackParams(best, p, q, P, Q, m.WithIntercept)
+	phi, theta, sPhi, sTheta, c, beta := unpackParamsX(best, p, q, P, Q, m.WithIntercept, k)
 	m.phi = phi
 	m.theta = theta
 	m.Phi = sPhi
 	m.Theta = sTheta
 	m.c = c
+	m.beta = beta
 
 	fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
 	fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
-	wsAdj := ws
-	if m.WithIntercept {
-		wsAdj = make([]float64, len(ws))
-		for i, v := range ws {
-			wsAdj[i] = v - c
-		}
-	}
-	negLL, sigma2, _ := kalmanARMALikelihood(wsAdj, fullPhi, fullTheta)
+	r := residOf(best)
+	negLL, sigma2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
 	if math.IsNaN(negLL) || math.IsInf(negLL, 0) {
-		// fallback to CSS variance
-		_, sigma2, _ = armaCSS(wsAdj, fullPhi, fullTheta)
-		negLL = float64(len(wsAdj)) / 2 * math.Log(sigma2)
+		_, sigma2, _ = armaCSS(r, fullPhi, fullTheta)
+		negLL = float64(len(r)) / 2 * math.Log(sigma2)
 	}
 	m.sigma2 = sigma2
 	m.logL = -negLL
 
-	// recompute residuals via CSS for storage
-	_, _, res := armaCSS(wsAdj, fullPhi, fullTheta)
+	_, _, res := armaCSS(r, fullPhi, fullTheta)
 	m.resids = res
 
 	m.fitted = true
@@ -238,8 +269,6 @@ func (m *ARIMA) Fit(y []float64) error {
 func minimize(f func([]float64) float64, x0 []float64, maxIter int) []float64 {
 	gradFn := func(grad, x []float64) {
 		const eps = 1e-7
-		base := f(x)
-		_ = base
 		for i := range x {
 			save := x[i]
 			x[i] = save + eps
@@ -267,7 +296,6 @@ func minimize(f func([]float64) float64, x0 []float64, maxIter int) []float64 {
 		}
 	}
 
-	// Refine with Nelder-Mead.
 	probNM := optimize.Problem{Func: f}
 	settingsNM := &optimize.Settings{
 		MajorIterations: maxIter * 4,
@@ -282,9 +310,9 @@ func minimize(f func([]float64) float64, x0 []float64, maxIter int) []float64 {
 	return bestX
 }
 
-// unpackParams splits the flat parameter vector into AR/MA/seasonal/intercept.
+// unpackParamsX splits the flat parameter vector into AR/MA/seasonal/intercept/beta.
 // Applies stationarity/invertibility transforms.
-func unpackParams(params []float64, p, q, P, Q int, withIntercept bool) (phi, theta, sPhi, sTheta []float64, c float64) {
+func unpackParamsX(params []float64, p, q, P, Q int, withIntercept bool, k int) (phi, theta, sPhi, sTheta []float64, c float64, beta []float64) {
 	idx := 0
 	if p > 0 {
 		phi = arTransparams(params[idx : idx+p])
@@ -304,6 +332,10 @@ func unpackParams(params []float64, p, q, P, Q int, withIntercept bool) (phi, th
 	}
 	if withIntercept {
 		c = params[idx]
+		idx++
+	}
+	if k > 0 {
+		beta = append([]float64{}, params[idx:idx+k]...)
 	}
 	return
 }
@@ -313,7 +345,7 @@ func (m *ARIMA) IC(ic InfoCriterion) float64 {
 	if !m.fitted {
 		return math.Inf(1)
 	}
-	k := float64(len(m.phi) + len(m.theta) + len(m.Phi) + len(m.Theta))
+	k := float64(len(m.phi) + len(m.theta) + len(m.Phi) + len(m.Theta) + len(m.beta))
 	if m.WithIntercept {
 		k++
 	}
@@ -360,10 +392,17 @@ func (m *ARIMA) Resid() []float64 {
 	return out
 }
 
+// Beta returns the exogenous-regressor coefficients (empty if no exog).
+func (m *ARIMA) Beta() []float64 {
+	out := make([]float64, len(m.beta))
+	copy(out, m.beta)
+	return out
+}
+
 // Params returns the fitted parameter vector in the order
-// [phi..., theta..., Phi..., Theta..., intercept (if any)].
+// [phi..., theta..., Phi..., Theta..., intercept (if any), beta...].
 func (m *ARIMA) Params() []float64 {
-	out := make([]float64, 0, len(m.phi)+len(m.theta)+len(m.Phi)+len(m.Theta)+1)
+	out := make([]float64, 0, len(m.phi)+len(m.theta)+len(m.Phi)+len(m.Theta)+1+len(m.beta))
 	out = append(out, m.phi...)
 	out = append(out, m.theta...)
 	out = append(out, m.Phi...)
@@ -371,22 +410,100 @@ func (m *ARIMA) Params() []float64 {
 	if m.WithIntercept {
 		out = append(out, m.c)
 	}
+	out = append(out, m.beta...)
 	return out
+}
+
+// FittedValues returns in-sample one-step-ahead predictions y_hat[t].
+//
+// Computed as y_hat[t] = y[t] - residual[t], aligned to the original (un-differenced)
+// time index. Length = len(yTrain) - (d + D*m). The first (d + D*m) values are
+// undefined and not returned.
+func (m *ARIMA) FittedValues() []float64 {
+	if !m.fitted {
+		return nil
+	}
+	dHead := m.Order.D
+	if m.Seasonal.Active() {
+		dHead += m.Seasonal.D * m.Seasonal.M
+	}
+	n := len(m.yTrain) - dHead
+	if n <= 0 || len(m.resids) == 0 {
+		return nil
+	}
+	residTail := m.resids
+	if len(residTail) > n {
+		residTail = residTail[len(residTail)-n:]
+	} else if len(residTail) < n {
+		// pad front with zeros
+		pad := make([]float64, n-len(residTail))
+		residTail = append(pad, residTail...)
+	}
+	out := make([]float64, n)
+	for i := 0; i < n; i++ {
+		out[i] = m.yTrain[dHead+i] - residTail[i]
+	}
+	return out
+}
+
+// PredictInSample returns the in-sample one-step-ahead predictions, alias of
+// FittedValues. Mirrors pmdarima.ARIMA.predict_in_sample.
+func (m *ARIMA) PredictInSample() []float64 { return m.FittedValues() }
+
+// Update appends new observations to the training data and re-fits the model
+// (with the same orders/configuration). Mirrors pmdarima.ARIMA.update.
+//
+// newY are the new observations; newX (optional) the matching exogenous rows.
+func (m *ARIMA) Update(newY []float64, newX [][]float64) error {
+	if !m.fitted {
+		return errors.New("model not fitted")
+	}
+	if newX != nil && len(newX) != len(newY) {
+		return fmt.Errorf("newX rows (%d) != len(newY) (%d)", len(newX), len(newY))
+	}
+	if (m.nExog > 0) != (newX != nil) {
+		return errors.New("exog provided/missing inconsistent with original fit")
+	}
+	combinedY := append([]float64{}, m.yTrain...)
+	combinedY = append(combinedY, newY...)
+	var combinedX [][]float64
+	if newX != nil {
+		combinedX = append(combinedX, m.xTrain...)
+		combinedX = append(combinedX, cloneMat(newX)...)
+	}
+	return m.Fit(combinedY, combinedX)
 }
 
 // Predict produces nPeriods forward forecasts. If alpha > 0, lower/upper
 // confidence intervals are returned alongside; otherwise lower/upper are nil.
-func (m *ARIMA) Predict(nPeriods int, alpha float64) (forecast, lower, upper []float64, err error) {
+//
+// futureExog is required if the model was fitted with exogenous regressors;
+// it must have nPeriods rows.
+func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (forecast, lower, upper []float64, err error) {
 	if !m.fitted {
 		return nil, nil, nil, errors.New("model not fitted")
 	}
 	if nPeriods <= 0 {
 		return []float64{}, nil, nil, nil
 	}
+	if m.nExog > 0 {
+		if futureExog == nil {
+			return nil, nil, nil, errors.New("future exog required for forecasting")
+		}
+		if len(futureExog) != nPeriods {
+			return nil, nil, nil, fmt.Errorf("future exog rows (%d) must match nPeriods (%d)", len(futureExog), nPeriods)
+		}
+		if len(futureExog[0]) != m.nExog {
+			return nil, nil, nil, fmt.Errorf("future exog cols (%d) must match training (%d)", len(futureExog[0]), m.nExog)
+		}
+	} else if futureExog != nil {
+		return nil, nil, nil, errors.New("model was fitted without exog; do not pass futureExog")
+	}
+
 	fullPhi := expandSARMA(m.phi, m.Phi, m.Seasonal.M)
 	fullTheta := expandSMA(m.theta, m.Theta, m.Seasonal.M)
 
-	// Reconstruct differenced (and centered/intercept-adjusted) training series.
+	// Reconstruct differenced training series and residuals.
 	ws := append([]float64{}, m.yTrain...)
 	if m.Order.D > 0 {
 		ws = applyDiff(ws, 1, m.Order.D)
@@ -394,14 +511,45 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64) (forecast, lower, upper []f
 	if m.Seasonal.Active() && m.Seasonal.D > 0 {
 		ws = applyDiff(ws, m.Seasonal.M, m.Seasonal.D)
 	}
+	var wX [][]float64
+	if m.xTrain != nil {
+		wX = cloneMat(m.xTrain)
+		if m.Order.D > 0 {
+			wX = applyMatDiff(wX, 1, m.Order.D)
+		}
+		if m.Seasonal.Active() && m.Seasonal.D > 0 {
+			wX = applyMatDiff(wX, m.Seasonal.M, m.Seasonal.D)
+		}
+	}
 	wsCentered := make([]float64, len(ws))
 	for i, v := range ws {
-		wsCentered[i] = v - m.mean - m.c
+		r := v - m.mean - m.c
+		if wX != nil {
+			for j, b := range m.beta {
+				r -= b * wX[i][j]
+			}
+		}
+		wsCentered[i] = r
 	}
-	// Recompute CSS residuals for forecasting.
 	_, _, res := armaCSS(wsCentered, fullPhi, fullTheta)
 
-	// Forecast on differenced series (centered).
+	// Difference the (combined) future exog. We need the full historical+future
+	// X matrix differenced, then take only the future tail.
+	var futureWX [][]float64
+	if futureExog != nil {
+		combined := append([][]float64{}, m.xTrain...)
+		combined = append(combined, futureExog...)
+		diffed := combined
+		if m.Order.D > 0 {
+			diffed = applyMatDiff(diffed, 1, m.Order.D)
+		}
+		if m.Seasonal.Active() && m.Seasonal.D > 0 {
+			diffed = applyMatDiff(diffed, m.Seasonal.M, m.Seasonal.D)
+		}
+		futureWX = diffed[len(diffed)-nPeriods:]
+	}
+
+	// Forecast residuals on differenced/centered scale.
 	forecastDiffed := make([]float64, nPeriods)
 	hist := append([]float64{}, wsCentered...)
 	residHist := append([]float64{}, res...)
@@ -423,9 +571,14 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64) (forecast, lower, upper []f
 		hist = append(hist, yh)
 		residHist = append(residHist, 0)
 	}
-	// Re-add intercept and mean
+	// Re-add intercept, mean, and exog contribution on the differenced scale.
 	for i := range forecastDiffed {
 		forecastDiffed[i] += m.mean + m.c
+		if futureWX != nil {
+			for j, b := range m.beta {
+				forecastDiffed[i] += b * futureWX[i][j]
+			}
+		}
 	}
 
 	// Integrate seasonal differencing back
@@ -459,6 +612,15 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64) (forecast, lower, upper []f
 	return out, lower, upper, nil
 }
 
+// FitPredict combines Fit and Predict in one step (for convenience).
+func (m *ARIMA) FitPredict(y []float64, exog [][]float64, nPeriods int, futureExog [][]float64) ([]float64, error) {
+	if err := m.Fit(y, exog); err != nil {
+		return nil, err
+	}
+	fc, _, _, err := m.Predict(nPeriods, 0, futureExog)
+	return fc, err
+}
+
 // diffStream applies non-seasonal differencing only.
 func diffStream(y []float64, lag, times int) []float64 {
 	if times == 0 {
@@ -477,6 +639,46 @@ func lastN(x []float64, n int) []float64 {
 	}
 	out := make([]float64, n)
 	copy(out, x[len(x)-n:])
+	return out
+}
+
+// applyMatDiff differences each column of x by lag, repeated times.
+func applyMatDiff(x [][]float64, lag, times int) [][]float64 {
+	if times == 0 || len(x) == 0 {
+		return cloneMat(x)
+	}
+	rows := len(x)
+	cols := len(x[0])
+	out := cloneMat(x)
+	for t := 0; t < times; t++ {
+		if rows <= lag {
+			return [][]float64{}
+		}
+		next := make([][]float64, rows-lag)
+		for i := 0; i < rows-lag; i++ {
+			row := make([]float64, cols)
+			for j := 0; j < cols; j++ {
+				row[j] = out[i+lag][j] - out[i][j]
+			}
+			next[i] = row
+		}
+		out = next
+		rows = len(out)
+	}
+	return out
+}
+
+// cloneMat returns a deep copy of a row-major matrix.
+func cloneMat(x [][]float64) [][]float64 {
+	if x == nil {
+		return nil
+	}
+	out := make([][]float64, len(x))
+	for i, row := range x {
+		r := make([]float64, len(row))
+		copy(r, row)
+		out[i] = r
+	}
 	return out
 }
 
@@ -505,7 +707,6 @@ func (m *ARIMA) computePsi() {
 
 // normPPF returns the inverse CDF of the standard normal.
 func normPPF(p float64) float64 {
-	// Beasley–Springer–Moro algorithm.
 	if p <= 0 || p >= 1 {
 		return math.NaN()
 	}

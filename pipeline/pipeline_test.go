@@ -29,7 +29,7 @@ func TestPipelineLogPlusARIMA(t *testing.T) {
 	if err := pl.Fit(y, nil); err != nil {
 		t.Fatal(err)
 	}
-	fc, _, _, err := pl.Predict(5, 0)
+	fc, _, _, err := pl.Predict(5, 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

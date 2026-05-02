@@ -95,11 +95,11 @@ func (p *Pipeline) Fit(y []float64, x [][]float64) error {
 			exogChain = append(exogChain, s.Exog)
 		}
 	}
+	var fitX [][]float64
 	if len(xc) > 0 {
-		// Until ARIMA accepts exogenous regressors, refuse to silently drop them.
-		return errors.New("pipeline: exog matrix is not yet plumbed through to ARIMA")
+		fitX = xc
 	}
-	if err := p.Model.Fit(yc); err != nil {
+	if err := p.Model.Fit(yc, fitX); err != nil {
 		return fmt.Errorf("estimator fit: %w", err)
 	}
 	p.endogChain = endogChain
@@ -109,11 +109,30 @@ func (p *Pipeline) Fit(y []float64, x [][]float64) error {
 }
 
 // Predict produces a forecast on the original (untransformed) scale.
-func (p *Pipeline) Predict(nPeriods int, alpha float64) (forecast, lower, upper []float64, err error) {
+//
+// If the pipeline contains an exog featurizer, future exog rows are derived
+// from the featurizer (n_periods passed through). futureExog (optional) is a
+// user-supplied exog matrix that gets concatenated with featurizer output.
+func (p *Pipeline) Predict(nPeriods int, alpha float64, futureExog [][]float64) (forecast, lower, upper []float64, err error) {
 	if !p.fitted {
 		return nil, nil, nil, errors.New("pipeline not fitted")
 	}
-	fc, lo, hi, err := p.Model.Predict(nPeriods, alpha)
+	var modelX [][]float64
+	if len(p.exogChain) > 0 {
+		// Reconstruct future exog from each featurizer in order. We pass the
+		// optional user-supplied futureExog as the seed and let each
+		// featurizer column-bind its own contribution on the right.
+		xseed := futureExog
+		for _, f := range p.exogChain {
+			out, e := f.Transform(nil, xseed, nPeriods)
+			if e != nil {
+				return nil, nil, nil, fmt.Errorf("future exog from featurizer: %w", e)
+			}
+			xseed = out
+		}
+		modelX = xseed
+	}
+	fc, lo, hi, err := p.Model.Predict(nPeriods, alpha, modelX)
 	if err != nil {
 		return nil, nil, nil, err
 	}
