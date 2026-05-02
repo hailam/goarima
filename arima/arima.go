@@ -209,6 +209,28 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		nFree++
 	}
 	nFree += k
+	// DiffuseStatsmodels: scale data so σ²≈1, then unit-σ² Kalman with
+	// kappa=1e6 matches statsmodels' kappa=1e6 absolute. We do this once
+	// up-front; the optimizer doesn't see σ² as a free parameter.
+	useStatsmodels := m.NonSimpleDifferencing && m.DiffuseConvention == DiffuseStatsmodels
+	dataScale := 1.0
+	if useStatsmodels {
+		// Estimate σ² from the differenced series.
+		mean0 := 0.0
+		for _, v := range ws {
+			mean0 += v
+		}
+		mean0 /= float64(len(ws))
+		ss := 0.0
+		for _, v := range ws {
+			d := v - mean0
+			ss += d * d
+		}
+		s2est := ss / float64(len(ws))
+		if s2est > 0 {
+			dataScale = math.Sqrt(s2est)
+		}
+	}
 
 	if nFree == 0 {
 		// Pure white-noise / random walk after differencing
@@ -316,8 +338,60 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		return out
 	}
 
+	// Scaled y (for DiffuseStatsmodels mode): y_scaled = y / dataScale.
+	yUndiffScaled := yUndiff
+	if useStatsmodels && dataScale != 1 {
+		yUndiffScaled = make([]float64, len(yUndiff))
+		for i, v := range yUndiff {
+			yUndiffScaled[i] = v / dataScale
+		}
+	}
+	xUndiffScaled := xUndiff
+	if useStatsmodels && dataScale != 1 && xUndiff != nil {
+		xUndiffScaled = make([][]float64, len(xUndiff))
+		for i, row := range xUndiff {
+			scaled := make([]float64, len(row))
+			for j, v := range row {
+				scaled[j] = v / dataScale
+			}
+			xUndiffScaled[i] = scaled
+		}
+	}
+
 	objective := func(params []float64) float64 {
 		phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
+		if useStatsmodels {
+			Dord := 0
+			mPer := 0
+			if m.Seasonal.Active() {
+				Dord = m.Seasonal.D
+				mPer = m.Seasonal.M
+			}
+			yEff := yUndiffScaled
+			if m.WithIntercept || k > 0 {
+				_, _, _, _, c, beta := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
+				yAdj := make([]float64, len(yUndiffScaled))
+				for i, v := range yUndiffScaled {
+					adj := v - c
+					if k > 0 && xUndiffScaled != nil {
+						for j := 0; j < k; j++ {
+							adj -= beta[j] * xUndiffScaled[i][j]
+						}
+					}
+					yAdj[i] = adj
+				}
+				yEff = yAdj
+			}
+			// Run unit-σ² Kalman on scaled data; kappa_scaled = 1e6 / σ²_est
+			// ensures statsmodels' kappa=1e6 absolute is preserved.
+			kappaUnit := 1e6 / (dataScale * dataScale)
+			ll, _, _ := kalmanSARIMAX(yEff, m.Order.D, mPer, Dord,
+				phi, theta, sPhi, sTheta, kappaUnit)
+			if math.IsNaN(ll) || math.IsInf(ll, 0) {
+				return math.Inf(1)
+			}
+			return ll
+		}
 		if m.NonSimpleDifferencing {
 			Dord := 0
 			mPer := 0
@@ -372,7 +446,57 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
 	r := residOf(best)
 	var negLL, sigma2 float64
-	if m.NonSimpleDifferencing {
+	switch {
+	case useStatsmodels:
+		Dord := 0
+		mPer := 0
+		if m.Seasonal.Active() {
+			Dord = m.Seasonal.D
+			mPer = m.Seasonal.M
+		}
+		yEff := yUndiffScaled
+		if m.WithIntercept || k > 0 {
+			yAdj := make([]float64, len(yUndiffScaled))
+			for i, v := range yUndiffScaled {
+				adj := v - c
+				if k > 0 && xUndiffScaled != nil {
+					for j := 0; j < k; j++ {
+						adj -= beta[j] * xUndiffScaled[i][j]
+					}
+				}
+				yAdj[i] = adj
+			}
+			yEff = yAdj
+		}
+		// Concentrated unit-σ² Kalman on scaled data with statsmodels-equivalent kappa.
+		kappaUnit := 1e6 / (dataScale * dataScale)
+		ll, s2Scaled, _ := kalmanSARIMAX(yEff, m.Order.D, mPer, Dord,
+			phi, theta, sPhi, sTheta, kappaUnit)
+		// Un-scale: σ²_orig = σ²_scaled * dataScale².
+		// logL_orig = logL_scaled - n_eff * log(dataScale).
+		// negLL_orig = negLL_scaled + n_eff * log(dataScale).
+		nEff := len(yEff)
+		// Drop the burn observations from the n_eff count.
+		// kStatesDiff isn't directly available here, recompute.
+		burn := m.Order.D
+		if m.Seasonal.Active() {
+			burn += m.Seasonal.D * m.Seasonal.M
+		}
+		nEff -= burn
+		if nEff < 1 {
+			nEff = 1
+		}
+		negLL = ll + float64(nEff)*math.Log(dataScale)
+		sigma2 = s2Scaled * dataScale * dataScale
+		// Restore intercept on the original scale so c parameter is meaningful.
+		m.c = c * dataScale
+		// Restore beta on the original scale.
+		if k > 0 {
+			for i := range m.beta {
+				m.beta[i] = beta[i] * dataScale
+			}
+		}
+	case m.NonSimpleDifferencing:
 		Dord := 0
 		mPer := 0
 		if m.Seasonal.Active() {
@@ -382,7 +506,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		ll, s2, _ := kalmanARIMAFullConv(residOfFull(best), m.Order.D, mPer, Dord,
 			phi, theta, sPhi, sTheta, 1e6, m.DiffuseConvention)
 		negLL, sigma2 = ll, s2
-	} else {
+	default:
 		ll, s2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
 		negLL, sigma2 = ll, s2
 	}

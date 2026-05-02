@@ -2,6 +2,21 @@ package arima
 
 import "gonum.org/v1/gonum/mat"
 
+// PublicGardner exposes Gardner's stationary cov for parity diagnostics.
+func PublicGardner(phi, theta []float64) [][]float64 {
+	m := stationaryCovGardner(phi, theta)
+	r, _ := m.Dims()
+	out := make([][]float64, r)
+	for i := 0; i < r; i++ {
+		row := make([]float64, r)
+		for j := 0; j < r; j++ {
+			row[j] = m.At(i, j)
+		}
+		out[i] = row
+	}
+	return out
+}
+
 // stationaryCovGardner computes the stationary covariance of the ARMA(p,q)
 // state-space form using Gardner's algorithm — a numerically-stable
 // alternative to direct discrete-Lyapunov solution.

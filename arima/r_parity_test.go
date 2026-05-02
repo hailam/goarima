@@ -204,6 +204,35 @@ func TestRParityDriftWithHighDiff(t *testing.T) {
 	}
 }
 
+// Verifies 1:1 statsmodels parity for SARIMA(1,1,1)(0,1,1)[12] on wineind
+// using DiffuseStatsmodels mode. Statsmodels' default reports:
+//
+//	ar1 ≈ 0.1313, ma1 ≈ -0.7165, sma1 ≈ -0.3853, logL ≈ -1529.25, σ² ≈ 8.46e6
+func TestRParityStatsmodelsWineind(t *testing.T) {
+	wi := datasets.LoadWineind()
+	m := NewARIMA(Order{P: 1, D: 1, Q: 1})
+	m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+	m.NonSimpleDifferencing = true
+	m.DiffuseConvention = DiffuseStatsmodels
+	m.MaxIter = 300
+	if err := m.Fit(wi, nil); err != nil {
+		t.Fatal(err)
+	}
+	params := m.Params()
+	if !approxEq(params[0], 0.1313, 0.02, 0) {
+		t.Errorf("ar1 = %v want ~0.1313", params[0])
+	}
+	if !approxEq(params[1], -0.7165, 0.05, 0) {
+		t.Errorf("ma1 = %v want ~-0.7165", params[1])
+	}
+	if !approxEq(params[2], -0.3853, 0.02, 0) {
+		t.Errorf("sma1 = %v want ~-0.3853", params[2])
+	}
+	if !approxEq(m.LogLikelihood(), -1529.2458, 1.5, 0) {
+		t.Errorf("logL = %v want ~-1529.25", m.LogLikelihood())
+	}
+}
+
 // Method "CSS" should produce a similar (but not identical) fit to CSS-ML.
 func TestRParityMethodCSS(t *testing.T) {
 	y := simulateAR1(300, 0.5, 1.0, 1)
