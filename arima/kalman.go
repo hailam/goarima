@@ -155,14 +155,19 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		return float64(n) / 2 * (math.Log(2*math.Pi*s2) + 1), s2, nil
 	}
 
-	// T (companion), R (selection), RR' (rank-1 noise cov) — all flat row-major.
-	Trow := make([]float64, r*r) // Trow[i*r + j] = T[i,j]
+	// T (companion form): T[i,0] = phi[i] for i<p; T[i,i+1] = 1 for i+1<r.
+	// At most p + (r-1) ≤ 2r-1 nonzero entries. Build a sparse list to skip
+	// the dense matmuls in the predict step.
+	Trow := make([]float64, r*r) // dense form (used only for stationaryCov bootstrap)
+	nzT := make([]tNZ, 0, 2*r)
 	for i := 0; i < r; i++ {
-		if i < p {
-			Trow[i*r] = phi[i] // T[i, 0]
+		if i < p && phi[i] != 0 {
+			Trow[i*r] = phi[i]
+			nzT = append(nzT, tNZ{i, 0, phi[i]})
 		}
 		if i+1 < r {
-			Trow[i*r+i+1] = 1 // T[i, i+1]
+			Trow[i*r+i+1] = 1
+			nzT = append(nzT, tNZ{i, i + 1, 1})
 		}
 	}
 	Rvec := make([]float64, r)
@@ -174,8 +179,13 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 	}
 	RRt := make([]float64, r*r)
 	for i := 0; i < r; i++ {
+		ri := Rvec[i]
+		if ri == 0 {
+			continue
+		}
+		off := i * r
 		for j := 0; j < r; j++ {
-			RRt[i*r+j] = Rvec[i] * Rvec[j]
+			RRt[off+j] = ri * Rvec[j]
 		}
 	}
 
@@ -196,10 +206,11 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		}
 	}
 
-	// Pre-allocated working buffers.
+	// Pre-allocated working buffers (reused every step).
 	a := make([]float64, r)
 	K := make([]float64, r)
 	row0 := make([]float64, r)
+	newA := make([]float64, r)
 	TP := make([]float64, r*r)
 	newP := make([]float64, r*r)
 
@@ -214,17 +225,12 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 			return math.Inf(1), 0, innov
 		}
 		invF := 1.0 / F
-		// K = P[:,0] / F
 		for i := 0; i < r; i++ {
 			K[i] = P[i*r] * invF
-		}
-		// a += K*v
-		for i := 0; i < r; i++ {
 			a[i] += K[i] * v
 		}
-		// snapshot row 0
+		// snapshot row 0; rank-1 P update: P -= K * row0.
 		copy(row0, P[:r])
-		// P -= K * row0
 		for i := 0; i < r; i++ {
 			ki := K[i]
 			off := i * r
@@ -237,43 +243,38 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		logF += math.Log(F)
 		sumVF += v * v * invF
 
-		// Predict: a = T*a, P = T*P*T' + RR'.
-		// First newA into a temporary (use K as scratch since K not needed).
-		var newA0, newA1, newA2 float64
-		_ = newA0
-		_ = newA1
-		_ = newA2
-		// newA = T*a
-		newA := K // re-use K as scratch buffer
+		// Predict via sparse T:
+		//   a' = T*a
+		//   P' = T*P*T' + RR'
 		for i := 0; i < r; i++ {
-			s := 0.0
-			for j := 0; j < r; j++ {
-				s += Trow[i*r+j] * a[j]
-			}
-			newA[i] = s
+			newA[i] = 0
+		}
+		for _, e := range nzT {
+			newA[e.i] += e.v * a[e.j]
 		}
 		copy(a, newA)
-		// TP = T*P
-		for i := 0; i < r; i++ {
+
+		// TP = T @ P (sparse-T, dense-P).
+		for k := range TP {
+			TP[k] = 0
+		}
+		for _, e := range nzT {
+			ti := e.i * r
+			tj := e.j * r
+			tv := e.v
 			for j := 0; j < r; j++ {
-				s := 0.0
-				for k := 0; k < r; k++ {
-					s += Trow[i*r+k] * P[k*r+j]
-				}
-				TP[i*r+j] = s
+				TP[ti+j] += tv * P[tj+j]
 			}
 		}
-		// newP = TP*T' + RR'
+		// P' = TP @ T' + RR'.
+		copy(newP, RRt)
 		for i := 0; i < r; i++ {
-			for j := 0; j < r; j++ {
-				s := RRt[i*r+j]
-				for k := 0; k < r; k++ {
-					s += TP[i*r+k] * Trow[j*r+k]
-				}
-				newP[i*r+j] = s
+			row := i * r
+			for _, e := range nzT {
+				newP[row+e.i] += TP[row+e.j] * e.v
 			}
 		}
-		copy(P, newP)
+		P, newP = newP, P
 	}
 
 	if sumVF <= 0 {

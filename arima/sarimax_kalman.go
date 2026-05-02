@@ -2,8 +2,6 @@ package arima
 
 import (
 	"math"
-
-	"gonum.org/v1/gonum/mat"
 )
 
 // PublicSarimaxKalman exposes kalmanSARIMAX for parity diagnostics.
@@ -19,6 +17,21 @@ func PublicSarimaxKalmanK(y []float64, d, m, D int, phi, theta, sPhi, sTheta []f
 // PublicSarimaxKalmanAbs exposes kalmanSARIMAXAbs (absolute units, sigma2 as input).
 func PublicSarimaxKalmanAbs(y []float64, d, m, D int, phi, theta, sPhi, sTheta []float64, sigma2, kappa float64) (float64, []float64) {
 	return kalmanSARIMAXAbs(y, d, m, D, phi, theta, sPhi, sTheta, sigma2, kappa)
+}
+
+// extractTNonzeros walks the dense 2D T and returns its nonzero entries.
+func extractTNonzeros(T [][]float64) []tNZ {
+	rd := len(T)
+	out := make([]tNZ, 0, 4*rd)
+	for i := 0; i < rd; i++ {
+		row := T[i]
+		for j := 0; j < rd; j++ {
+			if row[j] != 0 {
+				out = append(out, tNZ{i, j, row[j]})
+			}
+		}
+	}
+	return out
 }
 
 // kalmanSARIMAXAbs runs the SARIMAX Kalman filter in absolute units (sigma2
@@ -40,27 +53,25 @@ func kalmanSARIMAXAbs(
 	if rd == 0 || sigma2 <= 0 {
 		return math.Inf(1), nil
 	}
-	Tflat := make([]float64, rd*rd)
+	rd2 := rd * rd
+	nzT := extractTNonzeros(T2D)
+
+	RRt := make([]float64, rd2)
 	for i := 0; i < rd; i++ {
+		ri := rCol[i]
+		if ri == 0 {
+			continue
+		}
+		base := i * rd
+		s := sigma2 * ri
 		for j := 0; j < rd; j++ {
-			Tflat[i*rd+j] = T2D[i][j]
+			RRt[base+j] = s * rCol[j]
 		}
 	}
-	T := mat.NewDense(rd, rd, Tflat)
 
-	// Q = sigma2 * R*R'
-	RRtFlat := make([]float64, rd*rd)
-	for i := 0; i < rd; i++ {
-		for j := 0; j < rd; j++ {
-			RRtFlat[i*rd+j] = sigma2 * rCol[i] * rCol[j]
-		}
-	}
-	RRt := mat.NewDense(rd, rd, RRtFlat)
-
-	// Initial covariance: kappa on integrated diagonal, sigma2*stationary on ARMA.
-	P := mat.NewDense(rd, rd, nil)
+	P := make([]float64, rd2)
 	for i := 0; i < kStatesDiff; i++ {
-		P.Set(i, i, kappa)
+		P[i*rd+i] = kappa
 	}
 	if kArma := rd - kStatesDiff; kArma > 0 {
 		fullPhi := expandSARMA(phi, sPhi, m)
@@ -69,7 +80,7 @@ func kalmanSARIMAXAbs(
 		pr, _ := Pst.Dims()
 		for i := 0; i < pr && kStatesDiff+i < rd; i++ {
 			for j := 0; j < pr && kStatesDiff+j < rd; j++ {
-				P.Set(kStatesDiff+i, kStatesDiff+j, sigma2*Pst.At(i, j))
+				P[(kStatesDiff+i)*rd+(kStatesDiff+j)] = sigma2 * Pst.At(i, j)
 			}
 		}
 	}
@@ -82,26 +93,28 @@ func kalmanSARIMAXAbs(
 
 	PzT := make([]float64, rd)
 	K := make([]float64, rd)
-	ZP := make([]float64, rd)
 	newA := make([]float64, rd)
+	TP := make([]float64, rd2)
+	newP := make([]float64, rd2)
 
 	for t := 0; t < n; t++ {
 		predY := 0.0
-		for i, zi := range zRow {
-			predY += zi * a[i]
+		for i := 0; i < rd; i++ {
+			predY += zRow[i] * a[i]
 		}
 		v := y[t] - predY
 		innov[t] = v
 		for i := 0; i < rd; i++ {
+			base := i * rd
 			s := 0.0
 			for j := 0; j < rd; j++ {
-				s += P.At(i, j) * zRow[j]
+				s += P[base+j] * zRow[j]
 			}
 			PzT[i] = s
 		}
 		F := 0.0
-		for i, zi := range zRow {
-			F += zi * PzT[i]
+		for i := 0; i < rd; i++ {
+			F += zRow[i] * PzT[i]
 		}
 		if F <= 0 || math.IsNaN(F) {
 			return math.Inf(1), innov
@@ -109,41 +122,54 @@ func kalmanSARIMAXAbs(
 		invF := 1.0 / F
 		for i := 0; i < rd; i++ {
 			K[i] = PzT[i] * invF
-		}
-		for i := 0; i < rd; i++ {
 			a[i] += K[i] * v
 		}
+		// ZP[j] = sum_i z[i]*P[i,j]; then P -= K * ZP (rank-1 update).
 		for j := 0; j < rd; j++ {
 			s := 0.0
 			for i := 0; i < rd; i++ {
-				s += zRow[i] * P.At(i, j)
+				s += zRow[i] * P[i*rd+j]
 			}
-			ZP[j] = s
+			PzT[j] = s // reuse buffer as ZP
 		}
 		for i := 0; i < rd; i++ {
 			ki := K[i]
+			base := i * rd
 			for j := 0; j < rd; j++ {
-				P.Set(i, j, P.At(i, j)-ki*ZP[j])
+				P[base+j] -= ki * PzT[j]
 			}
 		}
 		if t >= burn {
 			logL -= 0.5 * (math.Log(2*math.Pi*F) + v*v*invF)
 		}
+		// Predict: a' = T*a (sparse).
 		for i := 0; i < rd; i++ {
-			s := 0.0
-			for j := 0; j < rd; j++ {
-				s += T.At(i, j) * a[j]
-			}
-			newA[i] = s
+			newA[i] = 0
+		}
+		for _, e := range nzT {
+			newA[e.i] += e.v * a[e.j]
 		}
 		copy(a, newA)
-		var TP mat.Dense
-		TP.Mul(T, P)
-		var TPTt mat.Dense
-		TPTt.Mul(&TP, T.T())
-		var newP mat.Dense
-		newP.Add(&TPTt, RRt)
-		P = mat.DenseCopyOf(&newP)
+		// P' = T*P*T' + RR'.
+		for k := range TP {
+			TP[k] = 0
+		}
+		for _, e := range nzT {
+			ti := e.i * rd
+			tj := e.j * rd
+			tv := e.v
+			for j := 0; j < rd; j++ {
+				TP[ti+j] += tv * P[tj+j]
+			}
+		}
+		copy(newP, RRt)
+		for i := 0; i < rd; i++ {
+			row := i * rd
+			for _, e := range nzT {
+				newP[row+e.i] += TP[row+e.j] * e.v
+			}
+		}
+		P, newP = newP, P
 	}
 	return -logL, innov
 }
@@ -175,110 +201,92 @@ func kalmanSARIMAX(
 		s2 := sse / float64(len(y))
 		return float64(len(y)) / 2 * (math.Log(2*math.Pi*s2) + 1), s2, nil
 	}
+	rd2 := rd * rd
+	nzT := extractTNonzeros(T2D)
 
-	// Convert T to mat.Dense for predict-step matrix products.
-	Tflat := make([]float64, rd*rd)
+	RRt := make([]float64, rd2)
 	for i := 0; i < rd; i++ {
+		ri := rCol[i]
+		if ri == 0 {
+			continue
+		}
+		base := i * rd
 		for j := 0; j < rd; j++ {
-			Tflat[i*rd+j] = T2D[i][j]
+			RRt[base+j] = ri * rCol[j]
 		}
 	}
-	T := mat.NewDense(rd, rd, Tflat)
 
-	// RR^T (selection outer product)
-	RRtFlat := make([]float64, rd*rd)
-	for i := 0; i < rd; i++ {
-		for j := 0; j < rd; j++ {
-			RRtFlat[i*rd+j] = rCol[i] * rCol[j]
-		}
-	}
-	RRt := mat.NewDense(rd, rd, RRtFlat)
-
-	// Initial covariance:
-	//   integrated states (positions [0, kStatesDiff)): diagonal kappa
-	//   ARMA block       (positions [kStatesDiff, rd)): stationary via Gardner getQ0
-	P := mat.NewDense(rd, rd, nil)
+	P := make([]float64, rd2)
 	for i := 0; i < kStatesDiff; i++ {
-		P.Set(i, i, kappa)
+		P[i*rd+i] = kappa
 	}
 	if kArma := rd - kStatesDiff; kArma > 0 {
-		// Compute stationary cov of the ARMA companion block.
-		// We need the AR/MA coefficients in the form expandSARMA / expandSMA produces.
 		fullPhi := expandSARMA(phi, sPhi, m)
 		fullTheta := expandSMA(theta, sTheta, m)
-		// statsmodels initialization for the ARMA block: stationary distribution.
 		Pst := stationaryCovGardner(fullPhi, fullTheta)
 		pr, _ := Pst.Dims()
-		// The Pst matrix is the standard Hamilton stationary form for ARMA.
-		// statsmodels' ARMA companion uses the SAME shape; copy directly.
 		for i := 0; i < pr && kStatesDiff+i < rd; i++ {
 			for j := 0; j < pr && kStatesDiff+j < rd; j++ {
-				P.Set(kStatesDiff+i, kStatesDiff+j, Pst.At(i, j))
+				P[(kStatesDiff+i)*rd+(kStatesDiff+j)] = Pst.At(i, j)
 			}
 		}
 	}
 
-	a := make([]float64, rd) // a_{t|t-1}
+	a := make([]float64, rd)
 	n := len(y)
 	innov := make([]float64, n)
 	logF := 0.0
 	sumVF := 0.0
 	nu := 0
-	burn := kStatesDiff // drop first kStatesDiff observations from likelihood
+	burn := kStatesDiff
 
 	PzT := make([]float64, rd)
-	K := make([]float64, rd)
 	ZP := make([]float64, rd)
+	K := make([]float64, rd)
 	newA := make([]float64, rd)
+	TP := make([]float64, rd2)
+	newP := make([]float64, rd2)
 
 	for t := 0; t < n; t++ {
-		// v = y - Z*a
 		predY := 0.0
-		for i, zi := range zRow {
-			predY += zi * a[i]
+		for i := 0; i < rd; i++ {
+			predY += zRow[i] * a[i]
 		}
 		v := y[t] - predY
 		innov[t] = v
 
-		// PzT = P * Z'
 		for i := 0; i < rd; i++ {
+			base := i * rd
 			s := 0.0
 			for j := 0; j < rd; j++ {
-				s += P.At(i, j) * zRow[j]
+				s += P[base+j] * zRow[j]
 			}
 			PzT[i] = s
 		}
-		// F = Z * PzT
 		F := 0.0
-		for i, zi := range zRow {
-			F += zi * PzT[i]
+		for i := 0; i < rd; i++ {
+			F += zRow[i] * PzT[i]
 		}
 		if F <= 0 || math.IsNaN(F) {
 			return math.Inf(1), 0, innov
 		}
 		invF := 1.0 / F
-
-		// K = PzT / F
 		for i := 0; i < rd; i++ {
 			K[i] = PzT[i] * invF
-		}
-		// a_{t|t} = a + K * v
-		for i := 0; i < rd; i++ {
 			a[i] += K[i] * v
 		}
-		// ZP = Z * P
 		for j := 0; j < rd; j++ {
 			s := 0.0
 			for i := 0; i < rd; i++ {
-				s += zRow[i] * P.At(i, j)
+				s += zRow[i] * P[i*rd+j]
 			}
 			ZP[j] = s
 		}
-		// P -= K * ZP
 		for i := 0; i < rd; i++ {
 			ki := K[i]
+			base := i * rd
 			for j := 0; j < rd; j++ {
-				P.Set(i, j, P.At(i, j)-ki*ZP[j])
+				P[base+j] -= ki * ZP[j]
 			}
 		}
 
@@ -288,22 +296,34 @@ func kalmanSARIMAX(
 			nu++
 		}
 
-		// Predict: a' = T*a, P' = T P T' + RR'
+		// Predict.
 		for i := 0; i < rd; i++ {
-			s := 0.0
-			for j := 0; j < rd; j++ {
-				s += T.At(i, j) * a[j]
-			}
-			newA[i] = s
+			newA[i] = 0
+		}
+		for _, e := range nzT {
+			newA[e.i] += e.v * a[e.j]
 		}
 		copy(a, newA)
-		var TP mat.Dense
-		TP.Mul(T, P)
-		var TPTt mat.Dense
-		TPTt.Mul(&TP, T.T())
-		var newP mat.Dense
-		newP.Add(&TPTt, RRt)
-		P = mat.DenseCopyOf(&newP)
+
+		for k := range TP {
+			TP[k] = 0
+		}
+		for _, e := range nzT {
+			ti := e.i * rd
+			tj := e.j * rd
+			tv := e.v
+			for j := 0; j < rd; j++ {
+				TP[ti+j] += tv * P[tj+j]
+			}
+		}
+		copy(newP, RRt)
+		for i := 0; i < rd; i++ {
+			row := i * rd
+			for _, e := range nzT {
+				newP[row+e.i] += TP[row+e.j] * e.v
+			}
+		}
+		P, newP = newP, P
 	}
 
 	if nu == 0 || sumVF <= 0 {
