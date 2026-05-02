@@ -48,6 +48,13 @@ type ARIMA struct {
 	Method        Method // fitting method
 	MaxIter       int    // optimizer max iterations (default 100)
 
+	// Lambda enables a Box-Cox transform of y before fitting and inverts on
+	// Predict. nil = no transform; *Lambda = power (use 0 for log). Useful
+	// for stabilising variance on positive series. Mirrors pmdarima's
+	// `lambda` argument on ARIMA / auto_arima.
+	Lambda  *float64
+	Lambda2 float64 // additive shift before transform; ignored if Lambda is nil
+
 	// Fitted state
 	phi   []float64 // non-seasonal AR
 	theta []float64 // non-seasonal MA
@@ -94,6 +101,17 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		m.MaxIter = 100
 	}
 	m.yTrain = append([]float64{}, y...)
+	// Apply Box-Cox transform up front. yTrain stores the *original* y so
+	// Predict can inverse-transform back to the original scale.
+	yEff := y
+	if m.Lambda != nil {
+		t, err := boxCoxApply(y, *m.Lambda, m.Lambda2)
+		if err != nil {
+			return fmt.Errorf("Box-Cox: %w", err)
+		}
+		yEff = t
+	}
+	y = yEff
 	if exog != nil {
 		m.xTrain = cloneMat(exog)
 		m.nExog = len(exog[0])
@@ -503,8 +521,19 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 	fullPhi := expandSARMA(m.phi, m.Phi, m.Seasonal.M)
 	fullTheta := expandSMA(m.theta, m.Theta, m.Seasonal.M)
 
+	// Working copy of training y on the model scale. If Box-Cox was used,
+	// transform yTrain (which is stored in original units) into model units.
+	yMS := append([]float64{}, m.yTrain...)
+	if m.Lambda != nil {
+		t, err := boxCoxApply(yMS, *m.Lambda, m.Lambda2)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		yMS = t
+	}
+
 	// Reconstruct differenced training series and residuals.
-	ws := append([]float64{}, m.yTrain...)
+	ws := yMS
 	if m.Order.D > 0 {
 		ws = applyDiff(ws, 1, m.Order.D)
 	}
@@ -581,15 +610,16 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 		}
 	}
 
-	// Integrate seasonal differencing back
+	// Integrate seasonal differencing back. Use model-scale y (Box-Cox-
+	// transformed if applicable) since forecasts are in model units.
 	out := forecastDiffed
 	if m.Seasonal.Active() && m.Seasonal.D > 0 {
-		head := lastN(diffStream(m.yTrain, 1, m.Order.D), m.Seasonal.D*m.Seasonal.M)
+		head := lastN(diffStream(yMS, 1, m.Order.D), m.Seasonal.D*m.Seasonal.M)
 		full := integrateBack(out, head, m.Seasonal.M, m.Seasonal.D)
 		out = full[len(head):]
 	}
 	if m.Order.D > 0 {
-		head := lastN(m.yTrain, m.Order.D)
+		head := lastN(yMS, m.Order.D)
 		full := integrateBack(out, head, 1, m.Order.D)
 		out = full[len(head):]
 	}
@@ -607,6 +637,15 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 			se := math.Sqrt(m.sigma2 * var2)
 			lower[h] = out[h] - z*se
 			upper[h] = out[h] + z*se
+		}
+	}
+
+	// Invert Box-Cox if applied during Fit.
+	if m.Lambda != nil {
+		out = boxCoxInvert(out, *m.Lambda, m.Lambda2)
+		if lower != nil {
+			lower = boxCoxInvert(lower, *m.Lambda, m.Lambda2)
+			upper = boxCoxInvert(upper, *m.Lambda, m.Lambda2)
 		}
 	}
 	return out, lower, upper, nil
