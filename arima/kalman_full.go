@@ -97,55 +97,40 @@ func kalmanARIMAFull(
 	RRt := mat.NewDense(rd, rd, nil)
 	RRt.Mul(rCol, rCol.T())
 
-	// Initial covariance: stationary ARMA + diagonal kappa for integrated states.
+	// Initial covariance: ARMA block via Gardner's stationary algorithm
+	// (R's getQ0), integrated block diagonal kappa.
 	P0 := mat.NewDense(rd, rd, nil)
 	if r > 0 {
-		Tarma := mat.NewDense(r, r, nil)
-		for i := 0; i < r; i++ {
-			if i < p {
-				Tarma.Set(i, 0, fullPhi[i])
-			}
-			if i+1 < r {
-				Tarma.Set(i, i+1, 1)
-			}
-		}
-		Rarma := mat.NewVecDense(r, nil)
-		Rarma.SetVec(0, 1)
-		for j := 0; j < q; j++ {
-			if j+1 < r {
-				Rarma.SetVec(j+1, fullTheta[j])
-			}
-		}
-		QQ := mat.NewDense(r, r, nil)
-		QQ.Mul(Rarma, Rarma.T())
-		Pst, ok := stationaryCov(Tarma, QQ, r)
-		if ok {
-			for i := 0; i < r; i++ {
-				for j := 0; j < r; j++ {
-					P0.Set(i, j, Pst.At(i, j))
-				}
-			}
-		} else {
-			for i := 0; i < r; i++ {
-				P0.Set(i, i, 1)
+		Pst := stationaryCovGardner(fullPhi, fullTheta)
+		pr, _ := Pst.Dims()
+		for i := 0; i < pr; i++ {
+			for j := 0; j < pr; j++ {
+				P0.Set(i, j, Pst.At(i, j))
 			}
 		}
 	}
-	// Diagonal kappa for integrated states; ARMA block already stationary.
+	// Exact diffuse Kalman filter (Durbin-Koopman 2003, eqs 5.10-5.18).
+	// Decompose P = lim_{kappa→∞} kappa * P_inf + P_*. P_inf carries the
+	// rank-deficient diffuse prior (identity on integrated states); P_* is
+	// the regular finite covariance (stationary ARMA on top, zero elsewhere).
+	_ = kappa // unused with the exact algorithm
+	Pstar := P0
+	Pinf := mat.NewDense(rd, rd, nil)
 	for i := 0; i < dInt; i++ {
-		P0.Set(r+i, r+i, kappa)
+		Pinf.Set(r+i, r+i, 1)
 	}
-	a := mat.NewVecDense(rd, nil)
-	P := mat.DenseCopyOf(P0)
 
+	a := mat.NewVecDense(rd, nil)
 	n := len(y)
 	innov := make([]float64, n)
-	const gainThreshold = 1e4
 	logF := 0.0
 	sumVF := 0.0
 	nu := 0
+	diffuseDone := dInt == 0
+	const tol = 1e-12
 
 	for t := 0; t < n; t++ {
+		// v_t = y_t - Z * a_{t|t-1}
 		predY := 0.0
 		for i, zi := range zRow {
 			predY += zi * a.AtVec(i)
@@ -153,64 +138,105 @@ func kalmanARIMAFull(
 		v := y[t] - predY
 		innov[t] = v
 
-		PzT := make([]float64, rd)
+		// M_inf = P_inf * Z'  (column vector)
+		// M_*   = P_*   * Z'
+		Minf := make([]float64, rd)
+		Mstar := make([]float64, rd)
 		for i := 0; i < rd; i++ {
-			s := 0.0
+			si := 0.0
+			ss := 0.0
 			for j := 0; j < rd; j++ {
-				s += P.At(i, j) * zRow[j]
+				si += Pinf.At(i, j) * zRow[j]
+				ss += Pstar.At(i, j) * zRow[j]
 			}
-			PzT[i] = s
+			Minf[i] = si
+			Mstar[i] = ss
 		}
-		F := 0.0
+		Finf := 0.0
+		Fstar := 0.0
 		for i, zi := range zRow {
-			F += zi * PzT[i]
-		}
-		if F <= 0 || math.IsNaN(F) {
-			return math.Inf(1), 0, innov
-		}
-		K := make([]float64, rd)
-		for i := 0; i < rd; i++ {
-			K[i] = PzT[i] / F
-		}
-		for i := 0; i < rd; i++ {
-			a.SetVec(i, a.AtVec(i)+K[i]*v)
-		}
-		ZP := make([]float64, rd)
-		for j := 0; j < rd; j++ {
-			s := 0.0
-			for i := 0; i < rd; i++ {
-				s += zRow[i] * P.At(i, j)
-			}
-			ZP[j] = s
-		}
-		for i := 0; i < rd; i++ {
-			ki := K[i]
-			for j := 0; j < rd; j++ {
-				P.Set(i, j, P.At(i, j)-ki*ZP[j])
-			}
+			Finf += zi * Minf[i]
+			Fstar += zi * Mstar[i]
 		}
 
-		if F < gainThreshold {
+		if !diffuseDone && Finf > tol {
+			// === Exact diffuse step (kappa→∞ limit of standard Kalman) ===
+			invFinf := 1.0 / Finf
+			Kinf := make([]float64, rd)
+			for i := 0; i < rd; i++ {
+				Kinf[i] = Minf[i] * invFinf
+			}
+			for i := 0; i < rd; i++ {
+				a.SetVec(i, a.AtVec(i)+Kinf[i]*v)
+			}
+			fStarOverFinf2 := Fstar * invFinf * invFinf
+			for i := 0; i < rd; i++ {
+				for j := 0; j < rd; j++ {
+					Pinf.Set(i, j, Pinf.At(i, j)-Kinf[i]*Minf[j])
+					Pstar.Set(i, j,
+						Pstar.At(i, j)+
+							fStarOverFinf2*Minf[i]*Minf[j]-
+							invFinf*(Minf[i]*Mstar[j]+Mstar[i]*Minf[j]))
+				}
+			}
+			// R / stats::arima convention: diffuse-phase observations are
+			// excluded from the concentrated likelihood entirely. (DK 2003
+			// would include log(F_inf) here; for exact R parity we skip.)
+		} else {
+			// === Standard step on P_* (no remaining diffuse rank) ===
+			diffuseDone = true
+			F := Fstar
+			if F <= tol || math.IsNaN(F) {
+				return math.Inf(1), 0, innov
+			}
+			invF := 1.0 / F
+			K := make([]float64, rd)
+			for i := 0; i < rd; i++ {
+				K[i] = Mstar[i] * invF
+			}
+			for i := 0; i < rd; i++ {
+				a.SetVec(i, a.AtVec(i)+K[i]*v)
+			}
+			for i := 0; i < rd; i++ {
+				for j := 0; j < rd; j++ {
+					Pstar.Set(i, j, Pstar.At(i, j)-K[i]*Mstar[j])
+				}
+			}
 			logF += math.Log(F)
-			sumVF += v * v / F
+			sumVF += v * v * invF
 			nu++
 		}
 
+		// Predict to t+1: a' = T*a, P_inf' = T*P_inf*T', P_*' = T*P_**T' + RR'
 		newA := mat.NewVecDense(rd, nil)
 		newA.MulVec(T, a)
 		a = newA
-		var TP mat.Dense
-		TP.Mul(T, P)
-		var TPTt mat.Dense
-		TPTt.Mul(&TP, T.T())
-		var newP mat.Dense
-		newP.Add(&TPTt, RRt)
-		P = mat.DenseCopyOf(&newP)
+
+		var TPstar, TPstarTt, newPstar mat.Dense
+		TPstar.Mul(T, Pstar)
+		TPstarTt.Mul(&TPstar, T.T())
+		newPstar.Add(&TPstarTt, RRt)
+		Pstar = mat.DenseCopyOf(&newPstar)
+
+		if !diffuseDone {
+			var TPinf, TPinfTt mat.Dense
+			TPinf.Mul(T, Pinf)
+			TPinfTt.Mul(&TPinf, T.T())
+			Pinf = mat.DenseCopyOf(&TPinfTt)
+			tr := 0.0
+			for i := 0; i < rd; i++ {
+				tr += Pinf.At(i, i)
+			}
+			if tr < tol {
+				diffuseDone = true
+			}
+		}
 	}
 
 	if nu == 0 || sumVF <= 0 {
 		return math.Inf(1), 0, innov
 	}
+	// Standard concentrated-σ² Gaussian likelihood, R's stats::arima form.
 	s2 := sumVF / float64(nu)
 	negLL := 0.5 * (float64(nu)*(math.Log(2*math.Pi*s2)+1) + logF)
 	return negLL, s2, innov
