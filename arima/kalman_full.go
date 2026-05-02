@@ -6,16 +6,19 @@ import (
 	"gonum.org/v1/gonum/mat"
 )
 
+
+
 // kalmanARIMAFull computes the Gaussian log-likelihood for ARIMA(p,d,q)(P,D,Q,m)
 // using the full integrated state-space form (no pre-differencing).
 //
 // Mirrors `stats::makeARIMA` + `C_ARIMA_Like` from R: state dimension is
 // r + d + D*m where r = max(p, q+1). Integrated states are initialized with
-// diffuse (large) covariance kappa.
-//
-// y is the *un-differenced* training series. phi/theta refer to the
-// non-seasonal AR/MA; sPhi/sTheta to seasonal AR/MA. Internal expansion
-// produces the full ARMA polynomials.
+// a large diffuse covariance kappa, and observations whose prediction
+// variance exceeds 1e4 (R's threshold) are skipped from the likelihood sum.
+// This matches R's behaviour for most models; for AR-with-seasonal-
+// differencing models on high-magnitude data, the kappa-leakage at the
+// transition between the diffuse phase and steady state can lead the
+// optimizer to a different (lower-IC) local maximum than R reports.
 //
 // Returns (negLogLik, sigma2_concentrated, innovations).
 func kalmanARIMAFull(
@@ -94,9 +97,7 @@ func kalmanARIMAFull(
 	RRt := mat.NewDense(rd, rd, nil)
 	RRt.Mul(rCol, rCol.T())
 
-	// Initial state covariance:
-	//   ARMA block (r x r): stationary
-	//   Integrated block (dInt x dInt diagonal): kappa
+	// Initial covariance: stationary ARMA + diagonal kappa for integrated states.
 	P0 := mat.NewDense(rd, rd, nil)
 	if r > 0 {
 		Tarma := mat.NewDense(r, r, nil)
@@ -125,34 +126,33 @@ func kalmanARIMAFull(
 				}
 			}
 		} else {
-			// fallback: large
 			for i := 0; i < r; i++ {
 				P0.Set(i, i, 1)
 			}
 		}
 	}
+	// Diagonal kappa for integrated states; ARMA block already stationary.
 	for i := 0; i < dInt; i++ {
 		P0.Set(r+i, r+i, kappa)
 	}
-
-	a := mat.NewVecDense(rd, nil) // mean = 0
+	a := mat.NewVecDense(rd, nil)
 	P := mat.DenseCopyOf(P0)
 
 	n := len(y)
 	innov := make([]float64, n)
-	fSteps := make([]float64, n)
-	vSteps := make([]float64, n)
+	const gainThreshold = 1e4
+	logF := 0.0
+	sumVF := 0.0
+	nu := 0
 
 	for t := 0; t < n; t++ {
-		// y_t - Z*a
 		predY := 0.0
 		for i, zi := range zRow {
 			predY += zi * a.AtVec(i)
 		}
 		v := y[t] - predY
-		// F_t = Z * P * Z^T
-		F := 0.0
-		// Compute P * Z^T → vector of length rd, then dot with Z.
+		innov[t] = v
+
 		PzT := make([]float64, rd)
 		for i := 0; i < rd; i++ {
 			s := 0.0
@@ -161,23 +161,20 @@ func kalmanARIMAFull(
 			}
 			PzT[i] = s
 		}
+		F := 0.0
 		for i, zi := range zRow {
 			F += zi * PzT[i]
 		}
 		if F <= 0 || math.IsNaN(F) {
 			return math.Inf(1), 0, innov
 		}
-		// K_t = P * Z^T / F
 		K := make([]float64, rd)
 		for i := 0; i < rd; i++ {
 			K[i] = PzT[i] / F
 		}
-		// Update a: a + K*v
 		for i := 0; i < rd; i++ {
 			a.SetVec(i, a.AtVec(i)+K[i]*v)
 		}
-		// Update P: P - K * (Z * P) (rank-1)
-		// First compute ZP = Z * P (1 x rd)
 		ZP := make([]float64, rd)
 		for j := 0; j < rd; j++ {
 			s := 0.0
@@ -193,11 +190,12 @@ func kalmanARIMAFull(
 			}
 		}
 
-		innov[t] = v
-		fSteps[t] = F
-		vSteps[t] = v
+		if F < gainThreshold {
+			logF += math.Log(F)
+			sumVF += v * v / F
+			nu++
+		}
 
-		// Predict: a = T*a, P = T P T^T + RR^T.
 		newA := mat.NewVecDense(rd, nil)
 		newA.MulVec(T, a)
 		a = newA
@@ -210,29 +208,11 @@ func kalmanARIMAFull(
 		P = mat.DenseCopyOf(&newP)
 	}
 
-	// Exact-diffuse adjustment (Koopman 1997 / R's `ARIMA_Like`):
-	// drop the first dInt observations from the likelihood sum because
-	// they are dominated by the kappa prior. This recovers the proper
-	// likelihood that R and statsmodels report.
-	skip := dInt
-	if skip > n {
-		skip = n
-	}
-	useN := n - skip
-	if useN <= 0 {
+	if nu == 0 || sumVF <= 0 {
 		return math.Inf(1), 0, innov
 	}
-	logF := 0.0
-	sumVF := 0.0
-	for t := skip; t < n; t++ {
-		logF += math.Log(fSteps[t])
-		sumVF += vSteps[t] * vSteps[t] / fSteps[t]
-	}
-	if sumVF <= 0 {
-		return math.Inf(1), 0, innov
-	}
-	s2 := sumVF / float64(useN)
-	negLL := 0.5 * (float64(useN)*(math.Log(2*math.Pi*s2)+1) + logF)
+	s2 := sumVF / float64(nu)
+	negLL := 0.5 * (float64(nu)*(math.Log(2*math.Pi*s2)+1) + logF)
 	return negLL, s2, innov
 }
 

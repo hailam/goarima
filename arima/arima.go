@@ -61,11 +61,16 @@ type ARIMA struct {
 	// which matches statsmodels SARIMAX(simple_differencing=True) to
 	// numerical precision.
 	//
-	// EXPERIMENTAL: the non-simple integrated-state-space implementation
-	// uses a diffuse approximation that matches R exactly for pure-MA
-	// + differencing models (e.g. the canonical airline model) but can
-	// land on a different local optimum than R for AR-with-differencing
-	// models. For exact R parity in those cases, use simple differencing.
+	// EXPERIMENTAL: the implementation uses R's gain-threshold diffuse
+	// approximation (kappa=1e6, skip likelihood when prediction-variance
+	// gain >= 1e4). This matches R exactly for:
+	//   - pure non-seasonal ARIMA(p,d,q) models (e.g. AirPassengers (2,1,1))
+	//   - pure-MA seasonal models (e.g. canonical airline log)
+	// For AR + seasonal-differencing models on high-magnitude data
+	// (e.g. wineind), the optimizer may converge to a different local
+	// optimum than R because kappa-leakage interacts with the data scale.
+	// The exact Koopman-Durbin diffuse Kalman filter would close that gap;
+	// it is left as future work.
 	NonSimpleDifferencing bool
 
 	// Fitted state
