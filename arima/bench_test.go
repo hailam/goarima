@@ -98,3 +98,24 @@ func BenchmarkKalmanARIMAFull(b *testing.B) {
 		_, _, _ = kalmanARIMAFull(wi, 1, 12, 1, phi, theta, nil, sTheta, 1e6)
 	}
 }
+
+// BenchmarkPredictRepeated measures repeat-Predict on a fitted SARIMA model
+// (e.g., as in cross-validation or simulation studies). Exercises the cached
+// wsCenteredCache / yMSCache path.
+func BenchmarkPredictRepeated(b *testing.B) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m := NewARIMA(Order{P: 0, D: 1, Q: 1})
+	m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+	m.MaxIter = 100
+	if err := m.Fit(logAp, nil); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _, _, _ = m.Predict(12, 0.05, nil)
+	}
+}

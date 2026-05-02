@@ -107,6 +107,10 @@ type ARIMA struct {
 	fitted  bool
 	psiInf  []float64 // truncated MA(infinity) for forecast variance
 	psiInfN int
+
+	// Predict caches (set at end of Fit, reused on every Predict call).
+	yMSCache       []float64 // yTrain on the model scale (Box-Cox-applied if used)
+	wsCenteredCache []float64 // differenced + centered training series (= residOf(best))
 }
 
 // NewARIMA constructs an ARIMA with default configuration.
@@ -145,6 +149,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		yEff = t
 	}
 	y = yEff
+	m.yMSCache = append([]float64(nil), y...)
 	if exog != nil {
 		m.xTrain = cloneMat(exog)
 		m.nExog = len(exog[0])
@@ -242,6 +247,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		}
 		m.sigma2 = sse / float64(len(ws))
 		m.resids = append([]float64{}, ws...)
+		m.wsCenteredCache = append([]float64(nil), ws...)
 		m.logL = -0.5 * float64(len(ws)) * (math.Log(2*math.Pi*m.sigma2) + 1)
 		m.fitted = true
 		m.computePsi()
@@ -521,6 +527,11 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 
 	_, _, res := armaCSS(r, fullPhi, fullTheta)
 	m.resids = res
+
+	// Cache the differenced+centered training series so Predict doesn't need
+	// to redo Box-Cox + applyDiff + armaCSS each call. (yMSCache is set up
+	// front during Fit, immediately after Box-Cox.)
+	m.wsCenteredCache = append([]float64(nil), r...)
 
 	m.fitted = true
 	m.computePsi()
@@ -812,46 +823,12 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 	fullPhi := expandSARMA(m.phi, m.Phi, m.Seasonal.M)
 	fullTheta := expandSMA(m.theta, m.Theta, m.Seasonal.M)
 
-	// Working copy of training y on the model scale. If Box-Cox was used,
-	// transform yTrain (which is stored in original units) into model units.
-	yMS := append([]float64{}, m.yTrain...)
-	if m.Lambda != nil {
-		t, err := boxCoxApply(yMS, *m.Lambda, m.Lambda2)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		yMS = t
-	}
-
-	// Reconstruct differenced training series and residuals.
-	ws := yMS
-	if m.Order.D > 0 {
-		ws = applyDiff(ws, 1, m.Order.D)
-	}
-	if m.Seasonal.Active() && m.Seasonal.D > 0 {
-		ws = applyDiff(ws, m.Seasonal.M, m.Seasonal.D)
-	}
-	var wX [][]float64
-	if m.xTrain != nil {
-		wX = cloneMat(m.xTrain)
-		if m.Order.D > 0 {
-			wX = applyMatDiff(wX, 1, m.Order.D)
-		}
-		if m.Seasonal.Active() && m.Seasonal.D > 0 {
-			wX = applyMatDiff(wX, m.Seasonal.M, m.Seasonal.D)
-		}
-	}
-	wsCentered := make([]float64, len(ws))
-	for i, v := range ws {
-		r := v - m.mean - m.c
-		if wX != nil {
-			for j, b := range m.beta {
-				r -= b * wX[i][j]
-			}
-		}
-		wsCentered[i] = r
-	}
-	_, _, res := armaCSS(wsCentered, fullPhi, fullTheta)
+	// Cached at end of Fit: yMS is yTrain on the model scale (Box-Cox-applied
+	// if Lambda was set), wsCentered is the differenced+centered training
+	// series, and m.resids holds the in-sample residuals.
+	yMS := m.yMSCache
+	wsCentered := m.wsCenteredCache
+	res := m.resids
 
 	// Difference the (combined) future exog. We need the full historical+future
 	// X matrix differenced, then take only the future tail.
