@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"runtime"
+	"sync"
 
 	"gonum.org/v1/gonum/optimize"
 )
@@ -525,21 +527,67 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	return nil
 }
 
+// parallelGradient returns a central-difference gradient function that
+// evaluates the 2*n perturbed objective calls concurrently across goroutines.
+//
+// `f` must be safe for concurrent invocation with distinct argument vectors —
+// our objectives allocate fresh state per call and do not mutate captured
+// slices, which satisfies this. For tiny problems (<4 params) the goroutine
+// overhead can dominate, so we fall back to a sequential loop in that case.
+func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []float64) {
+	const eps = 1e-7
+	if nWorkers < 1 {
+		nWorkers = 1
+	}
+	return func(grad, x []float64) {
+		n := len(x)
+		if n < 4 {
+			// sequential — overhead exceeds gain at small n
+			for i := 0; i < n; i++ {
+				save := x[i]
+				x[i] = save + eps
+				fp := f(x)
+				x[i] = save - eps
+				fm := f(x)
+				x[i] = save
+				grad[i] = (fp - fm) / (2 * eps)
+			}
+			return
+		}
+		jobs := make(chan int, n)
+		var wg sync.WaitGroup
+		for w := 0; w < nWorkers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				xLocal := make([]float64, n)
+				for i := range jobs {
+					copy(xLocal, x)
+					xLocal[i] += eps
+					fp := f(xLocal)
+					xLocal[i] -= 2 * eps
+					fm := f(xLocal)
+					xLocal[i] += eps // restore for next iter (cheap)
+					grad[i] = (fp - fm) / (2 * eps)
+				}
+			}()
+		}
+		for i := 0; i < n; i++ {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+	}
+}
+
 // minimize runs BFGS with a numerical gradient. Falls back to Nelder-Mead
 // if BFGS fails or stalls. Returns the best parameter vector found.
+//
+// The numerical gradient is computed in parallel — each component requires
+// two independent f(x) calls, dispatched to goroutines (a Go-specific win
+// since each f() allocates fresh state and does not mutate shared memory).
 func minimize(f func([]float64) float64, x0 []float64, maxIter int) []float64 {
-	gradFn := func(grad, x []float64) {
-		const eps = 1e-7
-		for i := range x {
-			save := x[i]
-			x[i] = save + eps
-			fp := f(x)
-			x[i] = save - eps
-			fm := f(x)
-			x[i] = save
-			grad[i] = (fp - fm) / (2 * eps)
-		}
-	}
+	gradFn := parallelGradient(f, runtime.GOMAXPROCS(0))
 	prob := optimize.Problem{Func: f, Grad: gradFn}
 	settings := &optimize.Settings{
 		MajorIterations:   maxIter,
