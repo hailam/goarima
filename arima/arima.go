@@ -1036,8 +1036,23 @@ func cloneMat(x [][]float64) [][]float64 {
 }
 
 // computePsi precomputes truncated MA(infinity) coefficients for forecast variance.
+//
+// For ARIMA(p,d,q)(P,D,Q,m) the integrated process is
+//
+//	y_t = [theta(B) Theta(B^m)] / [phi(B) Phi(B^m) (1-B)^d (1-B^m)^D] · e_t
+//
+// We first compute psi for the ARMA part via the standard recursion, then
+// integrate to account for differencing:
+//
+//   - 1/(1-B)   = 1 + B + B² + …  ⇒ apply cumulative sum, once per d.
+//   - 1/(1-B^m) = 1 + B^m + B^{2m} + … ⇒ apply stride-m cumulative sum, once per D.
+//
+// Without this integration step, forecast variance is constant in h for any
+// purely-integrated model — e.g. ARIMA(0,1,0) gets flat alpha-CIs instead of
+// the SD growing like √h. Matches R's `forecast::forecast` and
+// statsmodels' `SARIMAXResults.get_forecast` variance growth.
 func (m *ARIMA) computePsi() {
-	maxLag := 100
+	const maxLag = 100
 	fullPhi := expandSARMA(m.phi, m.Phi, m.Seasonal.M)
 	fullTheta := expandSMA(m.theta, m.Theta, m.Seasonal.M)
 	psi := make([]float64, maxLag)
@@ -1053,6 +1068,20 @@ func (m *ARIMA) computePsi() {
 			s += fullTheta[h-1]
 		}
 		psi[h] = s
+	}
+	// Integrate non-seasonal differencing (apply 1/(1-B), d times).
+	for k := 0; k < m.Order.D; k++ {
+		for h := 1; h < maxLag; h++ {
+			psi[h] += psi[h-1]
+		}
+	}
+	// Integrate seasonal differencing (apply 1/(1-B^m), D times).
+	if m.Seasonal.Active() && m.Seasonal.D > 0 && m.Seasonal.M > 0 {
+		for k := 0; k < m.Seasonal.D; k++ {
+			for h := m.Seasonal.M; h < maxLag; h++ {
+				psi[h] += psi[h-m.Seasonal.M]
+			}
+		}
 	}
 	m.psiInf = psi
 	m.psiInfN = maxLag
