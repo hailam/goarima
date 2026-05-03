@@ -171,31 +171,62 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		scoring = metrics.SMAPE
 	}
 
-	// Determine d on the fitting set.
-	d := opts.D
-	if !opts.HasD {
-		nd, err := NDiffs(yFit, NDiffsOpts{
-			Alpha: opts.Alpha, Test: opts.Test, MaxD: opts.MaxD,
-		})
-		if err != nil {
-			return nil, fmt.Errorf("ndiffs: %w", err)
+	// Pre-regress exog out of y before running differencing tests. Mirrors
+	// pmdarima.auto_arima (auto.py:491-494) and forecast::auto.arima which
+	// both fit `y ~ X` via OLS and pass the residuals to nsdiffs/ndiffs.
+	// Without this step, when exog explains a chunk of the seasonal pattern
+	// (e.g. calendar regressors like Ramadan/holidays), the raw-y test
+	// over-detects seasonal differencing and selects D=1 where pmdarima/R
+	// (correctly) settle on D=0.
+	xx := yFit
+	if xFit != nil && len(xFit) == len(yFit) && len(xFit[0]) > 0 {
+		if beta, err := olsFit(xFit, yFit, true); err == nil && len(beta) == len(xFit[0])+1 {
+			adjusted := make([]float64, len(yFit))
+			for i, v := range yFit {
+				pred := beta[0] // intercept
+				for j, b := range beta[1:] {
+					pred += b * xFit[i][j]
+				}
+				adjusted[i] = v - pred
+			}
+			xx = adjusted
 		}
-		d = nd
 	}
 
-	// Determine D if seasonal.
+	// Determine D first (matches pmdarima/R order), then d on the
+	// seasonally-differenced residuals. Pre-fix d was determined from raw
+	// xx with no seasonal-diff awareness, which can over-detect d=2 on a
+	// series whose seasonality hasn't been removed yet.
 	D := 0
 	if opts.M > 1 {
 		if opts.HasDd {
 			D = opts.Dd
 		} else {
-			Dx, err := NSDiffs(yFit, NSDiffsOpts{
+			Dx, err := NSDiffs(xx, NSDiffsOpts{
 				M: opts.M, MaxD: opts.MaxCapD, Test: opts.SeasonalTest, MaxLag: 3,
 			})
 			if err == nil {
 				D = Dx
 			}
 		}
+	}
+
+	// Difference by D before estimating d, matching pmdarima auto.py:516-519
+	// and R's auto.arima.
+	dx := xx
+	if D > 0 && opts.M > 1 {
+		dx = applyDiff(xx, opts.M, D)
+	}
+
+	d := opts.D
+	if !opts.HasD {
+		nd, err := NDiffs(dx, NDiffsOpts{
+			Alpha: opts.Alpha, Test: opts.Test, MaxD: opts.MaxD,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("ndiffs: %w", err)
+		}
+		d = nd
 	}
 
 	// Initial seed.
