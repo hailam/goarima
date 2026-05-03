@@ -195,6 +195,73 @@ func TestRParityIncludeDrift(t *testing.T) {
 	}
 }
 
+// Codex #C15: a drift-fit model must Predict without the user reconstructing
+// the drift column. Mirrors R's forecast::forecast(model, h) behavior where
+// drift is auto-extended.
+func TestRParityIncludeDriftAutoExtendsForPredict(t *testing.T) {
+	m, err := RArima(datasets.LoadAirPassengers(), RArimaOpts{
+		Order:        Order{P: 0, D: 1, Q: 0},
+		IncludeDrift: true,
+		MaxIter:      100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.DriftIncluded {
+		t.Fatal("DriftIncluded flag not set")
+	}
+	if m.nExog != 1 {
+		t.Fatalf("expected nExog=1 (drift), got %d", m.nExog)
+	}
+	// Predict with nil futureExog — should NOT error; drift is auto-built.
+	fc, lo, hi, err := m.Predict(12, 0.05, nil)
+	if err != nil {
+		t.Fatalf("Predict with nil futureExog should auto-build drift: %v", err)
+	}
+	if len(fc) != 12 {
+		t.Errorf("got %d forecasts, want 12", len(fc))
+	}
+	// Drift coef should be positive (AirPassengers trends up); forecasts must
+	// also drift up.
+	if fc[11] <= fc[0] {
+		t.Errorf("expected upward drift in forecast: fc[0]=%g, fc[11]=%g", fc[0], fc[11])
+	}
+	// CI bands should grow with horizon for an integrated model (after #C8).
+	if (hi[11] - lo[11]) <= (hi[0] - lo[0]) {
+		t.Errorf("CI band did not widen with horizon: h0=%g, h11=%g",
+			hi[0]-lo[0], hi[11]-lo[11])
+	}
+
+	// Manual-drift path: verify identical numerics when the user does the
+	// reconstruction themselves (regression check that auto-extension matches
+	// the legacy manual path).
+	manual := make([][]float64, 12)
+	for i := range manual {
+		manual[i] = []float64{float64(len(datasets.LoadAirPassengers()) + i + 1)}
+	}
+	// Need a separate fit because Predict isn't idempotent on internal state
+	// in pathological cases — though in practice it is. For safety:
+	m2, err := RArima(datasets.LoadAirPassengers(), RArimaOpts{
+		Order:        Order{P: 0, D: 1, Q: 0},
+		IncludeDrift: true,
+		MaxIter:      100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m2.DriftIncluded = false // disable auto-extension to take the manual path
+	fcManual, _, _, err := m2.Predict(12, 0.05, manual)
+	if err != nil {
+		t.Fatalf("manual-drift Predict: %v", err)
+	}
+	for i := range fc {
+		if math.Abs(fc[i]-fcManual[i]) > 1e-9 {
+			t.Errorf("auto vs manual drift forecast mismatch at h=%d: %g vs %g",
+				i, fc[i], fcManual[i])
+		}
+	}
+}
+
 // include.drift errors when d+D > 1 (matches R's warning, here as an error).
 func TestRParityDriftWithHighDiff(t *testing.T) {
 	if _, err := RArima([]float64{1, 2, 3, 4, 5}, RArimaOpts{

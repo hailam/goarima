@@ -89,6 +89,7 @@ func RArima(y []float64, opts RArimaOpts) (*ARIMA, error) {
 		MaxIter:       maxIter,
 		Lambda:        opts.Lambda,
 		Lambda2:       opts.Lambda2,
+		DriftIncluded: opts.IncludeDrift,
 	}
 	if err := m.Fit(y, xreg); err != nil {
 		return nil, err

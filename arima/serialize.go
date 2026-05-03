@@ -29,6 +29,7 @@ type arimaSnapshot struct {
 	Lambda2               float64       `json:"lambda2,omitempty"`
 	NonSimpleDifferencing bool          `json:"non_simple_differencing,omitempty"`
 	DiffuseConvention     string        `json:"diffuse_convention"`
+	DriftIncluded         bool          `json:"drift_included,omitempty"`
 
 	// Fitted parameters
 	Phi    []float64 `json:"phi"`     // non-seasonal AR (lowercase phi in math)
@@ -110,6 +111,7 @@ func (m *ARIMA) toSnapshot() (*arimaSnapshot, error) {
 		Lambda2:               m.Lambda2,
 		NonSimpleDifferencing: m.NonSimpleDifferencing,
 		DiffuseConvention:     diffStr,
+		DriftIncluded:         m.DriftIncluded,
 		Phi:                   m.phi,
 		Theta:                 m.theta,
 		SPhi:                  m.Phi,
@@ -230,6 +232,7 @@ func (m *ARIMA) fromSnapshot(snap *arimaSnapshot) error {
 	m.Lambda2 = snap.Lambda2
 	m.NonSimpleDifferencing = snap.NonSimpleDifferencing
 	m.DiffuseConvention = diffuse
+	m.DriftIncluded = snap.DriftIncluded
 	m.phi = snap.Phi
 	m.theta = snap.Theta
 	m.Phi = snap.SPhi

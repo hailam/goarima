@@ -38,6 +38,9 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 	if alpha <= 0 || alpha >= 1 {
 		return nil, errors.New("alpha must be in (0,1)")
 	}
+	// Drift auto-extension (mirrors Predict) — prepend the linear time index
+	// before validating widths.
+	futureExog = m.extendDriftIfNeeded(futureExog, nPeriods)
 	if m.nExog > 0 {
 		if futureExog == nil || len(futureExog) != nPeriods {
 			return nil, fmt.Errorf("future exog rows (%d) must match nPeriods (%d)", len(futureExog), nPeriods)

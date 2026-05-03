@@ -244,11 +244,31 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		}
 	}
 
+	// gradientBudget computes the GradientWorkers cap for each candidate
+	// fit when AutoArima dispatches K parallel candidates. Splits cores
+	// evenly so the total goroutines (outer K × inner GradientWorkers)
+	// stays at GOMAXPROCS instead of K × GOMAXPROCS.
+	gradientBudget := func(nParallelFits int) int {
+		if nParallelFits <= 1 {
+			return 0 // 0 → use full GOMAXPROCS in minimize
+		}
+		gp := runtime.GOMAXPROCS(0)
+		w := gp / nParallelFits
+		if w < 1 {
+			w = 1
+		}
+		return w
+	}
+
 	// independentFit fits a single candidate without touching the cache.
 	// Used both by the FullSearch worker pool and by the stepwise parallel
 	// neighbor evaluation. No emit() calls — callers emit on the main
 	// goroutine after the fit completes (Trace func may not be thread-safe).
-	independentFit := func(k orderKey) (*ARIMA, float64, error) {
+	//
+	// gradWorkers is the per-fit BFGS gradient concurrency budget; pass 0
+	// to use full GOMAXPROCS (sequential fit context) or a smaller value
+	// when this fit is one of K running concurrently (so outer×inner ≤ GOMAXPROCS).
+	independentFit := func(k orderKey, gradWorkers int) (*ARIMA, float64, error) {
 		if k.p < 0 || k.q < 0 || k.P < 0 || k.Q < 0 {
 			return nil, 0, fmt.Errorf("negative orders")
 		}
@@ -264,11 +284,12 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 			ssn = SeasonalOrder{P: k.P, D: D, Q: k.Q, M: opts.M}
 		}
 		mdl := &ARIMA{
-			Order:         ord,
-			Seasonal:      ssn,
-			WithIntercept: withIntercept,
-			Method:        MethodCSSML,
-			MaxIter:       opts.MaxIter,
+			Order:           ord,
+			Seasonal:        ssn,
+			WithIntercept:   withIntercept,
+			Method:          MethodCSSML,
+			MaxIter:         opts.MaxIter,
+			GradientWorkers: gradWorkers,
 		}
 		if err := mdl.Fit(yFit, xFit); err != nil {
 			return nil, 0, err
@@ -293,7 +314,9 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// Fit one candidate; cached. Returns model and the chosen score (lower=better).
 	// Sequential entry point (used by the initial stepwise fit). Thread-safe
 	// against concurrent tryOrderCached / fitNeighborParallel via cacheMu.
-	tryOrder := func(p, q, capP, capQ int) (*ARIMA, float64, error) {
+	// gradWorkers is the BFGS gradient concurrency budget — pass via
+	// closure-bound variable that callers update before parallel dispatch.
+	tryOrder := func(p, q, capP, capQ, gradWorkers int) (*ARIMA, float64, error) {
 		k := orderKey{p, q, capP, capQ}
 		cacheMu.Lock()
 		if cached, ok := cache[k]; ok {
@@ -305,7 +328,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 			return cached, score, nil
 		}
 		cacheMu.Unlock()
-		mdl, score, err := independentFit(k)
+		mdl, score, err := independentFit(k, gradWorkers)
 		cacheMu.Lock()
 		if err != nil {
 			cache[k] = nil
@@ -390,13 +413,14 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		jobs := make(chan orderKey, len(combos))
 		results := make(chan result, len(combos))
 		var wg sync.WaitGroup
+		gradBudget := gradientBudget(nJobs)
 
 		for w := 0; w < nJobs; w++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
 				for k := range jobs {
-					mdl, score, err := independentFit(k)
+					mdl, score, err := independentFit(k, gradBudget)
 					results <- result{key: k, model: mdl, score: score, err: err}
 				}
 			}()
@@ -440,7 +464,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	}
 
 	// Stepwise neighbor exploration.
-	best, bestScore, err := tryOrder(p, q, P, Q)
+	best, bestScore, err := tryOrder(p, q, P, Q, 0)
 	if err != nil {
 		if e := handleErr(err); e != nil {
 			return nil, fmt.Errorf("initial fit failed: %w", e)
@@ -511,10 +535,11 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		}
 		results := make([]stepResult, len(neighbors))
 
+		gradBudget := gradientBudget(nJobs)
 		if nJobs == 1 {
 			// Sequential — preserves zero goroutine overhead at small parallelism.
 			for i, n := range neighbors {
-				cand, score, err := tryOrder(n.p, n.q, n.P, n.Q)
+				cand, score, err := tryOrder(n.p, n.q, n.P, n.Q, 0)
 				results[i] = stepResult{cand, score, err}
 			}
 		} else {
@@ -527,7 +552,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				go func() {
 					defer wg.Done()
 					defer func() { <-sem }()
-					cand, score, err := tryOrder(n.p, n.q, n.P, n.Q)
+					cand, score, err := tryOrder(n.p, n.q, n.P, n.Q, gradBudget)
 					results[i] = stepResult{cand, score, err}
 				}()
 			}

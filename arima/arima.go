@@ -88,6 +88,21 @@ type ARIMA struct {
 	// is true.
 	DiffuseConvention DiffuseConv
 
+	// DriftIncluded marks the model as having a leading exog column
+	// representing a linear time index (drift). Set automatically by RArima
+	// when IncludeDrift=true. When set, Predict/PredictBoot/Simulate
+	// transparently prepend the drift column to user-supplied futureExog so
+	// callers don't have to reconstruct the [n+1, n+2, …] sequence manually.
+	// Mirrors R's forecast::forecast(model, h) behavior.
+	DriftIncluded bool
+
+	// GradientWorkers caps the goroutine count used by the BFGS numerical
+	// gradient inside Fit. 0 → GOMAXPROCS (default). AutoArima sets this to
+	// `max(1, GOMAXPROCS/n_parallel_fits)` when dispatching parallel
+	// candidate fits, so the nested parallelism (outer fits × inner gradient
+	// workers) doesn't exceed available cores.
+	GradientWorkers int
+
 	// Fitted state
 	phi   []float64 // non-seasonal AR
 	theta []float64 // non-seasonal MA
@@ -469,10 +484,10 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			ll, _, _ := armaCSS(residOf(params), fullPhi, fullTheta)
 			return ll
 		}
-		x0 = minimize(cssObj, x0, m.MaxIter)
+		x0 = minimize(cssObj, x0, m.MaxIter, m.gradientWorkers())
 	}
 
-	best := minimize(objective, x0, m.MaxIter)
+	best := minimize(objective, x0, m.MaxIter, m.gradientWorkers())
 	phi, theta, sPhi, sTheta, c, beta := unpackParamsX(best, p, q, P, Q, m.WithIntercept, k)
 	m.phi = phi
 	m.theta = theta
@@ -664,8 +679,21 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 // The numerical gradient is computed in parallel — each component requires
 // two independent f(x) calls, dispatched to goroutines (a Go-specific win
 // since each f() allocates fresh state and does not mutate shared memory).
-func minimize(f func([]float64) float64, x0 []float64, maxIter int) []float64 {
-	gradFn := parallelGradient(f, runtime.GOMAXPROCS(0))
+// gradientWorkers returns the effective worker count for parallelGradient,
+// respecting the optional GradientWorkers cap. AutoArima uses this to avoid
+// oversubscription when dispatching parallel candidate fits.
+func (m *ARIMA) gradientWorkers() int {
+	if m.GradientWorkers > 0 {
+		return m.GradientWorkers
+	}
+	return runtime.GOMAXPROCS(0)
+}
+
+func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers int) []float64 {
+	if nWorkers < 1 {
+		nWorkers = runtime.GOMAXPROCS(0)
+	}
+	gradFn := parallelGradient(f, nWorkers)
 	prob := optimize.Problem{Func: f, Grad: gradFn}
 	settings := &optimize.Settings{
 		MajorIterations:   maxIter,
@@ -898,6 +926,37 @@ func (m *ARIMA) Update(newY []float64, newX [][]float64) error {
 	return m.Fit(combinedY, combinedX)
 }
 
+// extendDriftIfNeeded prepends the drift column [n+1, n+2, …, n+nPeriods]
+// to user-supplied futureExog when m.DriftIncluded is true. The user passes
+// only the OTHER exog columns (or nil when drift is the only one) — drift
+// is reconstructed automatically because it's a deterministic time index.
+//
+// Returns the (possibly augmented) futureExog. No-op when DriftIncluded
+// is false.
+func (m *ARIMA) extendDriftIfNeeded(futureExog [][]float64, nPeriods int) [][]float64 {
+	if !m.DriftIncluded || nPeriods <= 0 {
+		return futureExog
+	}
+	n0 := len(m.yTrain)
+	if futureExog == nil {
+		// Drift is the only exog column. Build it directly.
+		out := make([][]float64, nPeriods)
+		for i := 0; i < nPeriods; i++ {
+			out[i] = []float64{float64(n0 + i + 1)}
+		}
+		return out
+	}
+	// User supplied the OTHER exog columns; prepend drift.
+	out := make([][]float64, nPeriods)
+	for i := 0; i < nPeriods; i++ {
+		row := make([]float64, 1+len(futureExog[i]))
+		row[0] = float64(n0 + i + 1)
+		copy(row[1:], futureExog[i])
+		out[i] = row
+	}
+	return out
+}
+
 // Predict produces nPeriods forward forecasts. If alpha > 0, lower/upper
 // confidence intervals are returned alongside; otherwise lower/upper are nil.
 //
@@ -910,6 +969,10 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 	if nPeriods <= 0 {
 		return []float64{}, nil, nil, nil
 	}
+	// If the model includes a drift column, transparently prepend it to
+	// futureExog. Done before validation so the user-facing futureExog
+	// shape is "the OTHER exog cols only" (or nil when drift is the only one).
+	futureExog = m.extendDriftIfNeeded(futureExog, nPeriods)
 	if m.nExog > 0 {
 		if futureExog == nil {
 			return nil, nil, nil, errors.New("future exog required for forecasting")

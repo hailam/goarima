@@ -39,6 +39,8 @@ func (m *ARIMA) Simulate(n, burnIn int, seed uint64, futureExog [][]float64) ([]
 	if burnIn == 0 {
 		burnIn = 100
 	}
+	// Drift auto-extension — same as Predict/PredictBoot.
+	futureExog = m.extendDriftIfNeeded(futureExog, n)
 	if m.nExog > 0 {
 		if futureExog == nil {
 			return nil, errors.New("arima: futureExog required (model was fit with exog)")
