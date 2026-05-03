@@ -2,6 +2,7 @@ package arima
 
 import (
 	"math"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/hailam/goarima/datasets"
@@ -245,5 +246,72 @@ func TestRParityMethodCSS(t *testing.T) {
 	}
 	if math.Abs(m.Params()[0]-0.5) > 0.1 {
 		t.Errorf("AR(1) CSS coef = %v want ~0.5", m.Params()[0])
+	}
+}
+
+// Codex #C13: DiffuseStatsmodels with exog must recover β on the original
+// scale. Pre-fix the rescale multiplied β by dataScale (the magnitude of the
+// data), so a model fitted on data with magnitude ~100 reported β ≈ 100×
+// the true value.
+func TestDiffuseStatsmodelsBetaScale(t *testing.T) {
+	// Synthetic: y_t = 2.5*x_t + AR(1)(0.5) noise, on a magnitude-100 scale.
+	rng := rand.New(rand.NewPCG(11, 12))
+	n := 300
+	x := make([][]float64, n)
+	y := make([]float64, n)
+	const trueBeta = 2.5
+	const scale = 100.0 // ensures dataScale != 1 in the optimizer
+	for i := 0; i < n; i++ {
+		x[i] = []float64{rng.NormFloat64() * scale}
+		var prev float64
+		if i > 0 {
+			prev = y[i-1] - trueBeta*x[i-1][0]
+		}
+		y[i] = trueBeta*x[i][0] + 0.5*prev + rng.NormFloat64()*scale
+	}
+	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
+	m.NonSimpleDifferencing = true
+	m.DiffuseConvention = DiffuseStatsmodels
+	m.WithIntercept = false
+	m.MaxIter = 200
+	if err := m.Fit(y, x); err != nil {
+		t.Fatal(err)
+	}
+	beta := m.Beta()
+	if len(beta) != 1 {
+		t.Fatalf("got %d beta coefs, want 1", len(beta))
+	}
+	// Pre-fix this would be ~250 (off by scale=100). Post-fix should be ~2.5.
+	if math.Abs(beta[0]-trueBeta) > 0.2 {
+		t.Errorf("beta = %g, want ~%g (within 0.2)", beta[0], trueBeta)
+	}
+}
+
+// Codex #C11: MethodCSS should report stats consistent with the CSS profile
+// likelihood, not Kalman. Sigma² from MethodCSS equals SSE / nResid where
+// nResid = nobs - p (CSS warm-up).
+func TestMethodCSSStatsMatchEstimator(t *testing.T) {
+	y := simulateAR1(300, 0.5, 1.0, 2)
+	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
+	m.Method = MethodCSS
+	m.WithIntercept = false
+	if err := m.Fit(y, nil); err != nil {
+		t.Fatal(err)
+	}
+	// Recompute CSS sigma² from the resids to confirm m.Sigma2() is the CSS
+	// estimate, not the Kalman one.
+	sse := 0.0
+	count := 0
+	for _, r := range m.resids {
+		if r != 0 { // skip CSS warm-up zeros
+			sse += r * r
+			count++
+		}
+	}
+	wantS2 := sse / float64(count)
+	got := m.Sigma2()
+	if math.Abs(got-wantS2)/wantS2 > 1e-6 {
+		t.Errorf("MethodCSS sigma² = %g, want CSS-derived %g (Kalman would differ)",
+			got, wantS2)
 	}
 }

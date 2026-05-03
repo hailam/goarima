@@ -131,6 +131,12 @@ func (p *Pipeline) Predict(nPeriods int, alpha float64, futureExog [][]float64) 
 			xseed = out
 		}
 		modelX = xseed
+	} else {
+		// No featurizer in the pipeline: pass user-supplied futureExog
+		// straight through. Pre-fix this branch left modelX nil and silently
+		// dropped any futureExog the user provided, even when the underlying
+		// model was fitted with raw exog.
+		modelX = futureExog
 	}
 	fc, lo, hi, err := p.Model.Predict(nPeriods, alpha, modelX)
 	if err != nil {

@@ -314,6 +314,81 @@ func TestSerialize_StreamingRoundTrip(t *testing.T) {
 	assertSeriesEqual(t, "streaming forecast", wantFc, gotFc)
 }
 
+// Codex #C14: Fit must reject malformed input — NaN/Inf in y or exog,
+// ragged exog, negative orders. Pre-fix these would panic or NaN-poison.
+func TestFit_RejectsMalformedInput(t *testing.T) {
+	good := simulateAR1(50, 0.5, 1.0, 1)
+	cases := []struct {
+		name    string
+		y       []float64
+		exog    [][]float64
+		order   Order
+		seasonl SeasonalOrder
+		wantSub string
+	}{
+		{
+			name:    "NaN in y",
+			y:       append([]float64{math.NaN()}, good...),
+			order:   Order{P: 1},
+			wantSub: "NaN/Inf",
+		},
+		{
+			name:    "Inf in y",
+			y:       append([]float64{math.Inf(1)}, good...),
+			order:   Order{P: 1},
+			wantSub: "NaN/Inf",
+		},
+		{
+			name:    "ragged exog",
+			y:       good[:5],
+			exog:    [][]float64{{1, 2}, {1}, {1, 2}, {1, 2}, {1, 2}},
+			order:   Order{P: 1},
+			wantSub: "ragged",
+		},
+		{
+			name:    "NaN in exog",
+			y:       good[:5],
+			exog:    [][]float64{{1}, {math.NaN()}, {1}, {1}, {1}},
+			order:   Order{P: 1},
+			wantSub: "NaN/Inf",
+		},
+		{
+			name:    "negative AR order",
+			y:       good,
+			order:   Order{P: -1},
+			wantSub: "negative",
+		},
+		{
+			name:    "negative seasonal D",
+			y:       good,
+			order:   Order{P: 1},
+			seasonl: SeasonalOrder{D: -1, M: 12},
+			wantSub: "negative",
+		},
+		{
+			name:    "zero-cols exog",
+			y:       good[:5],
+			exog:    [][]float64{{}, {}, {}, {}, {}},
+			order:   Order{P: 1},
+			wantSub: "zero columns",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewARIMA(tc.order)
+			m.Seasonal = tc.seasonl
+			m.MaxIter = 5
+			err := m.Fit(tc.y, tc.exog)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.wantSub)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.wantSub)
+			}
+		})
+	}
+}
+
 // C3: every futureExog row must have the right width.
 func TestPredict_RejectsRaggedFutureExog(t *testing.T) {
 	rng := rand.New(rand.NewPCG(99, 100))

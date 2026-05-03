@@ -129,9 +129,40 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	if len(y) == 0 {
 		return errors.New("y must be non-empty")
 	}
+	// Reject NaN/Inf in y. The optimizer would silently produce nonsense
+	// otherwise (objective evaluations would NaN-poison the BFGS state).
+	for i, v := range y {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return fmt.Errorf("y[%d] = %v (NaN/Inf not supported)", i, v)
+		}
+	}
+	// Reject negative orders.
+	if m.Order.P < 0 || m.Order.D < 0 || m.Order.Q < 0 {
+		return fmt.Errorf("order has negative field: %+v", m.Order)
+	}
+	if m.Seasonal.P < 0 || m.Seasonal.D < 0 || m.Seasonal.Q < 0 || m.Seasonal.M < 0 {
+		return fmt.Errorf("seasonal has negative field: %+v", m.Seasonal)
+	}
 	if exog != nil {
 		if len(exog) != len(y) {
 			return fmt.Errorf("exog rows (%d) must match len(y) (%d)", len(exog), len(y))
+		}
+		// Validate each row: same width as the first row, no NaN/Inf.
+		// Pre-fix, ragged exog or NaN-laden columns silently produced bad
+		// fits instead of clear errors.
+		k0 := len(exog[0])
+		if k0 == 0 {
+			return errors.New("exog has zero columns; pass nil for no regressors")
+		}
+		for i, row := range exog {
+			if len(row) != k0 {
+				return fmt.Errorf("exog row %d has %d cols, want %d (ragged exog)", i, len(row), k0)
+			}
+			for j, v := range row {
+				if math.IsNaN(v) || math.IsInf(v, 0) {
+					return fmt.Errorf("exog[%d][%d] = %v (NaN/Inf not supported)", i, j, v)
+				}
+			}
 		}
 	}
 	if m.MaxIter == 0 {
@@ -497,11 +528,16 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		negLL = ll + float64(nEff)*math.Log(dataScale)
 		sigma2 = s2Scaled * dataScale * dataScale
 		// Restore intercept on the original scale so c parameter is meaningful.
+		// (y_scaled = c_scaled + … on scaled data; multiply by dataScale to
+		// recover original-scale intercept.)
 		m.c = c * dataScale
-		// Restore beta on the original scale.
+		// β does NOT need a rescale here: the optimizer saw both y and x
+		// scaled by 1/dataScale, so the regression coefficients it found
+		// already apply 1:1 on the original scale (y/s = β · x/s ⇒ y = β · x).
+		// Pre-fix this multiplied β by dataScale, overstating coefficients.
 		if k > 0 {
 			for i := range m.beta {
-				m.beta[i] = beta[i] * dataScale
+				m.beta[i] = beta[i]
 			}
 		}
 	case m.NonSimpleDifferencing:
@@ -513,6 +549,14 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		}
 		ll, s2, _ := kalmanARIMAFullConv(residOfFull(best), m.Order.D, mPer, Dord,
 			phi, theta, sPhi, sTheta, 1e6, m.DiffuseConvention)
+		negLL, sigma2 = ll, s2
+	case m.Method == MethodCSS:
+		// MethodCSS optimizes the conditional sum-of-squares profile
+		// likelihood; report the same family of stats so logL/IC align with
+		// the estimator that produced the parameters. Mirrors R's
+		// stats::arima(method="CSS") convention. Note AIC under CSS is not
+		// directly comparable to AIC under ML across estimators.
+		ll, s2, _ := armaCSS(r, fullPhi, fullTheta)
 		negLL, sigma2 = ll, s2
 	default:
 		ll, s2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
@@ -532,9 +576,13 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	// expects coefficients consistent with wsCenteredCache, so we rebuild
 	// here from m.c/m.beta directly. For all other modes the rescale is a
 	// no-op and rFinal == r.
+	//
+	// Note: `ws` is already mean-subtracted earlier in Fit (line ~197) when
+	// the centering branch fires, so we MUST NOT subtract m.mean again here
+	// — that would double-center. residOf has the same shape: `ws - c - β·x`.
 	rFinal := make([]float64, len(ws))
 	for i, v := range ws {
-		rr := v - m.mean - m.c
+		rr := v - m.c
 		if m.nExog > 0 {
 			for j, b := range m.beta {
 				rr -= b * wX[i][j]

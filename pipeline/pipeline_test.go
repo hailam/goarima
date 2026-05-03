@@ -44,6 +44,55 @@ func TestPipelineLogPlusARIMA(t *testing.T) {
 	}
 }
 
+// A pipeline with no exog featurizer must still pass user-supplied
+// futureExog through to the underlying model. Pre-fix the predict path
+// silently dropped futureExog when len(p.exogChain) == 0, even when the
+// model was fitted with raw exog.
+func TestPipelineNoExogFeaturizer_FutureExogPasses(t *testing.T) {
+	rng := rand.New(rand.NewPCG(42, 99))
+	n := 120
+	y := make([]float64, n)
+	x := make([][]float64, n)
+	for i := 0; i < n; i++ {
+		x[i] = []float64{rng.Float64()}
+		var prev float64
+		if i > 0 {
+			prev = y[i-1]
+		}
+		y[i] = 0.5*prev + 1.5*x[i][0] + rng.NormFloat64()
+	}
+	model := arima.NewARIMA(arima.Order{P: 1, D: 0, Q: 0})
+	model.WithIntercept = true
+	pl, err := NewPipeline(nil, model) // no transformer steps
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pl.Fit(y, x); err != nil {
+		t.Fatal(err)
+	}
+	futureX := make([][]float64, 5)
+	for i := range futureX {
+		futureX[i] = []float64{rng.Float64()}
+	}
+	fc, _, _, err := pl.Predict(5, 0, futureX)
+	if err != nil {
+		t.Fatalf("Predict: %v", err)
+	}
+	if len(fc) != 5 {
+		t.Errorf("got %d forecasts, want 5", len(fc))
+	}
+	for i, v := range fc {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Errorf("fc[%d] = %v (NaN/Inf)", i, v)
+		}
+	}
+	// Sanity: passing nil futureExog should now error (model was fit with
+	// exog, so raw exog must be supplied).
+	if _, _, _, err := pl.Predict(5, 0, nil); err == nil {
+		t.Error("expected error when fitted-with-exog model gets no futureExog")
+	}
+}
+
 // Validate that names must be unique and non-empty.
 func TestPipelineValidation(t *testing.T) {
 	model := arima.NewARIMA(arima.Order{P: 1, D: 0, Q: 0})

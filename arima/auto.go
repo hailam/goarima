@@ -426,10 +426,14 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				best = r.model
 			}
 		}
+		// "raise" semantics: any errored candidate aborts the whole search,
+		// even if other candidates succeeded. Pre-fix this branch only
+		// surfaced firstErr when best was still nil — silently swallowing
+		// fit failures whenever any other candidate produced a model.
+		if firstErr != nil {
+			return nil, firstErr
+		}
 		if best == nil {
-			if firstErr != nil {
-				return nil, firstErr
-			}
 			return nil, errors.New("no candidate fit succeeded")
 		}
 		return best, nil
@@ -463,6 +467,26 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				orderKey{bestKey.p, bestKey.q, bestKey.P, bestKey.Q + 1},
 			)
 		}
+
+		// Drop neighbors that are out-of-bounds for the search box. These
+		// aren't fit failures — they're a normal consequence of stepwise
+		// neighbor expansion (e.g., bestKey.p=0 produces (-1,…) which is
+		// just skipped). Filtering here so ErrorAction="raise" only fires
+		// on real fit errors below.
+		filtered := neighbors[:0]
+		for _, n := range neighbors {
+			if n.p < 0 || n.q < 0 || n.P < 0 || n.Q < 0 {
+				continue
+			}
+			if n.p > opts.MaxP || n.q > opts.MaxQ || n.P > opts.MaxCapP || n.Q > opts.MaxCapQ {
+				continue
+			}
+			if n.p+n.q+n.P+n.Q > opts.MaxOrder {
+				continue
+			}
+			filtered = append(filtered, n)
+		}
+		neighbors = filtered
 
 		// Fit neighbors in parallel. Each iteration evaluates 4–8 candidates
 		// that are independent (no data dependency between them within an
@@ -511,10 +535,14 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		}
 
 		// Process results in stable original order so ties resolve identically
-		// to the sequential implementation (preserves determinism).
+		// to the sequential implementation (preserves determinism). Under
+		// ErrorAction="raise" any neighbor failure aborts the whole search,
+		// matching the documented contract.
 		for i, r := range results {
 			if r.err != nil || r.model == nil {
-				_ = handleErr(r.err)
+				if e := handleErr(r.err); e != nil {
+					return nil, e
+				}
 				continue
 			}
 			if r.score < bestScore-1e-6 {

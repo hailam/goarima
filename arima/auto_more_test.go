@@ -116,6 +116,52 @@ func TestAutoArimaErrorActionIgnore(t *testing.T) {
 	}
 }
 
+// Codex #C12: ErrorAction="raise" (default) must propagate fit errors even
+// when other candidates succeed. Pre-fix the FullSearch path returned
+// (best != nil, err == nil) when the best candidate happened to succeed,
+// silently swallowing failures from sibling candidates.
+//
+// We can't easily inject a fit failure (every well-formed candidate succeeds
+// on synthetic data), so we test the error-PROPAGATION wiring directly:
+// a custom Scoring callback that returns an error on the first call. With
+// "raise", the search must surface that error; with "ignore", it must not.
+func TestAutoArimaErrorActionRaisePropagates(t *testing.T) {
+	y := simulateAR1(150, 0.5, 1.0, 3)
+	scoringFails := func(yt, yp []float64) (float64, error) {
+		return 0, errors.New("synthetic scoring error")
+	}
+	// FullSearch path
+	_, err := AutoArima(y, nil, AutoArimaOpts{
+		MaxP: 1, MaxQ: 1, MaxOrder: 2, IC: AICc, MaxIter: 20,
+		OutOfSampleSize: 10, Scoring: scoringFails,
+		ErrorAction: "raise", FullSearch: true,
+	})
+	if err == nil {
+		t.Error("FullSearch + raise: expected error to propagate, got nil")
+	}
+	// Stepwise path
+	_, err = AutoArima(y, nil, AutoArimaOpts{
+		MaxP: 1, MaxQ: 1, MaxOrder: 2, IC: AICc, MaxIter: 20,
+		OutOfSampleSize: 10, Scoring: scoringFails,
+		ErrorAction: "raise",
+	})
+	if err == nil {
+		t.Error("Stepwise + raise: expected error to propagate, got nil")
+	}
+	// Same setup with ignore: must NOT propagate the synthetic scoring
+	// error. (Search may still error with "no candidate succeeded" since
+	// every candidate's scoring fails, but the error must not be the
+	// synthetic-scoring one.)
+	_, err = AutoArima(y, nil, AutoArimaOpts{
+		MaxP: 1, MaxQ: 1, MaxOrder: 2, IC: AICc, MaxIter: 20,
+		OutOfSampleSize: 10, Scoring: scoringFails,
+		ErrorAction: "ignore", FullSearch: true,
+	})
+	if err != nil && strings.Contains(err.Error(), "synthetic scoring error") {
+		t.Errorf("ignore mode propagated scoring error: %v", err)
+	}
+}
+
 // Custom scoring function.
 func TestAutoArimaCustomScoring(t *testing.T) {
 	y := simulateAR1(150, 0.4, 1.0, 1)
