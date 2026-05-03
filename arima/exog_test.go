@@ -163,3 +163,114 @@ func TestARIMA_Update(t *testing.T) {
 		t.Errorf("yTrain after Update = %d, want 150", len(m.yTrain))
 	}
 }
+
+// API audit #A2: Update should warm-start (no HR, short BFGS, no NM polish)
+// while Refit does the full cold-start re-fit. After both run on the same
+// pair of (initial fit, new data), the resulting parameters should agree
+// to within optimizer tolerance — both target the same likelihood maximum.
+func TestARIMA_UpdateMatchesRefit(t *testing.T) {
+	y := simulateAR1(200, 0.6, 1.0, 11)
+	build := func() *ARIMA {
+		m := NewARIMA(Order{P: 1, D: 0, Q: 1})
+		m.WithIntercept = true
+		m.MaxIter = 80
+		if err := m.Fit(y[:120], nil); err != nil {
+			t.Fatal(err)
+		}
+		return m
+	}
+	mUpd := build()
+	if err := mUpd.Update(y[120:], nil); err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	mRef := build()
+	if err := mRef.Refit(y[120:], nil); err != nil {
+		t.Fatalf("Refit: %v", err)
+	}
+
+	// Sanity: both end up with the same training data length.
+	if len(mUpd.yTrain) != 200 || len(mRef.yTrain) != 200 {
+		t.Fatalf("yTrain lengths upd=%d ref=%d, want 200/200",
+			len(mUpd.yTrain), len(mRef.yTrain))
+	}
+
+	// Parameters should agree to within optimizer tolerance — Update's
+	// short warm-start BFGS should converge near the same point Refit's
+	// full HR+BFGS+NM finds.
+	pUpd := mUpd.Params()
+	pRef := mRef.Params()
+	if len(pUpd) != len(pRef) {
+		t.Fatalf("param lengths upd=%d ref=%d", len(pUpd), len(pRef))
+	}
+	for i := range pUpd {
+		if math.Abs(pUpd[i]-pRef[i]) > 0.05 {
+			t.Errorf("param[%d]: Update=%g Refit=%g (diff %g)",
+				i, pUpd[i], pRef[i], pUpd[i]-pRef[i])
+		}
+	}
+	// LogL should also agree closely.
+	if math.Abs(mUpd.LogLikelihood()-mRef.LogLikelihood()) > 1.0 {
+		t.Errorf("logL: Update=%g Refit=%g", mUpd.LogLikelihood(), mRef.LogLikelihood())
+	}
+}
+
+// Refit should reach the same optimum as a fresh Fit on the combined series —
+// it's literally the documented contract.
+func TestARIMA_RefitMatchesFreshFit(t *testing.T) {
+	y := simulateAR1(180, 0.4, 1.0, 5)
+	mRefit := NewARIMA(Order{P: 1, D: 0, Q: 1})
+	mRefit.WithIntercept = true
+	mRefit.MaxIter = 80
+	if err := mRefit.Fit(y[:100], nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := mRefit.Refit(y[100:], nil); err != nil {
+		t.Fatal(err)
+	}
+
+	mFresh := NewARIMA(Order{P: 1, D: 0, Q: 1})
+	mFresh.WithIntercept = true
+	mFresh.MaxIter = 80
+	if err := mFresh.Fit(y, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	pR := mRefit.Params()
+	pF := mFresh.Params()
+	for i := range pR {
+		if math.Abs(pR[i]-pF[i]) > 1e-3 {
+			t.Errorf("param[%d]: Refit=%g freshFit=%g", i, pR[i], pF[i])
+		}
+	}
+}
+
+// Update on a model fit without exog must reject newX (and vice versa).
+func TestARIMA_UpdateExogConsistency(t *testing.T) {
+	y := simulateAR1(150, 0.5, 1.0, 7)
+	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
+	if err := m.Fit(y[:100], nil); err != nil {
+		t.Fatal(err)
+	}
+	// Model has no exog; passing X should error.
+	x := make([][]float64, 50)
+	for i := range x {
+		x[i] = []float64{float64(i)}
+	}
+	if err := m.Update(y[100:], x); err == nil {
+		t.Error("Update should reject exog when fit had none")
+	}
+	if err := m.Refit(y[100:], x); err == nil {
+		t.Error("Refit should reject exog when fit had none")
+	}
+}
+
+// Update should error if called on an unfitted model — same as Refit.
+func TestARIMA_UpdateUnfitted(t *testing.T) {
+	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
+	if err := m.Update([]float64{1, 2, 3}, nil); err == nil {
+		t.Error("Update on unfitted model should error")
+	}
+	if err := m.Refit([]float64{1, 2, 3}, nil); err == nil {
+		t.Error("Refit on unfitted model should error")
+	}
+}

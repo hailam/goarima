@@ -103,6 +103,13 @@ type ARIMA struct {
 	// workers) doesn't exceed available cores.
 	GradientWorkers int
 
+	// Warm-start hooks (used by Update). Private; not exposed via JSON
+	// serialization. When warmStartX has length == nFree, Fit uses it as
+	// the optimizer's starting point and skips both Hannan-Rissanen and the
+	// MethodCSSML CSS-warmup phase. Cleared at the end of every Fit call.
+	warmStartX       []float64
+	warmStartMaxIter int
+
 	// Fitted state
 	phi   []float64 // non-seasonal AR
 	theta []float64 // non-seasonal MA
@@ -300,12 +307,22 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		return nil
 	}
 
+	// Always clear warm-start hooks at function exit so a subsequent Fit
+	// call doesn't accidentally inherit them.
+	defer func() {
+		m.warmStartX = nil
+		m.warmStartMaxIter = 0
+	}()
+
 	// Initial guess: Hannan-Rissanen for AR/MA, OLS for beta, zeros for the
-	// rest. HR yields ARMA params close to the MLE so the optimizer is much
-	// more likely to land at the same local maximum that R's `stats::arima`
-	// finds (which itself uses HR-style initial values via the CSS warm-up).
+	// rest — UNLESS Update has supplied warm-start parameters from the
+	// previous fit. Warm-start skips HR entirely (the existing fit's params
+	// are already a near-optimal starting point on the new combined data).
 	x0 := make([]float64, nFree)
-	{
+	useWarmStart := len(m.warmStartX) == nFree
+	if useWarmStart {
+		copy(x0, m.warmStartX)
+	} else {
 		// Build a "clean" residual series for HR: subtract intercept (zero
 		// initial guess) and OLS-projected exog before running HR on the
 		// differenced data.
@@ -476,7 +493,10 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		}
 	}
 
-	if m.Method == MethodCSSML {
+	// Skip the CSS warmup phase when warm-starting: the existing fit's
+	// optimizer-space x is already a refined point, and the whole purpose
+	// of warm-start is to avoid the redundant work CSS would do here.
+	if m.Method == MethodCSSML && !useWarmStart {
 		cssObj := func(params []float64) float64 {
 			phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
 			fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
@@ -487,7 +507,11 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		x0 = minimize(cssObj, x0, m.MaxIter, m.gradientWorkers())
 	}
 
-	best := minimize(objective, x0, m.MaxIter, m.gradientWorkers())
+	mi := m.MaxIter
+	if m.warmStartMaxIter > 0 {
+		mi = m.warmStartMaxIter
+	}
+	best := minimize(objective, x0, mi, m.gradientWorkers())
 	phi, theta, sPhi, sTheta, c, beta := unpackParamsX(best, p, q, P, Q, m.WithIntercept, k)
 	m.phi = phi
 	m.theta = theta
@@ -949,11 +973,106 @@ func (m *ARIMA) FittedValues() []float64 {
 // FittedValues. Mirrors pmdarima.ARIMA.predict_in_sample.
 func (m *ARIMA) PredictInSample() []float64 { return m.FittedValues() }
 
-// Update appends new observations to the training data and re-fits the model
-// (with the same orders/configuration). Mirrors pmdarima.ARIMA.update.
+// Update appends new observations to the training data and runs a quick
+// MLE refresh on the existing parameters. Mirrors pmdarima.ARIMA.update
+// and R's `Arima(model = existing, x = new_y)` — same orders and intercept
+// choice are kept; only the parameter values move slightly to accommodate
+// the new data.
+//
+// Use Update when:
+//   - You have new observations and want to refresh the fit quickly.
+//   - You want to preserve the AutoArima-selected orders.
+//
+// Use Refit when:
+//   - You want a full cold-start fit on the combined data, including
+//     Hannan-Rissanen warmup and Nelder-Mead polish. Slower; matches
+//     calling Fit on the combined series from scratch.
 //
 // newY are the new observations; newX (optional) the matching exogenous rows.
 func (m *ARIMA) Update(newY []float64, newX [][]float64) error {
+	if !m.fitted {
+		return errors.New("model not fitted")
+	}
+	if newX != nil && len(newX) != len(newY) {
+		return fmt.Errorf("newX rows (%d) != len(newY) (%d)", len(newX), len(newY))
+	}
+	if (m.nExog > 0) != (newX != nil) {
+		return errors.New("exog provided/missing inconsistent with original fit")
+	}
+
+	// Pack the existing fit's parameters back into the optimizer's
+	// transformed parameter space. arTransparams / maTransparams are
+	// non-linear maps from R^p → stationarity-bounded space; their
+	// inverses (invertARTransform / invertMATransform) recover the
+	// optimizer x from m.phi / m.theta.
+	p := m.Order.P
+	q := m.Order.Q
+	P := 0
+	Q := 0
+	if m.Seasonal.Active() {
+		P = m.Seasonal.P
+		Q = m.Seasonal.Q
+	}
+	k := m.nExog
+	nFree := p + q + P + Q + k
+	if m.WithIntercept {
+		nFree++
+	}
+	if nFree > 0 {
+		warmX := make([]float64, nFree)
+		off := 0
+		if p > 0 {
+			copy(warmX[off:off+p], invertARTransform(m.phi))
+			off += p
+		}
+		if q > 0 {
+			copy(warmX[off:off+q], invertMATransform(m.theta))
+			off += q
+		}
+		if P > 0 {
+			copy(warmX[off:off+P], invertARTransform(m.Phi))
+			off += P
+		}
+		if Q > 0 {
+			copy(warmX[off:off+Q], invertMATransform(m.Theta))
+			off += Q
+		}
+		if m.WithIntercept {
+			warmX[off] = m.c
+			off++
+		}
+		if k > 0 {
+			copy(warmX[off:off+k], m.beta)
+		}
+		m.warmStartX = warmX
+		// Tight iteration budget — we're already near optimum.
+		m.warmStartMaxIter = 25
+	}
+
+	combinedY := append([]float64{}, m.yTrain...)
+	combinedY = append(combinedY, newY...)
+	var combinedX [][]float64
+	if newX != nil {
+		combinedX = append(combinedX, m.xTrain...)
+		combinedX = append(combinedX, cloneMat(newX)...)
+	}
+	// Fit clears m.warmStartX / m.warmStartMaxIter via deferred cleanup
+	// regardless of success/failure.
+	return m.Fit(combinedY, combinedX)
+}
+
+// Refit appends new observations and runs a full cold-start fit on the
+// combined series — Hannan-Rissanen warmup, full BFGS, and Nelder-Mead
+// polish. Equivalent to calling Fit on `[m.yTrain..newY]`.
+//
+// Slower than Update but more thorough: reaches a different local
+// optimum if the new data shifts the likelihood landscape enough that
+// the existing parameter neighborhood isn't optimal anymore.
+//
+// Note: Refit does NOT re-search ARIMA orders — `m.Order` and
+// `m.Seasonal` are preserved from the existing model. To re-search
+// orders, run AutoArima fresh on the combined series.
+func (m *ARIMA) Refit(newY []float64, newX [][]float64) error {
 	if !m.fitted {
 		return errors.New("model not fitted")
 	}
