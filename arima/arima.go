@@ -777,9 +777,15 @@ func (m *ARIMA) Params() []float64 {
 
 // FittedValues returns in-sample one-step-ahead predictions y_hat[t].
 //
-// Computed as y_hat[t] = y[t] - residual[t], aligned to the original (un-differenced)
-// time index. Length = len(yTrain) - (d + D*m). The first (d + D*m) values are
-// undefined and not returned.
+// Computed as y_hat[t] = y[t] - residual[t] on the model scale, then
+// inverse-Box-Cox (if Lambda was set) so the output matches the user's
+// original units. Aligned to the original time index; length =
+// len(yTrain) - (d + D*m). The first (d + D*m) values are undefined and
+// not returned.
+//
+// Pre-fix, the subtraction used m.yTrain (original units) directly with
+// m.resids (model-scale, post-Box-Cox), which produced meaningless values
+// when Lambda was set. Now both operands are on the model scale.
 func (m *ARIMA) FittedValues() []float64 {
 	if !m.fitted {
 		return nil
@@ -800,9 +806,18 @@ func (m *ARIMA) FittedValues() []float64 {
 		pad := make([]float64, n-len(residTail))
 		residTail = append(pad, residTail...)
 	}
+	// Use the model-scale yTrain (Box-Cox-applied if Lambda is set) so the
+	// subtraction is unit-consistent with the residuals.
+	yMS := m.yMSCache
+	if yMS == nil {
+		yMS = m.yTrain // older snapshots without cache; Lambda must be nil
+	}
 	out := make([]float64, n)
 	for i := 0; i < n; i++ {
-		out[i] = m.yTrain[dHead+i] - residTail[i]
+		out[i] = yMS[dHead+i] - residTail[i]
+	}
+	if m.Lambda != nil {
+		out = boxCoxInvert(out, *m.Lambda, m.Lambda2)
 	}
 	return out
 }

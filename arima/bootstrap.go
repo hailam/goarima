@@ -92,12 +92,20 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 	}
 
 	// Pre-compute integration heads once — they're identical for every sim.
+	// Use the *model-scale* yTrain (Box-Cox-applied if Lambda is set) so the
+	// integration is unit-consistent with the simulated series, which lives
+	// on the model scale. Output paths are inverse-Box-Cox'd at the end of
+	// each simulation so users see original units.
+	yMS := m.yMSCache
+	if yMS == nil {
+		yMS = m.yTrain // older snapshots without cache; Lambda must be nil
+	}
 	var seasHead, nonSeasHead []float64
 	if m.Seasonal.Active() && m.Seasonal.D > 0 {
-		seasHead = lastN(diffStream(m.yTrain, 1, m.Order.D), m.Seasonal.D*m.Seasonal.M)
+		seasHead = lastN(diffStream(yMS, 1, m.Order.D), m.Seasonal.D*m.Seasonal.M)
 	}
 	if m.Order.D > 0 {
-		nonSeasHead = lastN(m.yTrain, m.Order.D)
+		nonSeasHead = lastN(yMS, m.Order.D)
 	}
 
 	// Per-sim, the AR/MA forecast loop only reads the last len(fullPhi) /
@@ -156,6 +164,11 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 		if nonSeasHead != nil {
 			full := integrateBack(out, nonSeasHead, 1, m.Order.D)
 			out = full[len(nonSeasHead):]
+		}
+		// Inverse Box-Cox so paths land in the user's original units. Mirrors
+		// the same step at the end of Predict.
+		if m.Lambda != nil {
+			out = boxCoxInvert(out, *m.Lambda, m.Lambda2)
 		}
 		paths[s] = out
 	}
