@@ -26,28 +26,34 @@ func TestFittedValues_BoxCoxConsistency(t *testing.T) {
 		t.Fatal(err)
 	}
 	fitted := m.FittedValues()
-	if len(fitted) == 0 {
-		t.Fatal("FittedValues returned empty slice")
+	if len(fitted) != len(ap) {
+		t.Fatalf("FittedValues len %d != yTrain len %d (should match pmdarima/R semantics)",
+			len(fitted), len(ap))
 	}
 
-	// Every fitted value must be positive (Box-Cox lambda=0 inverts to exp).
-	for i, v := range fitted {
+	// Warmup region (first dHead entries) must be NaN; everything after must
+	// be a finite positive value (Box-Cox lambda=0 inverts to exp ⇒ > 0).
+	dHead := m.Order.D + m.Seasonal.D*m.Seasonal.M
+	for i := 0; i < dHead; i++ {
+		if !math.IsNaN(fitted[i]) {
+			t.Errorf("fitted[%d] = %g, want NaN (warmup region)", i, fitted[i])
+		}
+	}
+	for i := dHead; i < len(fitted); i++ {
+		v := fitted[i]
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			t.Errorf("fitted[%d] = %v (NaN/Inf outside warmup)", i, v)
+		}
 		if v <= 0 {
 			t.Errorf("fitted[%d] = %g, want positive (lambda=0 inverse is exp)", i, v)
 		}
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			t.Errorf("fitted[%d] = %v (NaN/Inf)", i, v)
-		}
 	}
 
-	// Fitted values should track yTrain reasonably closely (one-step-ahead
-	// predictions on a well-fit model). Median absolute relative error on a
-	// known-good airline fit is well under 10%.
-	dHead := m.Order.D + m.Seasonal.D*m.Seasonal.M
+	// Fitted values should track yTrain reasonably closely. fitted[i] now
+	// aligns with yTrain[i] directly (no offset arithmetic needed).
 	maxRelErr := 0.0
-	for i, v := range fitted {
-		actual := ap[dHead+i]
-		relErr := math.Abs(v-actual) / actual
+	for i := dHead; i < len(fitted); i++ {
+		relErr := math.Abs(fitted[i]-ap[i]) / ap[i]
 		if relErr > maxRelErr {
 			maxRelErr = relErr
 		}

@@ -851,17 +851,22 @@ func (m *ARIMA) Params() []float64 {
 	return out
 }
 
-// FittedValues returns in-sample one-step-ahead predictions y_hat[t].
+// FittedValues returns in-sample one-step-ahead predictions y_hat[t],
+// aligned to the original time index. Output length equals len(yTrain).
+//
+// The first `d + D*m` entries are NaN — they're the differencing-warmup
+// region where one-step-ahead predictions aren't defined. This matches
+// pmdarima.ARIMA.predict_in_sample (returns NaN-padded array) and R's
+// fitted.Arima (returns ts with NA in the warmup).
 //
 // Computed as y_hat[t] = y[t] - residual[t] on the model scale, then
-// inverse-Box-Cox (if Lambda was set) so the output matches the user's
-// original units. Aligned to the original time index; length =
-// len(yTrain) - (d + D*m). The first (d + D*m) values are undefined and
-// not returned.
+// inverse-Box-Cox (if Lambda was set) so the output is in the user's
+// original units. Both operands are on the model scale before the inverse,
+// so the arithmetic is unit-consistent under Box-Cox.
 //
-// Pre-fix, the subtraction used m.yTrain (original units) directly with
-// m.resids (model-scale, post-Box-Cox), which produced meaningless values
-// when Lambda was set. Now both operands are on the model scale.
+// Older versions returned a shorter slice without the warmup region —
+// callers that index by `i` should now use the value directly (it aligns
+// with yTrain[i]) and skip NaN entries.
 func (m *ARIMA) FittedValues() []float64 {
 	if !m.fitted {
 		return nil
@@ -870,16 +875,17 @@ func (m *ARIMA) FittedValues() []float64 {
 	if m.Seasonal.Active() {
 		dHead += m.Seasonal.D * m.Seasonal.M
 	}
-	n := len(m.yTrain) - dHead
-	if n <= 0 || len(m.resids) == 0 {
+	fullLen := len(m.yTrain)
+	residCount := fullLen - dHead
+	if residCount <= 0 || len(m.resids) == 0 {
 		return nil
 	}
 	residTail := m.resids
-	if len(residTail) > n {
-		residTail = residTail[len(residTail)-n:]
-	} else if len(residTail) < n {
+	if len(residTail) > residCount {
+		residTail = residTail[len(residTail)-residCount:]
+	} else if len(residTail) < residCount {
 		// pad front with zeros
-		pad := make([]float64, n-len(residTail))
+		pad := make([]float64, residCount-len(residTail))
 		residTail = append(pad, residTail...)
 	}
 	// Use the model-scale yTrain (Box-Cox-applied if Lambda is set) so the
@@ -888,11 +894,16 @@ func (m *ARIMA) FittedValues() []float64 {
 	if yMS == nil {
 		yMS = m.yTrain // older snapshots without cache; Lambda must be nil
 	}
-	out := make([]float64, n)
-	for i := 0; i < n; i++ {
-		out[i] = yMS[dHead+i] - residTail[i]
+	out := make([]float64, fullLen)
+	// Warmup region: NaN, matching pmdarima/R behavior.
+	for i := 0; i < dHead; i++ {
+		out[i] = math.NaN()
+	}
+	for i := 0; i < residCount; i++ {
+		out[dHead+i] = yMS[dHead+i] - residTail[i]
 	}
 	if m.Lambda != nil {
+		// boxCoxInvert preserves NaN for the warmup positions.
 		out = boxCoxInvert(out, *m.Lambda, m.Lambda2)
 	}
 	return out
