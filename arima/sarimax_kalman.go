@@ -19,21 +19,6 @@ func PublicSarimaxKalmanAbs(y []float64, d, m, D int, phi, theta, sPhi, sTheta [
 	return kalmanSARIMAXAbs(y, d, m, D, phi, theta, sPhi, sTheta, sigma2, kappa)
 }
 
-// extractTNonzeros walks the dense 2D T and returns its nonzero entries.
-func extractTNonzeros(T [][]float64) []tNZ {
-	rd := len(T)
-	out := make([]tNZ, 0, 4*rd)
-	for i := 0; i < rd; i++ {
-		row := T[i]
-		for j := 0; j < rd; j++ {
-			if row[j] != 0 {
-				out = append(out, tNZ{i, j, row[j]})
-			}
-		}
-	}
-	return out
-}
-
 // kalmanSARIMAXAbs runs the SARIMAX Kalman filter in absolute units (sigma2
 // passed as a parameter, NOT concentrated). Matches statsmodels exactly:
 // kappa=1e6 is in absolute (sigma2-included) units, stationary ARMA cov is
@@ -48,13 +33,11 @@ func kalmanSARIMAXAbs(
 	if kappa == 0 {
 		kappa = 1e6
 	}
-	T2D, zRow, rCol, kStatesDiff := sarimaxStateSpace(phi, theta, sPhi, sTheta, d, D, m)
-	rd := len(zRow)
+	nzT, zRow, rCol, rd, kStatesDiff := sarimaxStateSpaceSparse(phi, theta, sPhi, sTheta, d, D, m)
 	if rd == 0 || sigma2 <= 0 {
 		return math.Inf(1), nil
 	}
 	rd2 := rd * rd
-	nzT := extractTNonzeros(T2D)
 
 	RRt := make([]float64, rd2)
 	for i := 0; i < rd; i++ {
@@ -190,8 +173,7 @@ func kalmanSARIMAX(
 	if kappa == 0 {
 		kappa = 1e6
 	}
-	T2D, zRow, rCol, kStatesDiff := sarimaxStateSpace(phi, theta, sPhi, sTheta, d, D, m)
-	rd := len(zRow)
+	nzT, zRow, rCol, rd, kStatesDiff := sarimaxStateSpaceSparse(phi, theta, sPhi, sTheta, d, D, m)
 	if rd == 0 {
 		// pure white noise
 		sse := 0.0
@@ -202,7 +184,6 @@ func kalmanSARIMAX(
 		return float64(len(y)) / 2 * (math.Log(2*math.Pi*s2) + 1), s2, nil
 	}
 	rd2 := rd * rd
-	nzT := extractTNonzeros(T2D)
 
 	RRt := make([]float64, rd2)
 	for i := 0; i < rd; i++ {

@@ -176,7 +176,11 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 		paths[s] = out
 	}
 
-	// Per-step mean and quantiles.
+	// Per-step mean and quantiles. Reuse the col buffer in place: each
+	// horizon overwrites it from paths[s][h], computes the mean, then
+	// sorts col in-place (we don't need the unsorted order again — the
+	// next horizon overwrites col entirely). Saves an nSim-float alloc
+	// per horizon vs `sorted := append([]float64{}, col...)`.
 	mean := make([]float64, nPeriods)
 	lower := make([]float64, nPeriods)
 	upper := make([]float64, nPeriods)
@@ -192,10 +196,9 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 			sum += v
 		}
 		mean[h] = sum / float64(nSim)
-		sorted := append([]float64{}, col...)
-		sort.Float64s(sorted)
-		lower[h] = quantile(sorted, loQ)
-		upper[h] = quantile(sorted, hiQ)
+		sort.Float64s(col)
+		lower[h] = quantile(col, loQ)
+		upper[h] = quantile(col, hiQ)
 	}
 	return &BootResult{Mean: mean, Lower: lower, Upper: upper, Paths: paths}, nil
 }

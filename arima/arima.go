@@ -1002,20 +1002,40 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 	wsCentered := m.wsCenteredCache
 	res := m.resids
 
-	// Difference the (combined) future exog. We need the full historical+future
-	// X matrix differenced, then take only the future tail.
+	// Difference the future exog. We only need the last `dHead` historical
+	// rows of m.xTrain as context for the differencing operator (not the
+	// full training matrix). For long-history exog this trims a per-call
+	// O(len(xTrain) × nExog) matrix copy down to O(dHead × nExog).
 	var futureWX [][]float64
 	if futureExog != nil {
-		combined := append([][]float64{}, m.xTrain...)
-		combined = append(combined, futureExog...)
-		diffed := combined
-		if m.Order.D > 0 {
-			diffed = applyMatDiff(diffed, 1, m.Order.D)
+		dHead := m.Order.D
+		if m.Seasonal.Active() {
+			dHead += m.Seasonal.D * m.Seasonal.M
 		}
-		if m.Seasonal.Active() && m.Seasonal.D > 0 {
-			diffed = applyMatDiff(diffed, m.Seasonal.M, m.Seasonal.D)
+		if dHead == 0 {
+			// No differencing — futureExog rows pass through unchanged.
+			futureWX = futureExog
+		} else {
+			trimStart := len(m.xTrain) - dHead
+			if trimStart < 0 {
+				trimStart = 0
+			}
+			combined := make([][]float64, 0, dHead+nPeriods)
+			combined = append(combined, m.xTrain[trimStart:]...)
+			combined = append(combined, futureExog...)
+			diffed := combined
+			if m.Order.D > 0 {
+				diffed = applyMatDiff(diffed, 1, m.Order.D)
+			}
+			if m.Seasonal.Active() && m.Seasonal.D > 0 {
+				diffed = applyMatDiff(diffed, m.Seasonal.M, m.Seasonal.D)
+			}
+			// After both diff steps `diffed` has exactly nPeriods rows
+			// (combined was sized so the diff head consumes everything before
+			// futureExog) — but slice from the tail to be defensive against
+			// any boundary off-by-ones.
+			futureWX = diffed[len(diffed)-nPeriods:]
 		}
-		futureWX = diffed[len(diffed)-nPeriods:]
 	}
 
 	// Forecast residuals on differenced/centered scale.
