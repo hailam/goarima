@@ -150,6 +150,12 @@ func (m *ARIMA) UnmarshalJSON(data []byte) error {
 	if !ok {
 		return fmt.Errorf("arima: unknown DiffuseConvention %q", snap.DiffuseConvention)
 	}
+	if snap.Order.P < 0 || snap.Order.D < 0 || snap.Order.Q < 0 {
+		return fmt.Errorf("arima: negative Order field in snapshot: %+v", snap.Order)
+	}
+	if snap.Seasonal.P < 0 || snap.Seasonal.D < 0 || snap.Seasonal.Q < 0 || snap.Seasonal.M < 0 {
+		return fmt.Errorf("arima: negative Seasonal field in snapshot: %+v", snap.Seasonal)
+	}
 	if len(snap.Phi) != snap.Order.P {
 		return fmt.Errorf("arima: phi length %d != Order.P %d", len(snap.Phi), snap.Order.P)
 	}
@@ -164,8 +170,47 @@ func (m *ARIMA) UnmarshalJSON(data []byte) error {
 			return fmt.Errorf("arima: seasonal Theta length %d != Seasonal.Q %d", len(snap.STheta), snap.Seasonal.Q)
 		}
 	}
+	if snap.NExog < 0 {
+		return fmt.Errorf("arima: negative NExog %d", snap.NExog)
+	}
 	if snap.NExog > 0 && len(snap.Beta) != snap.NExog {
 		return fmt.Errorf("arima: beta length %d != NExog %d", len(snap.Beta), snap.NExog)
+	}
+	if len(snap.YTrain) == 0 {
+		return fmt.Errorf("arima: yTrain is empty")
+	}
+	// nobs should equal len(yTrain) - (d + D*M). Every fit path sets it that
+	// way, and every Predict / FittedValues path assumes it. Reject snapshots
+	// where this invariant is broken — they'd silently produce wrong forecasts.
+	dHead := snap.Order.D
+	if snap.Seasonal.Active() {
+		dHead += snap.Seasonal.D * snap.Seasonal.M
+	}
+	wantNobs := len(snap.YTrain) - dHead
+	if wantNobs < 1 {
+		return fmt.Errorf("arima: yTrain length %d insufficient for differencing head %d",
+			len(snap.YTrain), dHead)
+	}
+	if snap.Nobs != wantNobs {
+		return fmt.Errorf("arima: nobs %d inconsistent with yTrain length %d minus diff head %d",
+			snap.Nobs, len(snap.YTrain), dHead)
+	}
+	if len(snap.Resids) != snap.Nobs {
+		return fmt.Errorf("arima: resids length %d != nobs %d", len(snap.Resids), snap.Nobs)
+	}
+	if snap.NExog > 0 {
+		if len(snap.XTrain) != len(snap.YTrain) {
+			return fmt.Errorf("arima: xTrain rows %d != yTrain length %d",
+				len(snap.XTrain), len(snap.YTrain))
+		}
+		for i, row := range snap.XTrain {
+			if len(row) != snap.NExog {
+				return fmt.Errorf("arima: xTrain row %d cols %d != NExog %d",
+					i, len(row), snap.NExog)
+			}
+		}
+	} else if len(snap.XTrain) != 0 {
+		return fmt.Errorf("arima: xTrain non-empty but NExog is 0")
 	}
 
 	m.Order = snap.Order

@@ -42,6 +42,14 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 		if futureExog == nil || len(futureExog) != nPeriods {
 			return nil, fmt.Errorf("future exog rows (%d) must match nPeriods (%d)", len(futureExog), nPeriods)
 		}
+		for i, row := range futureExog {
+			if len(row) != m.nExog {
+				return nil, fmt.Errorf("future exog row %d cols (%d) must match training (%d)",
+					i, len(row), m.nExog)
+			}
+		}
+	} else if futureExog != nil {
+		return nil, errors.New("model was fitted without exog; do not pass futureExog")
 	}
 
 	// Pull residuals from the differenced fit, drop the leading zeros that

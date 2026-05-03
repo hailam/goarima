@@ -578,9 +578,15 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 			}
 			return
 		}
+		// Cap workers at the number of jobs — extra workers would spin on an
+		// empty channel and consume scheduler cycles for no benefit.
+		nw := nWorkers
+		if nw > n {
+			nw = n
+		}
 		jobs := make(chan int, n)
 		var wg sync.WaitGroup
-		for w := 0; w < nWorkers; w++ {
+		for w := 0; w < nw; w++ {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -826,8 +832,13 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 		if len(futureExog) != nPeriods {
 			return nil, nil, nil, fmt.Errorf("future exog rows (%d) must match nPeriods (%d)", len(futureExog), nPeriods)
 		}
-		if len(futureExog[0]) != m.nExog {
-			return nil, nil, nil, fmt.Errorf("future exog cols (%d) must match training (%d)", len(futureExog[0]), m.nExog)
+		// Validate every row width — checking only [0] would let a ragged
+		// matrix through and panic later during differencing.
+		for i, row := range futureExog {
+			if len(row) != m.nExog {
+				return nil, nil, nil, fmt.Errorf("future exog row %d cols (%d) must match training (%d)",
+					i, len(row), m.nExog)
+			}
 		}
 	} else if futureExog != nil {
 		return nil, nil, nil, errors.New("model was fitted without exog; do not pass futureExog")

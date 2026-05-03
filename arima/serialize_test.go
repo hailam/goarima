@@ -208,3 +208,96 @@ func TestSerialize_LengthMismatchRejected(t *testing.T) {
 		t.Errorf("unexpected error: %v", err)
 	}
 }
+
+// Tests for codex-flagged hardening: yTrain emptiness, nobs invariant, resids
+// length, xTrain shape, negative orders.
+func TestSerialize_RejectsMalformed(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want string // substring of expected error
+	}{
+		{
+			"empty yTrain",
+			`{"version":1,"order":{"P":1,"D":0,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[0.5],"theta":[],"resids":[],"y_train":[]}`,
+			"yTrain is empty",
+		},
+		{
+			"nobs mismatch with yTrain",
+			`{"version":1,"order":{"P":1,"D":1,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[0.5],"theta":[],"resids":[1,2,3],"y_train":[1,2,3,4,5],"nobs":99}`,
+			"nobs",
+		},
+		{
+			"resids length mismatch with nobs",
+			`{"version":1,"order":{"P":1,"D":0,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[0.5],"theta":[],"resids":[1,2],"y_train":[1,2,3,4,5],"nobs":5}`,
+			"resids length",
+		},
+		{
+			"negative order field",
+			`{"version":1,"order":{"P":-1,"D":0,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[],"theta":[],"resids":[],"y_train":[1]}`,
+			"negative Order",
+		},
+		{
+			"xTrain rows != yTrain length",
+			`{"version":1,"order":{"P":1,"D":0,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[0.5],"theta":[],"resids":[1,2,3,4,5],"y_train":[1,2,3,4,5],"nobs":5,"n_exog":1,"beta":[0.1],"x_train":[[1.0],[2.0]]}`,
+			"xTrain rows",
+		},
+		{
+			"xTrain row width != NExog",
+			`{"version":1,"order":{"P":1,"D":0,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[0.5],"theta":[],"resids":[1,2,3],"y_train":[1,2,3],"nobs":3,"n_exog":2,"beta":[0.1,0.2],"x_train":[[1,2],[3],[5,6]]}`,
+			"xTrain row 1",
+		},
+		{
+			"xTrain populated but NExog = 0",
+			`{"version":1,"order":{"P":1,"D":0,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[0.5],"theta":[],"resids":[1,2,3],"y_train":[1,2,3],"nobs":3,"x_train":[[1],[2],[3]]}`,
+			"xTrain non-empty but NExog is 0",
+		},
+		{
+			"yTrain too short for diff head",
+			`{"version":1,"order":{"P":0,"D":2,"Q":0},"seasonal":{},"method":"ml","diffuse_convention":"r","phi":[],"theta":[],"resids":[],"y_train":[1,2],"nobs":0}`,
+			"insufficient for differencing",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &ARIMA{}
+			err := json.Unmarshal([]byte(tc.body), m)
+			if err == nil {
+				t.Fatalf("expected error containing %q, got nil", tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
+			}
+		})
+	}
+}
+
+// C3: every futureExog row must have the right width.
+func TestPredict_RejectsRaggedFutureExog(t *testing.T) {
+	rng := rand.New(rand.NewPCG(99, 100))
+	n := 100
+	y := make([]float64, n)
+	x := make([][]float64, n)
+	for i := 0; i < n; i++ {
+		x[i] = []float64{rng.Float64()}
+		if i == 0 {
+			y[i] = rng.NormFloat64()
+		} else {
+			y[i] = 0.5*y[i-1] + 1.5*x[i][0] + rng.NormFloat64()
+		}
+	}
+	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
+	m.WithIntercept = true
+	if err := m.Fit(y, x); err != nil {
+		t.Fatal(err)
+	}
+	// Ragged: row 0 has 1 col, row 1 has 0 cols.
+	bad := [][]float64{{0.5}, {}, {0.7}}
+	if _, _, _, err := m.Predict(3, 0, bad); err == nil {
+		t.Error("Predict accepted ragged futureExog")
+	}
+	// PredictBoot must also reject ragged input.
+	if _, err := m.PredictBoot(3, 0.05, 50, 1, bad); err == nil {
+		t.Error("PredictBoot accepted ragged futureExog")
+	}
+}
