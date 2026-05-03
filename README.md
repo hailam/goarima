@@ -59,6 +59,20 @@ m, _ := arima.RArima(wineind, arima.RArimaOpts{
 })
 ```
 
+### Pipeline with date features
+
+```go
+import "github.com/hailam/goarima/preprocessing"
+
+dates := /* []time.Time aligned with y */
+feat := preprocessing.NewPipelineDateFeaturizer(dates, preprocessing.DailyStep)
+pl, _ := pipeline.NewPipeline([]pipeline.Step{
+    {Name: "dates", Exog: feat},
+}, arima.NewARIMA(arima.Order{P: 1, D: 0, Q: 0}))
+pl.Fit(y, nil)
+fc, _, _, _ := pl.Predict(14, 0.05, nil) // dates auto-extend forward
+```
+
 ### Pipeline (Box-Cox + Fourier + ARIMA)
 
 ```go
