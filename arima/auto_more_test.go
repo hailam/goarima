@@ -5,6 +5,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/hailam/goarima/datasets"
@@ -118,9 +119,12 @@ func TestAutoArimaErrorActionIgnore(t *testing.T) {
 // Custom scoring function.
 func TestAutoArimaCustomScoring(t *testing.T) {
 	y := simulateAR1(150, 0.4, 1.0, 1)
-	called := false
+	// AutoArima may invoke Scoring concurrently across neighbor candidates
+	// in stepwise mode (and across the search box in FullSearch mode), so
+	// any state captured in the closure must be safe for concurrent access.
+	var called atomic.Bool
 	scoring := func(yt, yp []float64) (float64, error) {
-		called = true
+		called.Store(true)
 		if len(yt) != len(yp) {
 			return 0, errors.New("length mismatch")
 		}
@@ -139,7 +143,7 @@ func TestAutoArimaCustomScoring(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !called {
+	if !called.Load() {
 		t.Error("custom scorer was never called")
 	}
 	if mdl == nil {
