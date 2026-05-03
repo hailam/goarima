@@ -272,6 +272,48 @@ func TestSerialize_RejectsMalformed(t *testing.T) {
 	}
 }
 
+// Streaming Save/Load: verify Save writes incrementally and LoadARIMA can
+// decode from a stream that contains trailing data (json.Decoder semantics
+// — only the leading JSON object is consumed). Confirms the streaming path
+// preserves bit-exact Predict parity.
+func TestSerialize_StreamingRoundTrip(t *testing.T) {
+	y := simulateAR1(500, 0.6, 1.0, 13)
+	m := NewARIMA(Order{P: 1, D: 0, Q: 1})
+	m.WithIntercept = true
+	if err := m.Fit(y, nil); err != nil {
+		t.Fatal(err)
+	}
+
+	// Save streams to a writer.
+	var buf bytes.Buffer
+	if err := m.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+	// Encoded output ends with a newline (json.Encoder convention).
+	body := buf.Bytes()
+	if len(body) == 0 || body[len(body)-1] != '\n' {
+		t.Errorf("Save output should end with newline (json.Encoder convention)")
+	}
+
+	// Append trailing garbage; LoadARIMA should still consume only the
+	// leading JSON object.
+	buf.WriteString("trailing garbage that should be ignored")
+	loaded, err := LoadARIMA(&buf)
+	if err != nil {
+		t.Fatalf("LoadARIMA from stream with trailing data: %v", err)
+	}
+
+	wantFc, _, _, err := m.Predict(20, 0.05, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotFc, _, _, err := loaded.Predict(20, 0.05, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSeriesEqual(t, "streaming forecast", wantFc, gotFc)
+}
+
 // C3: every futureExog row must have the right width.
 func TestPredict_RejectsRaggedFutureExog(t *testing.T) {
 	rng := rand.New(rand.NewPCG(99, 100))

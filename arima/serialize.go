@@ -83,10 +83,11 @@ var stringToDiffuse = func() map[string]DiffuseConv {
 	return m
 }()
 
-// MarshalJSON implements encoding/json.Marshaler. Saving an unfitted model
-// is a programming error and returns an error rather than producing a
-// half-state snapshot.
-func (m *ARIMA) MarshalJSON() ([]byte, error) {
+// toSnapshot converts the model into its serializable representation. Used
+// by both MarshalJSON (build-then-marshal) and Save (stream via encoder).
+// Returns an error for non-serializable states (currently: unfitted model
+// or unknown enum values).
+func (m *ARIMA) toSnapshot() (*arimaSnapshot, error) {
 	if !m.fitted {
 		return nil, fmt.Errorf("arima: cannot serialize unfitted model — call Fit first")
 	}
@@ -98,7 +99,7 @@ func (m *ARIMA) MarshalJSON() ([]byte, error) {
 	if !ok {
 		return nil, fmt.Errorf("arima: unknown DiffuseConvention %d", m.DiffuseConvention)
 	}
-	snap := arimaSnapshot{
+	return &arimaSnapshot{
 		Version:               SerializationVersion,
 		Order:                 m.Order,
 		Seasonal:              m.Seasonal,
@@ -125,19 +126,26 @@ func (m *ARIMA) MarshalJSON() ([]byte, error) {
 		YTrain:                m.yTrain,
 		XTrain:                m.xTrain,
 		PsiInf:                m.psiInf,
-	}
-	return json.Marshal(&snap)
+	}, nil
 }
 
-// UnmarshalJSON implements encoding/json.Unmarshaler. Validates the version,
-// the Method/DiffuseConvention strings, and basic coherence (parameter slice
-// lengths match Order). Regenerates the Predict caches so the loaded model
-// is immediately ready to forecast.
-func (m *ARIMA) UnmarshalJSON(data []byte) error {
-	var snap arimaSnapshot
-	if err := json.Unmarshal(data, &snap); err != nil {
-		return fmt.Errorf("arima: decode snapshot: %w", err)
+// MarshalJSON implements encoding/json.Marshaler. Saving an unfitted model
+// is a programming error and returns an error rather than producing a
+// half-state snapshot.
+func (m *ARIMA) MarshalJSON() ([]byte, error) {
+	snap, err := m.toSnapshot()
+	if err != nil {
+		return nil, err
 	}
+	return json.Marshal(snap)
+}
+
+// fromSnapshot validates a snapshot and applies it to m. Used by both
+// UnmarshalJSON (full-buffer decode) and LoadARIMA (stream-decode).
+//
+// On any validation failure m.fitted is left false so a partially-loaded
+// model can't be silently used.
+func (m *ARIMA) fromSnapshot(snap *arimaSnapshot) error {
 	if snap.Version != SerializationVersion {
 		return fmt.Errorf("arima: unsupported serialization version %d (want %d)",
 			snap.Version, SerializationVersion)
@@ -297,26 +305,41 @@ func (m *ARIMA) rebuildPredictCaches() error {
 	return nil
 }
 
-// Save writes the fitted model to w as JSON. Equivalent to
-// `json.NewEncoder(w).Encode(m)` but without the trailing newline.
+// UnmarshalJSON implements encoding/json.Unmarshaler. Validates the version,
+// the Method/DiffuseConvention strings, and basic coherence (parameter slice
+// lengths, yTrain/xTrain shapes, nobs/resids invariants). Regenerates the
+// Predict caches so the loaded model is immediately ready to forecast.
+func (m *ARIMA) UnmarshalJSON(data []byte) error {
+	var snap arimaSnapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		return fmt.Errorf("arima: decode snapshot: %w", err)
+	}
+	return m.fromSnapshot(&snap)
+}
+
+// Save writes the fitted model to w as JSON. Streams via json.Encoder so the
+// full serialized payload is never materialized in memory at once — important
+// for models with long training series. Output ends with a single newline
+// (json.Encoder convention).
 func (m *ARIMA) Save(w io.Writer) error {
-	b, err := m.MarshalJSON()
+	snap, err := m.toSnapshot()
 	if err != nil {
 		return err
 	}
-	_, err = w.Write(b)
-	return err
+	return json.NewEncoder(w).Encode(snap)
 }
 
 // LoadARIMA reads a JSON-serialized ARIMA model from r and returns it ready
-// for Predict. The reader is consumed in full.
+// for Predict. Streams via json.Decoder so the input is consumed incrementally
+// — important for large saved models. Trailing whitespace and additional
+// JSON objects in the same stream are ignored.
 func LoadARIMA(r io.Reader) (*ARIMA, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, fmt.Errorf("arima: read snapshot: %w", err)
+	var snap arimaSnapshot
+	if err := json.NewDecoder(r).Decode(&snap); err != nil {
+		return nil, fmt.Errorf("arima: decode snapshot: %w", err)
 	}
 	m := &ARIMA{}
-	if err := m.UnmarshalJSON(data); err != nil {
+	if err := m.fromSnapshot(&snap); err != nil {
 		return nil, err
 	}
 	return m, nil

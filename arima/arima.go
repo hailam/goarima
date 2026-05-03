@@ -628,17 +628,39 @@ func minimize(f func([]float64) float64, x0 []float64, maxIter int) []float64 {
 	copy(bestX, x0)
 	bestF := f(x0)
 
+	// Nelder-Mead serves two purposes: (1) safety net when BFGS errors or
+	// stalls, (2) global-optimum search — for SARIMA in particular, BFGS
+	// often converges to a local minimum and NM finds a substantially
+	// better point (TestRParityStatsmodelsWineind would lose ~17 logL units
+	// without NM). So we cannot skip NM outright. But when BFGS converged
+	// cleanly we can run NM with a reduced budget — most local-min escapes
+	// happen in the first ~maxIter major iters anyway.
+	bfgsConverged := false
 	if res, err := optimize.Minimize(prob, x0, settings, &optimize.BFGS{}); err == nil && res != nil {
 		if res.F < bestF {
 			bestF = res.F
 			copy(bestX, res.X)
 		}
+		switch res.Status {
+		case optimize.GradientThreshold,
+			optimize.FunctionConvergence,
+			optimize.StepConvergence,
+			optimize.FunctionThreshold:
+			bfgsConverged = true
+		}
 	}
 
+	nmIters := maxIter * 4
+	nmFuncEvals := maxIter * 200
+	if bfgsConverged {
+		// Cheap polish — still escapes most local minima but at ~1/4 cost.
+		nmIters = maxIter
+		nmFuncEvals = maxIter * 50
+	}
 	probNM := optimize.Problem{Func: f}
 	settingsNM := &optimize.Settings{
-		MajorIterations: maxIter * 4,
-		FuncEvaluations: maxIter * 200,
+		MajorIterations: nmIters,
+		FuncEvaluations: nmFuncEvals,
 	}
 	if res, err := optimize.Minimize(probNM, bestX, settingsNM, &optimize.NelderMead{}); err == nil && res != nil {
 		if res.F < bestF {
