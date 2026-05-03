@@ -35,6 +35,15 @@ type AutoArimaOpts struct {
 	Alpha float64    // alpha for diff tests
 	Test  NDiffsTest // unit-root test (default KPSS)
 
+	// SeasonalTest selects the seasonal-differencing test. Defaults to
+	// NSDiffsOCSB (zero value), matching pmdarima.auto_arima and R's
+	// forecast::auto.arima. Set to NSDiffsCH for the legacy Canova-Hansen
+	// test (older R / hand-rolled scripts).
+	//
+	// Pre-fix this field didn't exist and the search hard-coded CH, which
+	// underpicks D on short seasonal series where the two tests disagree.
+	SeasonalTest NSDiffsTest
+
 	WithIntercept *bool // explicit override; nil = auto
 
 	// Information criterion to minimize.
@@ -181,7 +190,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 			D = opts.Dd
 		} else {
 			Dx, err := NSDiffs(yFit, NSDiffsOpts{
-				M: opts.M, MaxD: opts.MaxCapD, Test: NSDiffsCH, MaxLag: 3,
+				M: opts.M, MaxD: opts.MaxCapD, Test: opts.SeasonalTest, MaxLag: 3,
 			})
 			if err == nil {
 				D = Dx

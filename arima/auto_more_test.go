@@ -116,6 +116,83 @@ func TestAutoArimaErrorActionIgnore(t *testing.T) {
 	}
 }
 
+// Regression: AutoArima must pick D=1 on AirPassengers — both pmdarima and
+// R's forecast::auto.arima default to OCSB which selects D=1 here. Pre-fix
+// the search hard-coded the CH test which returned D=0, leaving the model
+// to fit a non-seasonally-differenced SARIMA and producing visibly worse
+// forecasts on monthly data.
+func TestAutoArimaSelectsOCSBDByDefault(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	m, err := AutoArima(ap, nil, AutoArimaOpts{
+		M: 12, MaxP: 2, MaxQ: 2, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 5, MaxD: 1, IC: AICc, MaxIter: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Seasonal.D != 1 {
+		t.Errorf("AutoArima picked Seasonal.D = %d, want 1 (matches pmdarima/forecast::auto.arima with OCSB default)",
+			m.Seasonal.D)
+	}
+}
+
+// Short-series case (n < 4m) where OCSB and CH commonly disagree. Use the
+// first 41 observations of AirPassengers — known real data with a stochastic
+// seasonal that R's OCSB picks up (D=1) where CH does not (D=0). Pre-fix
+// AutoArima silently used CH and underpicked D on this kind of series.
+func TestAutoArimaShortSeasonalSeries(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	short := ap[:41]
+	// Verify OCSB and CH disagree on this slice (otherwise the test isn't
+	// actually exercising the bug).
+	dOCSB, err := NSDiffs(short, NSDiffsOpts{
+		M: 12, MaxD: 1, Test: NSDiffsOCSB, MaxLag: 3, LagMethod: OCSBAIC,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dCH, err := NSDiffs(short, NSDiffsOpts{
+		M: 12, MaxD: 1, Test: NSDiffsCH, MaxLag: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dOCSB == dCH {
+		t.Skipf("OCSB and CH agree on short series (both = %d); test loses its bite", dOCSB)
+	}
+	// AutoArima default should land on the OCSB answer.
+	m, err := AutoArima(short, nil, AutoArimaOpts{
+		M: 12, MaxP: 1, MaxQ: 1, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 3, MaxD: 1, IC: AICc, MaxIter: 30,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Seasonal.D != dOCSB {
+		t.Errorf("short-series AutoArima picked Seasonal.D = %d, want OCSB result %d (got CH result %d instead — default flipped to CH again?)",
+			m.Seasonal.D, dOCSB, dCH)
+	}
+}
+
+// Explicit opt-in to NSDiffsCH (legacy R behavior) should still be honored.
+func TestAutoArimaCHOptIn(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	m, err := AutoArima(ap, nil, AutoArimaOpts{
+		M: 12, MaxP: 1, MaxQ: 1, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 3, MaxD: 1, IC: AICc, MaxIter: 30,
+		SeasonalTest: NSDiffsCH,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// On AirPassengers, CH returns D=0 — verifies the opt-in path actually
+	// uses CH instead of silently dispatching OCSB.
+	if m.Seasonal.D != 0 {
+		t.Errorf("AutoArima with SeasonalTest=NSDiffsCH picked Seasonal.D = %d, want 0",
+			m.Seasonal.D)
+	}
+}
+
 // Codex #C12: ErrorAction="raise" (default) must propagate fit errors even
 // when other candidates succeed. Pre-fix the FullSearch path returned
 // (best != nil, err == nil) when the best candidate happened to succeed,
