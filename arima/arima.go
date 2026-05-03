@@ -822,10 +822,46 @@ func (m *ARIMA) LogLikelihood() float64 { return m.logL }
 // Sigma2 returns the residual variance estimate.
 func (m *ARIMA) Sigma2() float64 { return m.sigma2 }
 
-// Resid returns the in-sample residuals (length = differenced obs count).
+// Resid returns the in-sample residuals aligned to the original time index.
+// Output length equals len(yTrain). The first `d + D*m` entries are NaN —
+// the differencing-warmup region where one-step-ahead residuals aren't
+// defined. Matches both pmdarima.ARIMA.arima_res_.resid (which returns
+// length-len(y) but fills warmup with innovations) and R's
+// residuals.Arima (which returns a ts of length n with NA in warmup).
+//
+// Older versions returned a shorter slice without the warmup region —
+// callers that pass the result straight to a length-agnostic test (Ljung-
+// Box, ACF) keep working; callers that align by index now use the value
+// directly (matches yTrain[i]) and skip NaN entries.
 func (m *ARIMA) Resid() []float64 {
-	out := make([]float64, len(m.resids))
-	copy(out, m.resids)
+	if !m.fitted {
+		return nil
+	}
+	dHead := m.Order.D
+	if m.Seasonal.Active() {
+		dHead += m.Seasonal.D * m.Seasonal.M
+	}
+	fullLen := len(m.yTrain)
+	if fullLen == 0 {
+		return nil
+	}
+	out := make([]float64, fullLen)
+	for i := 0; i < dHead; i++ {
+		out[i] = math.NaN()
+	}
+	residCount := fullLen - dHead
+	if residCount > 0 && len(m.resids) > 0 {
+		// Take the trailing residCount entries of m.resids (front-pad with
+		// zeros if shorter, mirroring FittedValues' resid alignment).
+		residTail := m.resids
+		if len(residTail) > residCount {
+			residTail = residTail[len(residTail)-residCount:]
+		} else if len(residTail) < residCount {
+			pad := make([]float64, residCount-len(residTail))
+			residTail = append(pad, residTail...)
+		}
+		copy(out[dHead:], residTail)
+	}
 	return out
 }
 
