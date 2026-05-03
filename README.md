@@ -85,6 +85,24 @@ m, _ := arima.AutoArima(y, nil, arima.AutoArimaOpts{
 })
 ```
 
+### Save and load fitted models
+
+```go
+// Save
+f, _ := os.Create("model.json")
+m.Save(f)
+
+// Load
+g, _ := os.Open("model.json")
+loaded, _ := arima.LoadARIMA(g)
+fc, _, _, _ := loaded.Predict(12, 0.05, nil) // identical to original
+```
+
+Models also implement `json.Marshaler` / `json.Unmarshaler`, so
+`json.Marshal(m)` and `json.Unmarshal(data, &m)` work directly. Format is
+versioned (currently `1`); loading an unknown version fails fast with a
+clear error.
+
 ## Module layout
 
 | Package | Purpose |
