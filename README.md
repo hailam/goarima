@@ -103,12 +103,18 @@ m, _ := arima.AutoArima(y, nil, arima.AutoArimaOpts{
 
 ```go
 // Generate 100 samples from a fitted ARIMA process; deterministic with seed.
-samples, _ := m.Simulate(100, 0, 42, nil) // burnIn=0 → default 100
+samples, _ := m.Simulate(100, arima.SimulateOpts{Seed: 42})
+
+// With exog, custom burn-in, etc.:
+samples, _ = m.Simulate(100, arima.SimulateOpts{
+    BurnIn:     200,         // 0 → 100 (matches pmdarima/R hidden default)
+    Seed:       42,          // 0 → time-based
+    FutureExog: futureX,     // required if model has exog
+})
 ```
 
 Mirrors statsmodels' `SARIMAX.simulate` and R's `arima.sim`. Output is on
-the model's original scale (Box-Cox-inverted if applicable). For models
-with exog, pass a `futureExog` matrix matching `n` rows.
+the model's original scale (Box-Cox-inverted if applicable).
 
 ### Save and load fitted models
 
@@ -153,6 +159,30 @@ The default path is fastest and matches the most common Python usage. The
 non-simple-differencing path uses an exact Kalman filter with Gardner-Harvey-
 Phillips stationary-cov initialization and is needed only when an exact match
 to R or to statsmodels' default is required.
+
+## Coming from pmdarima or R? API map
+
+goarima ships as a port of *both* pmdarima and `forecast::auto.arima` /
+`stats::arima`. Where pmdarima and R agree on shape/behavior, goarima matches
+them. Where they disagree, goarima exposes a knob (e.g.
+`DiffuseConvention`, `Method`) and picks a sensible default. The table below
+lists the surface differences that bite users porting code over.
+
+| Concern | pmdarima | R | goarima |
+|---|---|---|---|
+| AR/MA/seasonal orders | `order=(p,d,q), seasonal_order=(P,D,Q,m)` | `order=c(p,d,q), seasonal=list(order=c(P,D,Q), period=m)` | `Order{P,D,Q}` (non-seasonal) and `Seasonal{P,D,Q,M}`. **`Order.P` is the non-seasonal AR order** (lowercase `p` in the math); `Seasonal.P` is the seasonal AR order. Capitalization is forced by Go visibility rules. |
+| Confidence interval | `alpha=0.05` (kwarg) | `level=95` | `Predict(n, alpha, futureExog)`. Pass `alpha=0` to skip CIs (returns `nil` for `lower`/`upper`). |
+| Fitted values | `predict_in_sample(...)` returns `len(y)` array | `fitted(model)` returns `ts` of length `n` (NA in warmup) | `m.FittedValues()` returns `len(yTrain)` slice with `math.NaN()` in the first `d + D*m` warmup entries. |
+| Residuals | `arima_res_.resid` length `len(y)` | `residuals(model)` length `n` (NA in warmup) | `m.Resid()` returns `len(yTrain)` slice with `math.NaN()` in warmup. Filter via `dropNaN()` before passing to non-NaN-aware stats (Ljung-Box, ACF). |
+| Update / refresh | `model.update(y, X)` warm-starts MLE on existing params | `Arima(model = existing, x = new_y, xreg = new_X)` warm-starts | `m.Update(y, x)` warm-starts (fast); `m.Refit(y, x)` does a full cold re-fit. Neither re-searches orders — call `AutoArima` fresh for that. |
+| Box-Cox | `lambda` kwarg | `lambda` arg in `Arima` | `m.Lambda *float64` (nil = off). `Predict`, `FittedValues`, `PredictBoot`, `Simulate` all inverse-transform automatically. |
+| Bootstrap CI | `predict(..., bootstrap=True, n_sims=...)` | not built-in | `m.PredictBoot(n, alpha, nSim, seed, futureExog)` |
+| Simulate | `simulate(...)` (burn-in hidden) | `simulate.Arima(...)` (burn-in hidden) | `m.Simulate(n, SimulateOpts{Seed: …, BurnIn: …})`. `BurnIn=0` → 100. |
+| Drift | `with_intercept=True` + `d=1` adds drift | `include.drift=TRUE` | `RArima(opts.IncludeDrift = true)` sets `m.DriftIncluded`; `Predict`/`PredictBoot`/`Simulate` auto-extend the drift column so callers don't reconstruct `[n+1, n+2, …]` manually. |
+| Seasonal differencing test | `nsdiffs(test='ocsb')` (default) | `nsdiffs(test='ocsb')` (default) | `AutoArimaOpts.SeasonalTest` defaults to `NSDiffsOCSB` (matches both); set to `NSDiffsCH` for legacy R behavior. |
+| Estimator | `method='lbfgs'/'css-mle'` | `method='CSS'/'ML'/'CSS-ML'` | `Method` enum: `MethodCSS`, `MethodML`, `MethodCSSML` (default — same as R). |
+| Save / load | pickle | `saveRDS` / `readRDS` | `m.Save(io.Writer)` / `arima.LoadARIMA(io.Reader)` write versioned JSON. `*ARIMA` also implements `json.Marshaler`/`json.Unmarshaler`. |
+| Forecast variance for integrated models | grows with horizon ✓ | grows with horizon ✓ | `Predict` CI bands grow correctly (cumulative-sum psi for each unit-root factor). |
 
 ## License
 

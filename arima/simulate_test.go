@@ -10,7 +10,7 @@ import (
 
 func TestSimulate_UnfittedErrors(t *testing.T) {
 	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
-	if _, err := m.Simulate(10, 0, 1, nil); err == nil {
+	if _, err := m.Simulate(10, SimulateOpts{Seed: 1}); err == nil {
 		t.Error("expected error simulating from unfitted model")
 	}
 }
@@ -21,13 +21,13 @@ func TestSimulate_BadArgs(t *testing.T) {
 	if err := m.Fit(y, nil); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Simulate(0, 0, 1, nil); err == nil {
+	if _, err := m.Simulate(0, SimulateOpts{Seed: 1}); err == nil {
 		t.Error("expected error for n=0")
 	}
-	if _, err := m.Simulate(10, -1, 1, nil); err == nil {
+	if _, err := m.Simulate(10, SimulateOpts{BurnIn: -1, Seed: 1}); err == nil {
 		t.Error("expected error for negative burnIn")
 	}
-	if _, err := m.Simulate(10, 0, 1, [][]float64{{0}}); err == nil {
+	if _, err := m.Simulate(10, SimulateOpts{Seed: 1, FutureExog: [][]float64{{0}}}); err == nil {
 		t.Error("expected error: model has no exog but futureExog passed")
 	}
 }
@@ -38,7 +38,7 @@ func TestSimulate_ShapeAndDeterminism(t *testing.T) {
 	if err := m.Fit(y, nil); err != nil {
 		t.Fatal(err)
 	}
-	a, err := m.Simulate(50, 0, 42, nil)
+	a, err := m.Simulate(50, SimulateOpts{Seed: 42})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -46,14 +46,14 @@ func TestSimulate_ShapeAndDeterminism(t *testing.T) {
 		t.Fatalf("got %d samples, want 50", len(a))
 	}
 	// Same seed → bit-identical output.
-	b, _ := m.Simulate(50, 0, 42, nil)
+	b, _ := m.Simulate(50, SimulateOpts{Seed: 42})
 	for i := range a {
 		if a[i] != b[i] {
 			t.Errorf("seed determinism broken at i=%d: %v vs %v", i, a[i], b[i])
 		}
 	}
 	// Different seed → different output (almost surely).
-	c, _ := m.Simulate(50, 0, 43, nil)
+	c, _ := m.Simulate(50, SimulateOpts{Seed: 43})
 	allEqual := true
 	for i := range a {
 		if a[i] != c[i] {
@@ -76,7 +76,7 @@ func TestSimulate_StatisticalProperties(t *testing.T) {
 	m.fitted = true
 
 	const N = 100_000
-	samples, err := m.Simulate(N, 200, 12345, nil)
+	samples, err := m.Simulate(N, SimulateOpts{BurnIn: 200, Seed: 12345})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -111,7 +111,7 @@ func TestSimulate_RecoverParams(t *testing.T) {
 	gen.sigma2 = 1.0
 	gen.fitted = true
 
-	y, err := gen.Simulate(2000, 200, 9876, nil)
+	y, err := gen.Simulate(2000, SimulateOpts{BurnIn: 200, Seed: 9876})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +143,7 @@ func TestSimulate_SARIMAAirline(t *testing.T) {
 	if err := m.Fit(logAp, nil); err != nil {
 		t.Fatal(err)
 	}
-	samples, err := m.Simulate(48, 0, 7, nil)
+	samples, err := m.Simulate(48, SimulateOpts{Seed: 7})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -169,7 +169,7 @@ func TestSimulate_BoxCox(t *testing.T) {
 	if err := m.Fit(ap, nil); err != nil {
 		t.Fatal(err)
 	}
-	samples, err := m.Simulate(36, 0, 11, nil)
+	samples, err := m.Simulate(36, SimulateOpts{Seed: 11})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -204,7 +204,7 @@ func TestSimulate_WithExog(t *testing.T) {
 	for i := range futureX {
 		futureX[i] = []float64{rng.Float64()}
 	}
-	samples, err := m.Simulate(20, 0, 5, futureX)
+	samples, err := m.Simulate(20, SimulateOpts{Seed: 5, FutureExog: futureX})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestSimulate_WithExog(t *testing.T) {
 		t.Fatalf("got %d samples, want 20", len(samples))
 	}
 	// Wrong row count → error.
-	if _, err := m.Simulate(20, 0, 5, futureX[:10]); err == nil {
+	if _, err := m.Simulate(20, SimulateOpts{Seed: 5, FutureExog: futureX[:10]}); err == nil {
 		t.Error("expected error: futureExog rows mismatch n")
 	}
 }

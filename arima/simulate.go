@@ -8,14 +8,32 @@ import (
 	"time"
 )
 
+// SimulateOpts groups the optional parameters for Simulate. All fields
+// have sensible zero-value defaults so `Simulate(n, SimulateOpts{})` Just
+// Works for the common case.
+//
+// pmdarima and R both hide BurnIn from their public Simulate signatures;
+// goarima keeps it accessible (some users genuinely need to tune it for
+// long-memory models) but moves it into opts so the default stays out of
+// the primary signature.
+type SimulateOpts struct {
+	// BurnIn discards this many transient initial samples to escape the
+	// zero-state startup effect. 0 → 100 (the goarima default; matches
+	// the typical pmdarima/R internal default).
+	BurnIn int
+
+	// Seed pins the math/rand/v2 PCG state. 0 → time-based seed
+	// (non-deterministic).
+	Seed uint64
+
+	// FutureExog supplies n exogenous-regressor rows when the model was
+	// fit with exog. Required when m.nExog > 0; must be nil otherwise.
+	// For models with DriftIncluded, the drift column is auto-extended;
+	// pass only the OTHER exog columns (or nil if drift is the only one).
+	FutureExog [][]float64
+}
+
 // Simulate returns n samples drawn from the fitted ARIMA process.
-//
-// burnIn discards transient initial samples to escape the zero-state startup
-// effect; pass 0 to use the default of 100. seed pins the RNG (math/rand/v2
-// PCG); pass 0 for a time-based seed (non-deterministic).
-//
-// futureExog must have exactly n rows if the model was fit with exogenous
-// regressors. Rows must each have the same width as during Fit.
 //
 // Output is in the model's original units. If Box-Cox was applied during
 // Fit (Lambda != nil), the simulated series on the model scale is
@@ -26,19 +44,22 @@ import (
 // and any seasonal counterparts. Differencing is integrated back with a
 // zero historical head so the simulation represents a "fresh start" from
 // the stationary distribution rather than a continuation of yTrain.
-func (m *ARIMA) Simulate(n, burnIn int, seed uint64, futureExog [][]float64) ([]float64, error) {
+func (m *ARIMA) Simulate(n int, opts SimulateOpts) ([]float64, error) {
 	if !m.fitted {
 		return nil, errors.New("arima: cannot simulate from unfitted model — call Fit first")
 	}
 	if n <= 0 {
 		return nil, errors.New("arima: n must be positive")
 	}
+	burnIn := opts.BurnIn
 	if burnIn < 0 {
-		return nil, errors.New("arima: burnIn must be non-negative")
+		return nil, errors.New("arima: BurnIn must be non-negative")
 	}
 	if burnIn == 0 {
 		burnIn = 100
 	}
+	seed := opts.Seed
+	futureExog := opts.FutureExog
 	// Drift auto-extension — same as Predict/PredictBoot.
 	futureExog = m.extendDriftIfNeeded(futureExog, n)
 	if m.nExog > 0 {
