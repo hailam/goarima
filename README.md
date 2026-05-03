@@ -85,6 +85,17 @@ m, _ := arima.AutoArima(y, nil, arima.AutoArimaOpts{
 })
 ```
 
+### Simulate samples from a fitted model
+
+```go
+// Generate 100 samples from a fitted ARIMA process; deterministic with seed.
+samples, _ := m.Simulate(100, 0, 42, nil) // burnIn=0 → default 100
+```
+
+Mirrors statsmodels' `SARIMAX.simulate` and R's `arima.sim`. Output is on
+the model's original scale (Box-Cox-inverted if applicable). For models
+with exog, pass a `futureExog` matrix matching `n` rows.
+
 ### Save and load fitted models
 
 ```go

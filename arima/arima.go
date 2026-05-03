@@ -525,13 +525,26 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	m.sigma2 = sigma2
 	m.logL = -negLL
 
-	_, _, res := armaCSS(r, fullPhi, fullTheta)
+	// Recompute residuals + cache using the FINAL (possibly post-rescale)
+	// m.c and m.beta. In DiffuseStatsmodels mode the optimizer runs on
+	// scaled data and m.c/m.beta are rescaled back at the end of the switch
+	// above; the optimizer's `r` used the un-rescaled coefficients. Predict
+	// expects coefficients consistent with wsCenteredCache, so we rebuild
+	// here from m.c/m.beta directly. For all other modes the rescale is a
+	// no-op and rFinal == r.
+	rFinal := make([]float64, len(ws))
+	for i, v := range ws {
+		rr := v - m.mean - m.c
+		if m.nExog > 0 {
+			for j, b := range m.beta {
+				rr -= b * wX[i][j]
+			}
+		}
+		rFinal[i] = rr
+	}
+	_, _, res := armaCSS(rFinal, fullPhi, fullTheta)
 	m.resids = res
-
-	// Cache the differenced+centered training series so Predict doesn't need
-	// to redo Box-Cox + applyDiff + armaCSS each call. (yMSCache is set up
-	// front during Fit, immediately after Box-Cox.)
-	m.wsCenteredCache = append([]float64(nil), r...)
+	m.wsCenteredCache = rFinal
 
 	m.fitted = true
 	m.computePsi()

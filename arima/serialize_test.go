@@ -154,6 +154,23 @@ func TestSerialize_RoundTripNonSimpleDifferencing(t *testing.T) {
 	roundTripPredictParity(t, m, 12, nil, 0.05)
 }
 
+// Codex review flagged: in DiffuseStatsmodels mode, m.c and m.beta are
+// rescaled AFTER wsCenteredCache is built — so a Load+Predict using the
+// rescaled values may diverge from the original Predict using the cached
+// (un-rescaled) wsCentered. This test confirms or refutes that.
+func TestSerialize_RoundTripStatsmodelsWithIntercept(t *testing.T) {
+	wi := datasets.LoadWineind()
+	m := NewARIMA(Order{P: 1, D: 0, Q: 1})
+	m.WithIntercept = true
+	m.NonSimpleDifferencing = true
+	m.DiffuseConvention = DiffuseStatsmodels
+	m.MaxIter = 100
+	if err := m.Fit(wi, nil); err != nil {
+		t.Fatal(err)
+	}
+	roundTripPredictParity(t, m, 12, nil, 0.05)
+}
+
 func TestSerialize_UnfittedErrors(t *testing.T) {
 	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
 	if _, err := json.Marshal(m); err == nil {
