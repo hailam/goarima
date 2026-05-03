@@ -99,6 +99,26 @@ func BenchmarkKalmanARIMAFull(b *testing.B) {
 	}
 }
 
+// BenchmarkPredictBoot measures bootstrap CIs on a fitted SARIMA model.
+// This path is dominated by the per-simulation forecast loop; it benefits
+// strongly from the cache-reuse + window-only history optimization.
+func BenchmarkPredictBoot(b *testing.B) {
+	wi := datasets.LoadWineind()
+	m := NewARIMA(Order{P: 1, D: 1, Q: 1})
+	m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+	m.MaxIter = 100
+	if err := m.Fit(wi, nil); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := m.PredictBoot(12, 0.05, 1000, 1, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkPredictRepeated measures repeat-Predict on a fitted SARIMA model
 // (e.g., as in cross-validation or simulation studies). Exercises the cached
 // wsCenteredCache / yMSCache path.

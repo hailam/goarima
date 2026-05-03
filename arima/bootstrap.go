@@ -67,39 +67,16 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 		return nil, errors.New("no residuals to bootstrap from")
 	}
 
-	// Reconstruct differenced (centered/intercept-adjusted) training series.
 	fullPhi := expandSARMA(m.phi, m.Phi, m.Seasonal.M)
 	fullTheta := expandSMA(m.theta, m.Theta, m.Seasonal.M)
-	ws := append([]float64{}, m.yTrain...)
-	if m.Order.D > 0 {
-		ws = applyDiff(ws, 1, m.Order.D)
-	}
-	if m.Seasonal.Active() && m.Seasonal.D > 0 {
-		ws = applyDiff(ws, m.Seasonal.M, m.Seasonal.D)
-	}
-	var wX [][]float64
-	if m.xTrain != nil {
-		wX = cloneMat(m.xTrain)
-		if m.Order.D > 0 {
-			wX = applyMatDiff(wX, 1, m.Order.D)
-		}
-		if m.Seasonal.Active() && m.Seasonal.D > 0 {
-			wX = applyMatDiff(wX, m.Seasonal.M, m.Seasonal.D)
-		}
-	}
-	wsCentered := make([]float64, len(ws))
-	for i, v := range ws {
-		r := v - m.mean - m.c
-		if wX != nil {
-			for j, b := range m.beta {
-				r -= b * wX[i][j]
-			}
-		}
-		wsCentered[i] = r
-	}
-	_, _, baseRes := armaCSS(wsCentered, fullPhi, fullTheta)
 
-	// Difference combined exog.
+	// Pull cached differenced+centered training series + residuals from Fit
+	// (set by m.wsCenteredCache / m.resids). Avoids re-running applyDiff +
+	// armaCSS on every PredictBoot call — important when nSim is large.
+	wsCentered := m.wsCenteredCache
+	baseRes := m.resids
+
+	// Difference combined exog (one-time cost; not in the per-sim loop).
 	var futureWX [][]float64
 	if futureExog != nil {
 		combined := append([][]float64{}, m.xTrain...)
@@ -114,12 +91,32 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 		futureWX = diffed[len(diffed)-nPeriods:]
 	}
 
+	// Pre-compute integration heads once — they're identical for every sim.
+	var seasHead, nonSeasHead []float64
+	if m.Seasonal.Active() && m.Seasonal.D > 0 {
+		seasHead = lastN(diffStream(m.yTrain, 1, m.Order.D), m.Seasonal.D*m.Seasonal.M)
+	}
+	if m.Order.D > 0 {
+		nonSeasHead = lastN(m.yTrain, m.Order.D)
+	}
+
+	// Per-sim, the AR/MA forecast loop only reads the last len(fullPhi) /
+	// len(fullTheta) elements of the history. Copying the entire training
+	// series per simulation (the old code) was wasted work — extract the
+	// lag windows once and clone just those.
+	pLag := len(fullPhi)
+	qLag := len(fullTheta)
+	phiWin := lastN(wsCentered, pLag)
+	thetaWin := lastN(baseRes, qLag)
+
 	rng := rand.New(rand.NewPCG(seed, seed+1))
 	paths := make([][]float64, nSim)
+	// Reusable per-sim buffers (allocated once, overwritten each iteration).
+	hist := make([]float64, 0, pLag+nPeriods)
+	residHist := make([]float64, 0, qLag+nPeriods)
 	for s := 0; s < nSim; s++ {
-		// Working copy of the differenced state for this simulation.
-		hist := append([]float64{}, wsCentered...)
-		residHist := append([]float64{}, baseRes...)
+		hist = append(hist[:0], phiWin...)
+		residHist = append(residHist[:0], thetaWin...)
 		simDiffed := make([]float64, nPeriods)
 		for h := 0; h < nPeriods; h++ {
 			yh := 0.0
@@ -135,7 +132,6 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 					yh += th * residHist[idx]
 				}
 			}
-			// Inject a bootstrapped innovation.
 			eps := residPool[rng.IntN(len(residPool))]
 			yh += eps
 			simDiffed[h] = yh
@@ -151,17 +147,15 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 				}
 			}
 		}
-		// Integrate back through differencing.
+		// Integrate back through differencing using the pre-computed heads.
 		out := simDiffed
-		if m.Seasonal.Active() && m.Seasonal.D > 0 {
-			head := lastN(diffStream(m.yTrain, 1, m.Order.D), m.Seasonal.D*m.Seasonal.M)
-			full := integrateBack(out, head, m.Seasonal.M, m.Seasonal.D)
-			out = full[len(head):]
+		if seasHead != nil {
+			full := integrateBack(out, seasHead, m.Seasonal.M, m.Seasonal.D)
+			out = full[len(seasHead):]
 		}
-		if m.Order.D > 0 {
-			head := lastN(m.yTrain, m.Order.D)
-			full := integrateBack(out, head, 1, m.Order.D)
-			out = full[len(head):]
+		if nonSeasHead != nil {
+			full := integrateBack(out, nonSeasHead, 1, m.Order.D)
+			out = full[len(nonSeasHead):]
 		}
 		paths[s] = out
 	}
