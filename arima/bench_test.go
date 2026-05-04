@@ -249,3 +249,21 @@ func BenchmarkFitARIMA011_Airline_MethodML(b *testing.B) {
 		}
 	}
 }
+
+// Worst-case realistic scenario: AutoArima with NonSimpleDifferencing on
+// a long monthly series. Pre-CSS-1 this would compound 100ms+ NonSimple
+// fits across ~30 candidates → multi-second wall.
+func BenchmarkAutoArima_NonSimple_Wineind(b *testing.B) {
+	wi := datasets.LoadWineind()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := AutoArima(wi, nil, AutoArimaOpts{
+			M: 12, MaxP: 2, MaxQ: 2, MaxCapP: 1, MaxCapQ: 1,
+			MaxOrder: 4, MaxD: 2, IC: AICc, MaxIter: 50,
+			NonSimpleDifferencing: true,
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

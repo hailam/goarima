@@ -851,8 +851,11 @@ func minimizeNM(f func([]float64) float64, x0 []float64, maxIter, nWorkers int, 
 
 	nmIters := maxIter * 4
 	nmFuncEvals := maxIter * 200
-	if bfgsConverged {
+	if bfgsConverged || warmStarted {
 		// Cheap polish — still escapes most local minima but at ~1/4 cost.
+		// We use the reduced budget when EITHER (a) BFGS converged cleanly,
+		// or (b) we were warm-started: in both cases the global search is
+		// already done and NM only needs to refine.
 		nmIters = maxIter
 		nmFuncEvals = maxIter * 50
 	}
