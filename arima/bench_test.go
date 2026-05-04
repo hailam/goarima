@@ -213,3 +213,39 @@ func BenchmarkPredictRepeated(b *testing.B) {
 		_, _, _, _ = m.Predict(12, 0.05, nil)
 	}
 }
+
+func BenchmarkFitARIMA011_Airline_MethodCSS(b *testing.B) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m := NewARIMA(Order{P: 0, D: 1, Q: 1})
+		m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+		m.MaxIter = 100
+		m.Method = MethodCSS
+		if err := m.Fit(logAp, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkFitARIMA011_Airline_MethodML(b *testing.B) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m := NewARIMA(Order{P: 0, D: 1, Q: 1})
+		m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+		m.MaxIter = 100
+		m.Method = MethodML
+		if err := m.Fit(logAp, nil); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -543,6 +543,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	// Skip the CSS warmup phase when warm-starting: the existing fit's
 	// optimizer-space x is already a refined point, and the whole purpose
 	// of warm-start is to avoid the redundant work CSS would do here.
+	cssWarmedX := false
 	if m.Method == MethodCSSML && !useWarmStart {
 		cssObj := func(params []float64) float64 {
 			phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
@@ -552,13 +553,18 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			return ll
 		}
 		x0 = minimize(cssObj, x0, m.MaxIter, m.gradientWorkers())
+		cssWarmedX = true
 	}
 
 	mi := m.MaxIter
 	if m.warmStartMaxIter > 0 {
 		mi = m.warmStartMaxIter
 	}
-	best := minimize(objective, x0, mi, m.gradientWorkers())
+	// Warm-started ML phase (after CSS or after a previous fit) can skip
+	// the Nelder-Mead polish when BFGS converges cleanly — CSS already did
+	// the global search, so NM here is mostly redundant.
+	mlWarmStarted := cssWarmedX || useWarmStart
+	best := minimizeNM(objective, x0, mi, m.gradientWorkers(), mlWarmStarted)
 	phi, theta, sPhi, sTheta, c, beta := unpackParamsX(best, p, q, P, Q, m.WithIntercept, k)
 	m.phi = phi
 	m.theta = theta
@@ -787,6 +793,22 @@ func (m *ARIMA) gradientWorkers() int {
 }
 
 func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers int) []float64 {
+	return minimizeNM(f, x0, maxIter, nWorkers, false)
+}
+
+// minimizeNM is the BFGS+Nelder-Mead optimizer. When `warmStarted` is true,
+// the caller is signalling that x0 is already close to the optimum (e.g.
+// after a CSS warmup phase that fed the ML refinement). In that case, NM
+// is skipped when BFGS converges cleanly — saving ~30-50% of optimizer
+// time. NM is still run when BFGS fails, when warmStarted is false, or
+// when BFGS reports a non-convergence status, since SARIMA likelihoods
+// have many local minima and NM is the only reliable global-search step.
+//
+// Empirically: skipping NM after a converged warm-started BFGS keeps
+// likelihood within ~1e-6 units (well under the parity test tolerances)
+// and saves the cost of a full second optimizer run. See PERF_TODO
+// CSS-1 for the bench numbers.
+func minimizeNM(f func([]float64) float64, x0 []float64, maxIter, nWorkers int, warmStarted bool) []float64 {
 	if nWorkers < 1 {
 		nWorkers = runtime.GOMAXPROCS(0)
 	}
@@ -805,9 +827,9 @@ func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers int) []
 	// stalls, (2) global-optimum search — for SARIMA in particular, BFGS
 	// often converges to a local minimum and NM finds a substantially
 	// better point (TestRParityStatsmodelsWineind would lose ~17 logL units
-	// without NM). So we cannot skip NM outright. But when BFGS converged
-	// cleanly we can run NM with a reduced budget — most local-min escapes
-	// happen in the first ~maxIter major iters anyway.
+	// without NM). So we cannot skip NM outright on cold starts. When
+	// warmStarted=true and BFGS converges cleanly, we DO skip NM — the
+	// CSS phase has already done the global search.
 	bfgsConverged := false
 	if res, err := optimize.Minimize(prob, x0, settings, &optimize.BFGS{}); err == nil && res != nil {
 		if res.F < bestF {
@@ -821,6 +843,10 @@ func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers int) []
 			optimize.FunctionThreshold:
 			bfgsConverged = true
 		}
+	}
+
+	if warmStarted && bfgsConverged {
+		return bestX
 	}
 
 	nmIters := maxIter * 4
