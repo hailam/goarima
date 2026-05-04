@@ -118,6 +118,43 @@ func TestForecastSE_AirlineStyleIntegration(t *testing.T) {
 	}
 }
 
+// Long-horizon CI for ARIMA(0,1,0): SE = σ√h must keep growing past h=100.
+// Pre-fix `computePsi` hard-coded a 100-entry psi array, so var2 stopped
+// accumulating at horizon 100 — every CI band for h ∈ [101, ∞) was the
+// same as h=100. Post-fix, Predict calls `computePsiUpTo(nPeriods)` to
+// extend the cached psi when the horizon exceeds it.
+func TestForecastSE_LongHorizon_NoTruncation(t *testing.T) {
+	m := NewARIMA(Order{P: 0, D: 1, Q: 0})
+	m.sigma2 = 1.0
+	m.fitted = true
+	m.yTrain = []float64{0, 1, 0, 1, 2, 3, 4}
+	m.yMSCache = append([]float64(nil), m.yTrain...)
+	m.wsCenteredCache = []float64{1, -1, 1, 1, 1, 1}
+	m.resids = []float64{1, -1, 1, 1, 1, 1}
+	m.nobs = 6
+	m.computePsi() // initial 100-entry cache
+
+	// Forecast past the original 100-entry truncation point.
+	const horizon = 200
+	_, lower, upper, err := m.Predict(horizon, 0.05, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	z := normPPF(0.975)
+	for _, h := range []int{100, 150, 199} {
+		seGot := (upper[h] - lower[h]) / (2 * z)
+		seWant := math.Sqrt(float64(h + 1)) // σ=1, var = h+1
+		if math.Abs(seGot-seWant)/seWant > 1e-9 {
+			t.Errorf("horizon h=%d: SE got %g, want %g — CI flattened past truncation",
+				h+1, seGot, seWant)
+		}
+	}
+	// Sanity: cached psi was extended to cover the new horizon.
+	if len(m.psiInf) < horizon {
+		t.Errorf("psiInf len = %d, want ≥ %d", len(m.psiInf), horizon)
+	}
+}
+
 // Stationary AR(1): no integration, so psi recursion alone is correct.
 // The fix should NOT change behavior for d=D=0 models.
 func TestForecastSE_AR1_Unchanged(t *testing.T) {

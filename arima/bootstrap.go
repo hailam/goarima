@@ -84,18 +84,35 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 	baseRes := m.resids
 
 	// Difference combined exog (one-time cost; not in the per-sim loop).
+	// Trim m.xTrain to the last `dHead = D + D*M` rows of historical context
+	// — that's all the differencing operator needs. Same fix as #C17 for
+	// Predict; pre-fix bootstrap copied the full training xTrain on every
+	// PredictBoot call, which adds up fast on long-history workloads.
 	var futureWX [][]float64
 	if futureExog != nil {
-		combined := append([][]float64{}, m.xTrain...)
-		combined = append(combined, futureExog...)
-		diffed := combined
-		if m.Order.D > 0 {
-			diffed = applyMatDiff(diffed, 1, m.Order.D)
+		dHead := m.Order.D
+		if m.Seasonal.Active() {
+			dHead += m.Seasonal.D * m.Seasonal.M
 		}
-		if m.Seasonal.Active() && m.Seasonal.D > 0 {
-			diffed = applyMatDiff(diffed, m.Seasonal.M, m.Seasonal.D)
+		if dHead == 0 {
+			futureWX = futureExog
+		} else {
+			trimStart := len(m.xTrain) - dHead
+			if trimStart < 0 {
+				trimStart = 0
+			}
+			combined := make([][]float64, 0, dHead+nPeriods)
+			combined = append(combined, m.xTrain[trimStart:]...)
+			combined = append(combined, futureExog...)
+			diffed := combined
+			if m.Order.D > 0 {
+				diffed = applyMatDiff(diffed, 1, m.Order.D)
+			}
+			if m.Seasonal.Active() && m.Seasonal.D > 0 {
+				diffed = applyMatDiff(diffed, m.Seasonal.M, m.Seasonal.D)
+			}
+			futureWX = diffed[len(diffed)-nPeriods:]
 		}
-		futureWX = diffed[len(diffed)-nPeriods:]
 	}
 
 	// Pre-compute integration heads once — they're identical for every sim.

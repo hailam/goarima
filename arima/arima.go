@@ -1215,10 +1215,21 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 		}
 	}
 
-	// Forecast residuals on differenced/centered scale.
+	// Forecast residuals on differenced/centered scale. Pre-fix this copied
+	// the entire training history (`append([]float64{}, wsCentered...)`)
+	// even though the AR/MA recursion only reads the last len(fullPhi) /
+	// len(fullTheta) elements. Same fix as #C18 for PredictBoot: extract the
+	// AR/MA lag windows once and reuse small buffers sized to lag + horizon.
+	pLag := len(fullPhi)
+	qLag := len(fullTheta)
+	phiWin := lastN(wsCentered, pLag)
+	thetaWin := lastN(res, qLag)
+	thetaOriginalLen := len(thetaWin)
 	forecastDiffed := make([]float64, nPeriods)
-	hist := append([]float64{}, wsCentered...)
-	residHist := append([]float64{}, res...)
+	hist := make([]float64, 0, pLag+nPeriods)
+	hist = append(hist, phiWin...)
+	residHist := make([]float64, 0, qLag+nPeriods)
+	residHist = append(residHist, thetaWin...)
 	for h := 0; h < nPeriods; h++ {
 		yh := 0.0
 		for i, ph := range fullPhi {
@@ -1229,7 +1240,12 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 		}
 		for j, th := range fullTheta {
 			idx := len(residHist) - 1 - j
-			if idx >= 0 && idx < len(res) {
+			// Only read the ORIGINAL training residuals (the windowed prefix).
+			// Future innovations are zero in expectation — leaving them as the
+			// zero pads we append below. This matches the pre-fix behaviour
+			// where `idx < len(res)` excluded the just-appended zeros from
+			// contributing to the MA(future) part redundantly.
+			if idx >= 0 && idx < thetaOriginalLen {
 				yh += th * residHist[idx]
 			}
 		}
@@ -1261,19 +1277,28 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 		out = full[len(head):]
 	}
 
-	// Confidence intervals using truncated MA(infinity) coefficients.
-	if alpha > 0 && alpha < 1 && len(m.psiInf) > 0 {
-		z := normPPF(1 - alpha/2)
-		lower = make([]float64, nPeriods)
-		upper = make([]float64, nPeriods)
-		var2 := 0.0
-		for h := 0; h < nPeriods; h++ {
-			if h < len(m.psiInf) {
-				var2 += m.psiInf[h] * m.psiInf[h]
+	// Confidence intervals using truncated MA(infinity) coefficients. If
+	// the cached psi is shorter than the horizon, extend it — pre-fix the
+	// hard-coded 100-entry truncation silently flattened CIs past horizon
+	// 100 (psi[h] for h ≥ 100 was absent, so var2 stopped accumulating
+	// even though every additional psi² term should add to the variance).
+	if alpha > 0 && alpha < 1 {
+		if len(m.psiInf) < nPeriods {
+			m.computePsiUpTo(nPeriods)
+		}
+		if len(m.psiInf) > 0 {
+			z := normPPF(1 - alpha/2)
+			lower = make([]float64, nPeriods)
+			upper = make([]float64, nPeriods)
+			var2 := 0.0
+			for h := 0; h < nPeriods; h++ {
+				if h < len(m.psiInf) {
+					var2 += m.psiInf[h] * m.psiInf[h]
+				}
+				se := math.Sqrt(m.sigma2 * var2)
+				lower[h] = out[h] - z*se
+				upper[h] = out[h] + z*se
 			}
-			se := math.Sqrt(m.sigma2 * var2)
-			lower[h] = out[h] - z*se
-			upper[h] = out[h] + z*se
 		}
 	}
 
@@ -1375,7 +1400,17 @@ func cloneMat(x [][]float64) [][]float64 {
 // the SD growing like √h. Matches R's `forecast::forecast` and
 // statsmodels' `SARIMAXResults.get_forecast` variance growth.
 func (m *ARIMA) computePsi() {
-	const maxLag = 100
+	m.computePsiUpTo(100)
+}
+
+// computePsiUpTo recomputes psi with at least `maxLag` entries. Predict
+// calls this with `nPeriods` if its current cache is shorter — pre-fix the
+// hard-coded 100-entry limit silently flattened forecast CIs past horizon
+// 100 (psi[h] for h ≥ 100 was just absent, so var2 stopped accumulating).
+func (m *ARIMA) computePsiUpTo(maxLag int) {
+	if maxLag < 1 {
+		maxLag = 1
+	}
 	fullPhi := expandSARMA(m.phi, m.Phi, m.Seasonal.M)
 	fullTheta := expandSMA(m.theta, m.Theta, m.Seasonal.M)
 	psi := make([]float64, maxLag)
