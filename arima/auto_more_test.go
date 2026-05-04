@@ -193,6 +193,93 @@ func TestAutoArimaCHOptIn(t *testing.T) {
 	}
 }
 
+// CD-F2: AutoArima accepts Lambda and threads it into every candidate fit.
+// Verified by fitting with Lambda=0 (log) on AirPassengers and checking
+// that m.Lambda is set on the returned model + that forecasts are positive
+// (Box-Cox-inverted from log scale).
+func TestAutoArima_Lambda(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	lambda := 0.0 // log
+	mdl, err := AutoArima(ap, nil, AutoArimaOpts{
+		M: 12, MaxP: 1, MaxQ: 1, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 3, IC: AICc, MaxIter: 50,
+		Lambda: &lambda,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mdl.Lambda == nil || *mdl.Lambda != 0 {
+		t.Errorf("Lambda not threaded: got %v", mdl.Lambda)
+	}
+	// Forecast must be on the original positive scale (Box-Cox-inverted).
+	fc, _, _, err := mdl.Predict(12, 0.05, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, v := range fc {
+		if v <= 0 {
+			t.Errorf("fc[%d] = %g, want positive (Box-Cox-inverted from log)", i, v)
+		}
+	}
+}
+
+// CD-F2: AutoArima with NonSimpleDifferencing=true threads it into candidate
+// fits. Verify by checking the returned model's flag is set.
+func TestAutoArima_NonSimpleDifferencing(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	mdl, err := AutoArima(logAp, nil, AutoArimaOpts{
+		M: 12, MaxP: 1, MaxQ: 1, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 3, IC: AICc, MaxIter: 50,
+		NonSimpleDifferencing: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mdl.NonSimpleDifferencing {
+		t.Error("NonSimpleDifferencing not threaded into returned model")
+	}
+}
+
+// CD-F2: explicit Method choice threads into candidate fits.
+func TestAutoArima_MethodCSS(t *testing.T) {
+	y := simulateAR1(200, 0.5, 1.0, 7)
+	mdl, err := AutoArima(y, nil, AutoArimaOpts{
+		M: 0, MaxP: 1, MaxQ: 1, MaxOrder: 2, IC: AIC, MaxIter: 30,
+		Method: MethodCSS,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mdl.Method != MethodCSS {
+		t.Errorf("Method = %v, want MethodCSS", mdl.Method)
+	}
+}
+
+// CD-F2: DiffuseConvention defaults to DiffuseR; verify DiffuseStatsmodels
+// is honored when explicitly set alongside NonSimpleDifferencing.
+func TestAutoArima_DiffuseStatsmodels(t *testing.T) {
+	wi := datasets.LoadWineind()
+	mdl, err := AutoArima(wi, nil, AutoArimaOpts{
+		M: 12, MaxP: 1, MaxQ: 1, MaxCapP: 0, MaxCapQ: 1,
+		MaxOrder: 3, IC: AICc, MaxIter: 50,
+		NonSimpleDifferencing: true,
+		DiffuseConvention:     DiffuseStatsmodels,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !mdl.NonSimpleDifferencing {
+		t.Error("NonSimpleDifferencing not threaded")
+	}
+	if mdl.DiffuseConvention != DiffuseStatsmodels {
+		t.Errorf("DiffuseConvention = %v, want DiffuseStatsmodels", mdl.DiffuseConvention)
+	}
+}
+
 // Codex #C12: ErrorAction="raise" (default) must propagate fit errors even
 // when other candidates succeed. Pre-fix the FullSearch path returned
 // (best != nil, err == nil) when the best candidate happened to succeed,

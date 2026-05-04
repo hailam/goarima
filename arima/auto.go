@@ -96,6 +96,31 @@ type AutoArimaOpts struct {
 	// Mirrors pmdarima's `n_jobs`. R/Python require pickling+IPC for parallel
 	// auto.arima, but Go's goroutines are essentially free.
 	NJobs int
+
+	// Method selects the per-candidate fitting estimator (CSS / ML / CSS-ML).
+	// Default 0 (MethodCSSML) — same as a hand-rolled `Fit`. Mirrors
+	// pmdarima's `method=` and R's `method=` arguments to auto.arima.
+	Method Method
+
+	// Lambda (and Lambda2 shift) enable Box-Cox transformation on every
+	// candidate fit. nil → no transform. Use `floatPtr(0)` for log. Mirrors
+	// pmdarima's `lambda=` arg. Each candidate's AICc / forecast is
+	// computed on the back-transformed series so values are comparable
+	// across the search box.
+	Lambda  *float64
+	Lambda2 float64
+
+	// NonSimpleDifferencing routes every candidate through the integrated
+	// state-space form (R's `stats::arima` / statsmodels SARIMAX path).
+	// Slower than the default simple-differencing path but required when
+	// you need 1:1 R or statsmodels parity within the search.
+	NonSimpleDifferencing bool
+
+	// DiffuseConvention selects the likelihood-convention flag passed to
+	// each candidate. Only effective when NonSimpleDifferencing is true.
+	// DiffuseR (default) matches R's stats::arima; DiffuseStatsmodels
+	// matches SARIMAX(simple_differencing=False).
+	DiffuseConvention DiffuseConv
 }
 
 // AutoArima runs model selection over ARIMA(p,d,q)(P,D,Q,m).
@@ -198,11 +223,24 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// (e.g. calendar regressors like Ramadan/holidays), the raw-y test
 	// over-detects seasonal differencing and selects D=1 where pmdarima/R
 	// (correctly) settle on D=0.
-	xx := yFit
-	if xFit != nil && len(xFit) == len(yFit) && len(xFit[0]) > 0 {
-		if beta, err := olsFit(xFit, yFit, true); err == nil && len(beta) == len(xFit[0])+1 {
-			adjusted := make([]float64, len(yFit))
-			for i, v := range yFit {
+	//
+	// When Lambda is set, the differencing tests should see the same
+	// transformed series the candidate fits will work on internally, so
+	// apply Box-Cox here (only for the diff-test path; yFit / yHoldout
+	// stay on original scale so candidate Fit can apply its own Box-Cox).
+	yForDiff := yFit
+	if opts.Lambda != nil {
+		bc, err := boxCoxApply(yFit, *opts.Lambda, opts.Lambda2)
+		if err != nil {
+			return nil, fmt.Errorf("Box-Cox transform: %w", err)
+		}
+		yForDiff = bc
+	}
+	xx := yForDiff
+	if xFit != nil && len(xFit) == len(yForDiff) && len(xFit[0]) > 0 {
+		if beta, err := olsFit(xFit, yForDiff, true); err == nil && len(beta) == len(xFit[0])+1 {
+			adjusted := make([]float64, len(yForDiff))
+			for i, v := range yForDiff {
 				pred := beta[0] // intercept
 				for j, b := range beta[1:] {
 					pred += b * xFit[i][j]
@@ -343,13 +381,18 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		if opts.M > 1 && (k.P+k.Q+D > 0) {
 			ssn = SeasonalOrder{P: k.P, D: D, Q: k.Q, M: opts.M}
 		}
+		method := opts.Method // zero value = MethodCSSML, same as before
 		mdl := &ARIMA{
-			Order:           ord,
-			Seasonal:        ssn,
-			WithIntercept:   withIntercept,
-			Method:          MethodCSSML,
-			MaxIter:         opts.MaxIter,
-			GradientWorkers: gradWorkers,
+			Order:                 ord,
+			Seasonal:              ssn,
+			WithIntercept:         withIntercept,
+			Method:                method,
+			MaxIter:               opts.MaxIter,
+			GradientWorkers:       gradWorkers,
+			Lambda:                opts.Lambda,
+			Lambda2:               opts.Lambda2,
+			NonSimpleDifferencing: opts.NonSimpleDifferencing,
+			DiffuseConvention:     opts.DiffuseConvention,
 		}
 		if err := mdl.Fit(yFit, xFit); err != nil {
 			return nil, 0, err
