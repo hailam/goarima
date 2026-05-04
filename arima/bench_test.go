@@ -119,6 +119,26 @@ func BenchmarkPredictBoot(b *testing.B) {
 	}
 }
 
+// BenchmarkPredictBootLarge stresses the L-7 parallel path with a longer
+// horizon and more simulations — where per-path work is large enough to
+// amortise goroutine overhead.
+func BenchmarkPredictBootLarge(b *testing.B) {
+	wi := datasets.LoadWineind()
+	m := NewARIMA(Order{P: 1, D: 1, Q: 1})
+	m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+	m.MaxIter = 100
+	if err := m.Fit(wi, nil); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := m.PredictBoot(60, 0.05, 5000, 1, nil)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkPredictRepeated measures repeat-Predict on a fitted SARIMA model
 // (e.g., as in cross-validation or simulation studies). Exercises the cached
 // wsCenteredCache / yMSCache path.

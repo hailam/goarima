@@ -64,3 +64,40 @@ func TestPredictBootErrors(t *testing.T) {
 		t.Error("expected error: not fitted")
 	}
 }
+
+// L-7: PredictBoot is parallelized once nSim ≥ 64 (constant in bootstrap.go).
+// To stay deterministic for users — same seed produces identical Paths
+// regardless of how the work is partitioned across goroutines — each path
+// uses a per-path PCG seeded from (seed, s). This test verifies that
+// invariant by comparing two runs at the same seed but different nSim
+// (which forces a different worker partition under the s % nWorkers
+// scheduling).
+func TestPredictBoot_DeterministicAcrossWorkerCounts(t *testing.T) {
+	y := simulateAR1(300, 0.6, 1.0, 7)
+	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
+	m.MaxIter = 60
+	if err := m.Fit(y, nil); err != nil {
+		t.Fatal(err)
+	}
+	// nSim=128: parallel path (≥ threshold of 64).
+	res128, err := m.PredictBoot(8, 0.05, 128, 999, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// First 50 paths should match a smaller-nSim run that goes serial
+	// (50 < 64 → serial path). Both use the same per-path seeding, so
+	// paths[0..49] must be bit-identical.
+	res50, err := m.PredictBoot(8, 0.05, 50, 999, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for s := 0; s < 50; s++ {
+		for h := 0; h < 8; h++ {
+			if res128.Paths[s][h] != res50.Paths[s][h] {
+				t.Errorf("path[%d][%d]: nSim=128 (parallel) = %g, nSim=50 (serial) = %g — per-path seeding broken",
+					s, h, res128.Paths[s][h], res50.Paths[s][h])
+				return
+			}
+		}
+	}
+}

@@ -4,7 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"runtime"
 	"sort"
+	"sync"
 )
 
 // BootResult holds nSim simulated forecast paths plus bootstrap quantile CIs.
@@ -141,12 +143,19 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 	phiWin := lastN(wsCentered, pLag)
 	thetaWin := lastN(baseRes, qLag)
 
-	rng := rand.New(rand.NewPCG(seed, seed+1))
 	paths := make([][]float64, nSim)
-	// Reusable per-sim buffers (allocated once, overwritten each iteration).
-	hist := make([]float64, 0, pLag+nPeriods)
-	residHist := make([]float64, 0, qLag+nPeriods)
-	for s := 0; s < nSim; s++ {
+
+	// simulateOne runs simulation s with its own pre-allocated buffers and
+	// PCG seeded from (seed, s). Returns the output path on the user's
+	// original scale (Box-Cox-inverted if applicable). The per-path
+	// (seed, s) seeding makes paths[s] deterministic regardless of worker
+	// assignment — serial and parallel runs produce identical Paths for a
+	// given `seed`. RNG cost: PCG re-seed per path (constant time, no
+	// allocation thanks to PCG's value semantics on Seed).
+	const seedSalt = uint64(0x9E3779B97F4A7C15) // golden-ratio salt
+	simulateOne := func(s int, pcg *rand.PCG, hist, residHist []float64) []float64 {
+		pcg.Seed(seed^seedSalt, uint64(s)+1)
+		rng := rand.New(pcg)
 		hist = append(hist[:0], phiWin...)
 		residHist = append(residHist[:0], thetaWin...)
 		simDiffed := make([]float64, nPeriods)
@@ -189,12 +198,49 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 			full := integrateBack(out, nonSeasHead, 1, m.Order.D)
 			out = full[len(nonSeasHead):]
 		}
-		// Inverse Box-Cox so paths land in the user's original units. Mirrors
-		// the same step at the end of Predict.
+		// Inverse Box-Cox so paths land in the user's original units.
 		if m.Lambda != nil {
 			out = boxCoxInvert(out, *m.Lambda, m.Lambda2)
 		}
-		paths[s] = out
+		return out
+	}
+
+	// Worker count: dispatch to goroutines once nSim is big enough that the
+	// per-path simulation work amortises goroutine setup. Below the threshold
+	// we stay single-threaded — overhead would dominate.
+	nWorkers := runtime.GOMAXPROCS(0)
+	if nWorkers > nSim {
+		nWorkers = nSim
+	}
+	const parallelThreshold = 64
+	if nSim < parallelThreshold || nWorkers < 2 {
+		// Serial path — one PCG, one set of scratch buffers, processes all paths.
+		pcg := rand.NewPCG(0, 0)
+		hist := make([]float64, 0, pLag+nPeriods)
+		residHist := make([]float64, 0, qLag+nPeriods)
+		for s := 0; s < nSim; s++ {
+			paths[s] = simulateOne(s, pcg, hist, residHist)
+		}
+	} else {
+		// Parallel path — each worker owns its scratch buffers and PCG; paths
+		// are partitioned by index modulo nWorkers (cheap, balanced for
+		// uniform-cost simulations). Each path writes only to paths[s], so no
+		// lock is needed.
+		var wg sync.WaitGroup
+		for w := 0; w < nWorkers; w++ {
+			w := w
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				pcg := rand.NewPCG(0, 0)
+				hist := make([]float64, 0, pLag+nPeriods)
+				residHist := make([]float64, 0, qLag+nPeriods)
+				for s := w; s < nSim; s += nWorkers {
+					paths[s] = simulateOne(s, pcg, hist, residHist)
+				}
+			}()
+		}
+		wg.Wait()
 	}
 
 	// Per-step mean and quantiles. Reuse the col buffer in place: each
