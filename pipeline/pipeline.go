@@ -39,6 +39,13 @@ type Pipeline struct {
 	endogChain []EndogTransformer
 	exogChain  []ExogFeaturizer
 	fitted     bool
+
+	// Original-scale training data, kept so Update / Refit can rebuild the
+	// transformer-chain inputs for the combined (history + new) series.
+	// The model's own m.yTrain is on the post-transform scale, so we need
+	// our own copy in original units.
+	yTrain []float64
+	xTrain [][]float64
 }
 
 // NewPipeline constructs a pipeline from steps and a final estimator.
@@ -104,8 +111,122 @@ func (p *Pipeline) Fit(y []float64, x [][]float64) error {
 	}
 	p.endogChain = endogChain
 	p.exogChain = exogChain
+	// Save the ORIGINAL-scale training data (pre-transform) so Update /
+	// Refit can rebuild the transformer-chain inputs for the combined
+	// (history + new) series.
+	p.yTrain = append([]float64(nil), y...)
+	p.xTrain = cloneMatrix(x)
 	p.fitted = true
 	return nil
+}
+
+// Update appends new observations and warm-starts the underlying model's
+// MLE refresh. The transformer chain's fit-time state is preserved — only
+// the model's parameters move. Mirrors pmdarima.pipeline.Pipeline.update.
+//
+// `newY` is on the original (untransformed) input scale; `newX` is the
+// matching raw exog rows (or nil when the pipeline derives all exog from
+// featurizers). The pipeline:
+//
+//  1. Concatenates newY/newX with the original-scale training data.
+//  2. Applies each EndogTransformer.Transform (NOT Fit — the transformer
+//     keeps its calibrated state) to produce the model-scale combined series.
+//  3. Calls UpdateAndTransform on each ExogFeaturizer to extend its
+//     internal feature index to cover the combined range.
+//  4. Slices off the last len(newY) rows and passes them to m.Update for
+//     the warm-start MLE refresh.
+//
+// Errors at any stage roll back without mutating pipeline state.
+func (p *Pipeline) Update(newY []float64, newX [][]float64) error {
+	if !p.fitted {
+		return errors.New("pipeline not fitted")
+	}
+	yc, xc, err := p.transformCombined(newY, newX)
+	if err != nil {
+		return err
+	}
+	// Slice off the new tail to pass to m.Update — it appends to its own
+	// m.yTrain internally and runs a short BFGS warm-start.
+	tailY := yc[len(yc)-len(newY):]
+	var tailX [][]float64
+	if len(xc) > 0 {
+		tailX = xc[len(xc)-len(newY):]
+	}
+	if err := p.Model.Update(tailY, tailX); err != nil {
+		return fmt.Errorf("estimator update: %w", err)
+	}
+	// Commit: extend our original-scale training cache.
+	p.yTrain = append(p.yTrain, newY...)
+	p.xTrain = append(p.xTrain, cloneMatrix(newX)...)
+	return nil
+}
+
+// Refit appends new observations and runs a full cold-start fit on the
+// combined series — Hannan-Rissanen warmup, full BFGS, and Nelder-Mead
+// polish. Same transformer-chain semantics as Update; only the underlying
+// model's fit strategy differs.
+//
+// Like ARIMA.Refit, the pipeline's transformer steps and the underlying
+// ARIMA orders are preserved — to re-search ARIMA orders, run AutoArima
+// fresh on the combined data.
+func (p *Pipeline) Refit(newY []float64, newX [][]float64) error {
+	if !p.fitted {
+		return errors.New("pipeline not fitted")
+	}
+	yc, xc, err := p.transformCombined(newY, newX)
+	if err != nil {
+		return err
+	}
+	tailY := yc[len(yc)-len(newY):]
+	var tailX [][]float64
+	if len(xc) > 0 {
+		tailX = xc[len(xc)-len(newY):]
+	}
+	if err := p.Model.Refit(tailY, tailX); err != nil {
+		return fmt.Errorf("estimator refit: %w", err)
+	}
+	p.yTrain = append(p.yTrain, newY...)
+	p.xTrain = append(p.xTrain, cloneMatrix(newX)...)
+	return nil
+}
+
+// transformCombined builds the (history + new) combined series, runs it
+// through every endog transformer (Transform-only, no re-fit), and through
+// every exog featurizer's UpdateAndTransform. Returns the post-chain y/x
+// covering the FULL combined range.
+func (p *Pipeline) transformCombined(newY []float64, newX [][]float64) ([]float64, [][]float64, error) {
+	if len(newY) == 0 {
+		return nil, nil, errors.New("newY must be non-empty")
+	}
+	if newX != nil && len(newX) != len(newY) {
+		return nil, nil, fmt.Errorf("newX rows (%d) must match newY length (%d)", len(newX), len(newY))
+	}
+	yc := make([]float64, 0, len(p.yTrain)+len(newY))
+	yc = append(yc, p.yTrain...)
+	yc = append(yc, newY...)
+	xc := cloneMatrix(p.xTrain)
+	if newX != nil {
+		xc = append(xc, cloneMatrix(newX)...)
+	}
+	// Apply each EndogTransformer (no re-fit — keep calibrated state).
+	for _, t := range p.endogChain {
+		yt, err := t.Transform(yc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("update transform: %w", err)
+		}
+		yc = yt
+	}
+	// Apply each ExogFeaturizer's UpdateAndTransform — they internally
+	// extend their feature index (e.g. dates) to cover the combined range
+	// and return features for the FULL post-update period.
+	for _, f := range p.exogChain {
+		xt, err := f.UpdateAndTransform(yc, xc)
+		if err != nil {
+			return nil, nil, fmt.Errorf("update featurizer: %w", err)
+		}
+		xc = xt
+	}
+	return yc, xc, nil
 }
 
 // Predict produces a forecast on the original (untransformed) scale.
