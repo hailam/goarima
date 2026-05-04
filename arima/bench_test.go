@@ -60,6 +60,29 @@ func BenchmarkAutoArima_AirPassengers(b *testing.B) {
 	}
 }
 
+// L-2 verification: stepwise AutoArima with NJobs=1 forces every
+// neighbor candidate fit to run sequentially, holding the cache mutex
+// uncontended. Compared to BenchmarkAutoArima_AirPassengers (which uses
+// the parallel default), the speedup tells us how much wall-clock the
+// parallel path actually saves — and therefore how much room there is
+// for cache-mutex contention to matter in the first place. If the lock
+// were a bottleneck, parallel speedup would be far below the per-iter
+// neighbor count (4-8). If it isn't, speedup approaches min(K, GOMAXPROCS).
+func BenchmarkAutoArima_AirPassengers_Sequential(b *testing.B) {
+	ap := datasets.LoadAirPassengers()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := AutoArima(ap, nil, AutoArimaOpts{
+			M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 1, MaxCapQ: 1,
+			MaxOrder: 5, MaxD: 2, IC: AICc, MaxIter: 50,
+			NJobs: 1, // force sequential — no goroutine dispatch, mutex uncontended
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkAutoArimaFull_Wineind measures full-search auto-selection.
 func BenchmarkAutoArimaFull_Wineind(b *testing.B) {
 	wi := datasets.LoadWineind()
