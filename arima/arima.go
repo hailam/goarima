@@ -712,23 +712,10 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 			}
 			return
 		}
-		// Cap workers at the number of jobs — extra workers would spin for
-		// no benefit.
 		nw := nWorkers
 		if nw > n {
 			nw = n
 		}
-		// Static striding: worker w handles indices w, w+nw, w+2*nw, …
-		// Two wins over the previous jobs-channel pattern: (1) no channel
-		// send/receive overhead per gradient component, which fires on every
-		// BFGS gradient evaluation; (2) the access pattern (each worker
-		// touches grad[w], grad[w+nw], …) keeps cache lines hot per worker.
-		// Per-component objective cost is symmetric for numerical
-		// gradients (each runs 2 f() calls), so static partitioning is
-		// balanced.
-		//
-		// Per-worker xLocal: `nw * n` floats sliced into views — same
-		// single-alloc strategy as before, just without the channel.
 		var wg sync.WaitGroup
 		buf := make([]float64, nw*n)
 		for w := 0; w < nw; w++ {
@@ -743,7 +730,7 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 					fp := f(xLocal)
 					xLocal[i] -= 2 * eps
 					fm := f(xLocal)
-					xLocal[i] += eps // restore for next iter (cheap)
+					xLocal[i] += eps
 					grad[i] = (fp - fm) / (2 * eps)
 				}
 			}()
