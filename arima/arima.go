@@ -1098,10 +1098,17 @@ func (m *ARIMA) Refit(newY []float64, newX [][]float64) error {
 // is reconstructed automatically because it's a deterministic time index.
 //
 // Returns the (possibly augmented) futureExog. No-op when DriftIncluded
-// is false.
-func (m *ARIMA) extendDriftIfNeeded(futureExog [][]float64, nPeriods int) [][]float64 {
+// is false. Returns a clean error when the user's futureExog row count
+// doesn't match nPeriods, instead of letting the caller-side check fire
+// later — pre-fix the loop below indexed `futureExog[i]` for i < nPeriods
+// without a length guard, producing an opaque slice-out-of-range panic.
+func (m *ARIMA) extendDriftIfNeeded(futureExog [][]float64, nPeriods int) ([][]float64, error) {
 	if !m.DriftIncluded || nPeriods <= 0 {
-		return futureExog
+		return futureExog, nil
+	}
+	if futureExog != nil && len(futureExog) != nPeriods {
+		return nil, fmt.Errorf("future exog rows (%d) must match nPeriods (%d)",
+			len(futureExog), nPeriods)
 	}
 	n0 := len(m.yTrain)
 	if futureExog == nil {
@@ -1110,7 +1117,7 @@ func (m *ARIMA) extendDriftIfNeeded(futureExog [][]float64, nPeriods int) [][]fl
 		for i := 0; i < nPeriods; i++ {
 			out[i] = []float64{float64(n0 + i + 1)}
 		}
-		return out
+		return out, nil
 	}
 	// User supplied the OTHER exog columns; prepend drift.
 	out := make([][]float64, nPeriods)
@@ -1120,7 +1127,7 @@ func (m *ARIMA) extendDriftIfNeeded(futureExog [][]float64, nPeriods int) [][]fl
 		copy(row[1:], futureExog[i])
 		out[i] = row
 	}
-	return out
+	return out, nil
 }
 
 // Predict produces nPeriods forward forecasts. If alpha > 0, lower/upper
@@ -1138,7 +1145,11 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 	// If the model includes a drift column, transparently prepend it to
 	// futureExog. Done before validation so the user-facing futureExog
 	// shape is "the OTHER exog cols only" (or nil when drift is the only one).
-	futureExog = m.extendDriftIfNeeded(futureExog, nPeriods)
+	var driftErr error
+	futureExog, driftErr = m.extendDriftIfNeeded(futureExog, nPeriods)
+	if driftErr != nil {
+		return nil, nil, nil, driftErr
+	}
 	if m.nExog > 0 {
 		if futureExog == nil {
 			return nil, nil, nil, errors.New("future exog required for forecasting")

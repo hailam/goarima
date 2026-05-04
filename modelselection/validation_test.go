@@ -90,3 +90,31 @@ func TestCrossValPredict(t *testing.T) {
 		}
 	}
 }
+
+// CD-N4: CrossValPredict must guard against nil ModelFactory and
+// length-mismatched exog (matching CrossValScoreConcurrent).
+func TestCrossValPredictGuards(t *testing.T) {
+	y := make([]float64, 50)
+	for i := range y {
+		y[i] = float64(i)
+	}
+	cv, _ := NewRollingForecastCV(1, 1, 30)
+	mk := func() *arima.ARIMA { return arima.NewARIMA(arima.Order{P: 0, D: 1, Q: 0}) }
+
+	// nil cv → error
+	if _, err := CrossValPredict(y, nil, nil, mk); err == nil {
+		t.Error("expected error for nil cv")
+	}
+	// nil mk → error
+	if _, err := CrossValPredict(y, nil, cv, nil); err == nil {
+		t.Error("expected error for nil ModelFactory")
+	}
+	// short exog → error (was: panic in pickRows)
+	short := make([][]float64, 10)
+	for i := range short {
+		short[i] = []float64{1}
+	}
+	if _, err := CrossValPredict(y, short, cv, mk); err == nil {
+		t.Error("expected error for length-mismatched exog")
+	}
+}

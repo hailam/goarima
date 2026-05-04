@@ -243,6 +243,12 @@ func CrossValPredict(y []float64, exog [][]float64, cv CrossValidator, mk ModelF
 	if cv == nil {
 		return nil, errors.New("cv must be non-nil")
 	}
+	if mk == nil {
+		return nil, errors.New("model factory must be non-nil")
+	}
+	if exog != nil && len(exog) != len(y) {
+		return nil, fmt.Errorf("exog rows (%d) != len(y) (%d)", len(exog), len(y))
+	}
 	splits, err := cv.Split(len(y))
 	if err != nil {
 		return nil, err

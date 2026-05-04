@@ -148,6 +148,26 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		return nil, fmt.Errorf("invalid error_action %q", opts.ErrorAction)
 	}
 
+	// Validate exog up front: row count must match y, and rows must be
+	// non-ragged (mirrors Fit's checks). Pre-fix this only happened inside
+	// the per-candidate Fit call, which meant the holdout slice below
+	// (`exog[:split]`) panicked with an opaque slice-out-of-range when
+	// exog was shorter than y.
+	if exog != nil {
+		if len(exog) != len(y) {
+			return nil, fmt.Errorf("exog rows (%d) must match len(y) (%d)", len(exog), len(y))
+		}
+		if len(exog[0]) == 0 {
+			return nil, errors.New("exog has zero columns; pass nil for no regressors")
+		}
+		k0 := len(exog[0])
+		for i, row := range exog {
+			if len(row) != k0 {
+				return nil, fmt.Errorf("exog row %d has %d cols, want %d (ragged exog)", i, len(row), k0)
+			}
+		}
+	}
+
 	// Optional out-of-sample holdout.
 	yFit := y
 	var yHoldout []float64

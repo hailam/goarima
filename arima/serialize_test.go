@@ -389,6 +389,76 @@ func TestFit_RejectsMalformedInput(t *testing.T) {
 	}
 }
 
+// CD-N1: drift model + wrong-row-count futureExog must error cleanly,
+// not panic. Pre-fix the extendDriftIfNeeded loop indexed futureExog[i]
+// up to nPeriods-1 with no length guard.
+func TestPredict_DriftWrongFutureExogLengthErrors(t *testing.T) {
+	m, err := RArima(datasets.LoadAirPassengers(), RArimaOpts{
+		Order:        Order{P: 0, D: 1, Q: 0},
+		IncludeDrift: true,
+		MaxIter:      100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// User passes only 5 rows but asks for 12 forecasts. With drift
+	// auto-extension, this previously panicked with "index out of range".
+	bad := make([][]float64, 5)
+	for i := range bad {
+		bad[i] = []float64{0}
+	}
+	if _, _, _, err := m.Predict(12, 0.05, bad); err == nil {
+		t.Error("Predict should return error when drift+wrong-length futureExog")
+	}
+	if _, err := m.PredictBoot(12, 0.05, 100, 1, bad); err == nil {
+		t.Error("PredictBoot should return error when drift+wrong-length futureExog")
+	}
+	if _, err := m.Simulate(12, SimulateOpts{Seed: 1, FutureExog: bad}); err == nil {
+		t.Error("Simulate should return error when drift+wrong-length futureExog")
+	}
+}
+
+// CD-N2: AutoArima with OutOfSampleSize > 0 and short exog must error
+// cleanly, not panic on the holdout slice.
+func TestAutoArima_ShortExogErrorsCleanly(t *testing.T) {
+	y := simulateAR1(100, 0.5, 1.0, 1)
+	shortExog := make([][]float64, 50) // half of len(y)
+	for i := range shortExog {
+		shortExog[i] = []float64{1}
+	}
+	_, err := AutoArima(y, shortExog, AutoArimaOpts{
+		MaxP: 1, MaxQ: 1, MaxOrder: 2, IC: AICc,
+		OutOfSampleSize: 10,
+	})
+	if err == nil {
+		t.Error("AutoArima should return error for short exog")
+	}
+	if !strings.Contains(err.Error(), "exog rows") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+// CD-N3: RArima IncludeDrift with short Xreg must error cleanly, not
+// panic in the drift-prepend loop.
+func TestRArima_ShortXregWithDriftErrorsCleanly(t *testing.T) {
+	y := datasets.LoadAirPassengers()
+	short := make([][]float64, 10) // way less than len(y)
+	for i := range short {
+		short[i] = []float64{1}
+	}
+	_, err := RArima(y, RArimaOpts{
+		Order:        Order{P: 0, D: 1, Q: 0},
+		IncludeDrift: true,
+		Xreg:         short,
+	})
+	if err == nil {
+		t.Error("RArima should return error for short Xreg with IncludeDrift")
+	}
+	if !strings.Contains(err.Error(), "xreg rows") {
+		t.Errorf("unexpected error: %v", err)
+	}
+}
+
 // C3: every futureExog row must have the right width.
 func TestPredict_RejectsRaggedFutureExog(t *testing.T) {
 	rng := rand.New(rand.NewPCG(99, 100))

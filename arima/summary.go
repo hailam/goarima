@@ -90,7 +90,25 @@ func (m *ARIMA) Summary() (*FitSummary, error) {
 		}, nil
 	}
 
-	// Direct negLL of (phi, theta, Phi, Theta, c, beta) on the differenced data.
+	// Pre-compute un-differenced y on the model scale (Box-Cox-applied if
+	// applicable). Used by the NonSimpleDifferencing branch of negLL since
+	// kalmanARIMAFullConv handles its own differencing internally.
+	yUndiff := m.yMSCache
+	if yUndiff == nil {
+		yUndiff = m.yTrain
+	}
+
+	// Direct negLL of (phi, theta, Phi, Theta, c, beta). Dispatches to the
+	// SAME likelihood family that Fit used for this model — pre-fix this
+	// always called kalmanARMALikelihood, which produced wrong standard
+	// errors for NonSimpleDifferencing and MethodCSS fits (the Hessian
+	// reflected a different objective than the one that produced the params).
+	mPer := 0
+	Dord := 0
+	if m.Seasonal.Active() {
+		mPer = m.Seasonal.M
+		Dord = m.Seasonal.D
+	}
 	negLL := func(theta []float64) float64 {
 		idx := 0
 		var phi []float64
@@ -124,17 +142,53 @@ func (m *ARIMA) Summary() (*FitSummary, error) {
 		}
 		fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
 		fullTheta := expandSMA(maC, sTheta, m.Seasonal.M)
-		r := make([]float64, len(ws))
-		for i, v := range ws {
-			rr := v - c
-			if k > 0 {
-				for j := 0; j < k; j++ {
-					rr -= beta[j] * wX[i][j]
+
+		var ll float64
+		switch {
+		case m.NonSimpleDifferencing:
+			// Use the integrated state-space form with the model's
+			// configured DiffuseConvention. Residual is the un-differenced y
+			// minus the regression part (the integrated Kalman handles the
+			// differencing internally).
+			rUndiff := make([]float64, len(yUndiff))
+			for i, v := range yUndiff {
+				rr := v - c
+				if k > 0 {
+					for j := 0; j < k; j++ {
+						rr -= beta[j] * m.xTrain[i][j]
+					}
 				}
+				rUndiff[i] = rr
 			}
-			r[i] = rr
+			ll, _, _ = kalmanARIMAFullConv(rUndiff, m.Order.D, mPer, Dord,
+				phi, maC, sPhi, sTheta, 1e6, m.DiffuseConvention)
+		case m.Method == MethodCSS:
+			// CSS profile likelihood on the differenced+centered series.
+			r := make([]float64, len(ws))
+			for i, v := range ws {
+				rr := v - c
+				if k > 0 {
+					for j := 0; j < k; j++ {
+						rr -= beta[j] * wX[i][j]
+					}
+				}
+				r[i] = rr
+			}
+			ll, _, _ = armaCSS(r, fullPhi, fullTheta)
+		default:
+			// Simple-differencing Kalman on the differenced+centered series.
+			r := make([]float64, len(ws))
+			for i, v := range ws {
+				rr := v - c
+				if k > 0 {
+					for j := 0; j < k; j++ {
+						rr -= beta[j] * wX[i][j]
+					}
+				}
+				r[i] = rr
+			}
+			ll, _, _ = kalmanARMALikelihood(r, fullPhi, fullTheta)
 		}
-		ll, _, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
 		if math.IsNaN(ll) || math.IsInf(ll, 0) {
 			return 1e15
 		}

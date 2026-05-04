@@ -59,9 +59,14 @@ func RArima(y []float64, opts RArimaOpts) (*ARIMA, error) {
 		return nil, errors.New("include.drift cannot be used when total differencing > 1 (matches R warning)")
 	}
 
-	// Build xreg: drift prefix + user xreg.
+	// Build xreg: drift prefix + user xreg. Validate Xreg row count BEFORE
+	// the prepend loop so a length mismatch produces a clean error instead
+	// of an opaque index-out-of-range panic at line `xreg[i]`.
 	xreg := opts.Xreg
 	if opts.IncludeDrift {
+		if xreg != nil && len(xreg) != len(y) {
+			return nil, fmt.Errorf("xreg rows (%d) must match len(y) (%d)", len(xreg), len(y))
+		}
 		drift := make([][]float64, len(y))
 		for i := range drift {
 			drift[i] = []float64{float64(i + 1)}

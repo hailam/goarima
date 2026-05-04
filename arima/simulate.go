@@ -61,7 +61,11 @@ func (m *ARIMA) Simulate(n int, opts SimulateOpts) ([]float64, error) {
 	seed := opts.Seed
 	futureExog := opts.FutureExog
 	// Drift auto-extension — same as Predict/PredictBoot.
-	futureExog = m.extendDriftIfNeeded(futureExog, n)
+	var driftErr error
+	futureExog, driftErr = m.extendDriftIfNeeded(futureExog, n)
+	if driftErr != nil {
+		return nil, driftErr
+	}
 	if m.nExog > 0 {
 		if futureExog == nil {
 			return nil, errors.New("arima: futureExog required (model was fit with exog)")
