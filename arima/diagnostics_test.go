@@ -2,6 +2,7 @@ package arima
 
 import (
 	"math"
+	"math/rand/v2"
 	"testing"
 
 	"github.com/hailam/goarima/datasets"
@@ -184,6 +185,149 @@ func TestLjungBox_StatsmodelsParity(t *testing.T) {
 	}
 	if math.Abs(p-wantP)/wantP > 1e-3 {
 		t.Errorf("LjungBox p = %g, want %g (statsmodels)", p, wantP)
+	}
+}
+
+// JarqueBera parity vs statsmodels. Verified via:
+//
+//	from statsmodels.stats.stattools import jarque_bera
+//	y = np.array([1,2,3,4,5,4,3,2,1,2,3,4,5,4,3,2,1,2,3,4], dtype=float)
+//	jarque_bera(y)
+//	# stat=0.843556 p=0.655880 skew=0.026391 kurt=1.995270
+func TestJarqueBera_StatsmodelsParity(t *testing.T) {
+	y := []float64{
+		1, 2, 3, 4, 5, 4, 3, 2, 1, 2,
+		3, 4, 5, 4, 3, 2, 1, 2, 3, 4,
+	}
+	jb, p, skew, kurt, err := JarqueBera(y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantJB = 0.843556
+	const wantP = 0.655880
+	const wantSkew = 0.026391
+	const wantKurt = 1.995270
+	if math.Abs(jb-wantJB) > 1e-4 {
+		t.Errorf("JB = %g, want %g", jb, wantJB)
+	}
+	if math.Abs(p-wantP) > 1e-4 {
+		t.Errorf("p = %g, want %g", p, wantP)
+	}
+	if math.Abs(skew-wantSkew) > 1e-4 {
+		t.Errorf("skew = %g, want %g", skew, wantSkew)
+	}
+	if math.Abs(kurt-wantKurt) > 1e-4 {
+		t.Errorf("kurtosis = %g, want %g", kurt, wantKurt)
+	}
+}
+
+// JB on near-normal noise should NOT reject H0.
+func TestJarqueBera_WhiteNoise(t *testing.T) {
+	y := simulateAR1(500, 0.0, 1.0, 42)
+	jb, p, _, _, err := JarqueBera(y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if math.IsNaN(jb) || math.IsInf(jb, 0) {
+		t.Errorf("JB = %g", jb)
+	}
+	if p < 0.01 {
+		t.Errorf("JB on white noise: p = %g, want > 0.01", p)
+	}
+}
+
+// JB should reject for skewed input.
+func TestJarqueBera_SkewedRejects(t *testing.T) {
+	// Exponential-ish: lots of small positives, few large.
+	rng := simulateAR1(0, 0, 0, 0) // unused; just need a deterministic seed below
+	_ = rng
+	n := 500
+	y := make([]float64, n)
+	// Use a simple pseudo-random seed via simulateAR1's RNG pattern.
+	for i := 0; i < n; i++ {
+		// y_i = (i mod 17) - distribution is roughly uniform with strong
+		// truncation at 0 and 16; far from normal.
+		y[i] = float64((i*31 + 7) % 17)
+	}
+	_, p, _, _, err := JarqueBera(y)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p > 0.05 {
+		t.Errorf("JB on non-normal series: p = %g, want < 0.05", p)
+	}
+}
+
+// ArchLM parity vs statsmodels.het_arch on a Go-generated ARCH-effect series.
+// Series produced by the same PCG(7,8) seed used to generate /tmp/arch_series.txt
+// during diagnostics development. statsmodels reports lm=11.1981923, p=0.0475890.
+func TestArchLM_StatsmodelsParity(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 8))
+	n := 200
+	e := make([]float64, n)
+	sigma := 1.0
+	for t := 1; t < n; t++ {
+		sigma = math.Sqrt(0.1 + 0.7*e[t-1]*e[t-1])
+		e[t] = sigma * rng.NormFloat64()
+	}
+	lm, p, err := ArchLM(e, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const wantLM = 11.1981923131
+	const wantP = 0.0475889738
+	if math.Abs(lm-wantLM) > 1e-6 {
+		t.Errorf("ArchLM lm = %g, want %g (statsmodels)", lm, wantLM)
+	}
+	if math.Abs(p-wantP)/wantP > 1e-3 {
+		t.Errorf("ArchLM p = %g, want %g (statsmodels)", p, wantP)
+	}
+}
+
+// ArchLM on white noise should NOT reject (no ARCH effects).
+func TestArchLM_WhiteNoise(t *testing.T) {
+	y := simulateAR1(500, 0.0, 1.0, 42)
+	_, p, err := ArchLM(y, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p < 0.01 {
+		t.Errorf("ArchLM on white noise: p = %g, want > 0.01", p)
+	}
+}
+
+// ArchLM convenience method on a fitted model.
+func TestARIMA_ArchLM_ConvenienceMethod(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m := NewARIMA(Order{P: 0, D: 1, Q: 1})
+	m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+	m.MaxIter = 100
+	if err := m.Fit(logAp, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := m.ArchLM(12); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, _, _, err := m.JarqueBera(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// JB and ArchLM error paths.
+func TestJarqueBeraArchLM_ArgValidation(t *testing.T) {
+	short := []float64{1, 2, 3}
+	if _, _, _, _, err := JarqueBera(short); err == nil {
+		t.Error("expected error for n<4")
+	}
+	if _, _, err := ArchLM([]float64{1, 2, 3}, 1); err == nil {
+		t.Error("expected error for n<2q+2")
+	}
+	if _, _, err := ArchLM([]float64{1, 2, 3, 4, 5}, 0); err == nil {
+		t.Error("expected error for q=0")
 	}
 }
 
