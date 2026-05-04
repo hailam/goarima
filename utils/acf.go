@@ -74,7 +74,12 @@ func PACF(y []float64, nLags int) ([]float64, error) {
 		for j := 1; j < k; j++ {
 			s += phi[k-1][j] * r[k-j]
 		}
-		if math.Abs(v[k-1]) < 1e-30 {
+		// Zero-variance guard: if the partial-autocorrelation residual variance
+		// has collapsed to ~machine epsilon, the next coefficient is undefined
+		// (the Levinson-Durbin recursion divides by it). The threshold is set
+		// well above f64 denormal range so we abort cleanly on near-singular
+		// covariance instead of producing huge spurious pacf values.
+		if math.Abs(v[k-1]) < 1e-12 {
 			pacf[k] = 0
 			break
 		}

@@ -317,6 +317,49 @@ func TestARIMA_ArchLM_ConvenienceMethod(t *testing.T) {
 	}
 }
 
+// G-F3: m.StdErrors() returns the standard-error column of Summary aligned
+// with Params(). Convenience accessor for code that only needs the numbers.
+func TestARIMA_StdErrors(t *testing.T) {
+	y := simulateAR1(300, 0.6, 1.0, 5)
+	m := NewARIMA(Order{P: 1, D: 0, Q: 1})
+	m.WithIntercept = true
+	if err := m.Fit(y, nil); err != nil {
+		t.Fatal(err)
+	}
+	se, err := m.StdErrors()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pp := m.Params()
+	if len(se) != len(pp) {
+		t.Fatalf("len(StdErrors)=%d, want %d (= len(Params))", len(se), len(pp))
+	}
+	// All stderrs should be finite and positive on this well-conditioned fit.
+	for i, v := range se {
+		if math.IsNaN(v) || math.IsInf(v, 0) || v <= 0 {
+			t.Errorf("se[%d] = %g, want finite positive", i, v)
+		}
+	}
+	// Sanity: must agree with Summary().Coefs[i].StdErr.
+	s, err := m.Summary()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := range se {
+		if se[i] != s.Coefs[i].StdErr {
+			t.Errorf("se[%d]=%g != Summary.Coefs[%d].StdErr=%g", i, se[i], i, s.Coefs[i].StdErr)
+		}
+	}
+}
+
+// G-F3 error path.
+func TestARIMA_StdErrors_Unfitted(t *testing.T) {
+	m := NewARIMA(Order{P: 1, D: 0, Q: 0})
+	if _, err := m.StdErrors(); err == nil {
+		t.Error("StdErrors should error on unfitted model")
+	}
+}
+
 // JB and ArchLM error paths.
 func TestJarqueBeraArchLM_ArgValidation(t *testing.T) {
 	short := []float64{1, 2, 3}

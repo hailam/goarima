@@ -32,6 +32,26 @@ type FitSummary struct {
 	Coefs    []CoefSummary
 }
 
+// StdErrors returns the standard errors of the fitted parameters, aligned
+// with the order returned by Params(). Convenience wrapper that pulls the
+// stderr column out of Summary() — useful when callers only need the
+// numbers, not the full coefficient table.
+//
+// Returns nil and an error if the model is not yet fitted, or if the
+// Hessian cannot be inverted (in which case Summary itself fills in NaN
+// stderrs and this method propagates them).
+func (m *ARIMA) StdErrors() ([]float64, error) {
+	s, err := m.Summary()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float64, len(s.Coefs))
+	for i, c := range s.Coefs {
+		out[i] = c.StdErr
+	}
+	return out, nil
+}
+
 // Summary computes coefficient standard errors via numerical Hessian of the
 // negative log-likelihood at the fitted parameter vector.
 //
@@ -283,16 +303,24 @@ func (s *FitSummary) String() string {
 }
 
 // numericalHessian computes a central-difference Hessian of f at x.
+//
+// Reuses four perturbation buffers across all (i,j) pairs to avoid the
+// 2k(k+1) allocations that the per-pair `append([]float64{}, x0...)`
+// pattern produced. Each buffer is reset to x0 before we perturb.
 func numericalHessian(f func([]float64) float64, x []float64, eps float64) *mat.Dense {
 	n := len(x)
 	h := mat.NewDense(n, n, nil)
 	x0 := append([]float64{}, x...)
+	xpp := make([]float64, n)
+	xpm := make([]float64, n)
+	xmp := make([]float64, n)
+	xmm := make([]float64, n)
 	for i := 0; i < n; i++ {
 		for j := i; j < n; j++ {
-			xpp := append([]float64{}, x0...)
-			xpm := append([]float64{}, x0...)
-			xmp := append([]float64{}, x0...)
-			xmm := append([]float64{}, x0...)
+			copy(xpp, x0)
+			copy(xpm, x0)
+			copy(xmp, x0)
+			copy(xmm, x0)
 			xpp[i] += eps
 			xpp[j] += eps
 			xpm[i] += eps

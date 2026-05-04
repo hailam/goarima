@@ -673,11 +673,18 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 		}
 		jobs := make(chan int, n)
 		var wg sync.WaitGroup
+		// Single allocation for all worker buffers — `nw * n` floats sliced
+		// into per-worker xLocal views. Pre-fix each worker called `make`
+		// independently, so a BFGS iteration with nw goroutines made nw
+		// fresh n-element slices. Modest savings; matters across many
+		// objective evaluations during the line search.
+		buf := make([]float64, nw*n)
 		for w := 0; w < nw; w++ {
+			w := w
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				xLocal := make([]float64, n)
+				xLocal := buf[w*n : (w+1)*n]
 				for i := range jobs {
 					copy(xLocal, x)
 					xLocal[i] += eps
