@@ -100,7 +100,7 @@ func (m *ARIMA) toSnapshot() (*arimaSnapshot, error) {
 	if !ok {
 		return nil, fmt.Errorf("arima: unknown DiffuseConvention %d", m.DiffuseConvention)
 	}
-	return &arimaSnapshot{
+	snap := &arimaSnapshot{
 		Version:               SerializationVersion,
 		Order:                 m.Order,
 		Seasonal:              m.Seasonal,
@@ -123,12 +123,17 @@ func (m *ARIMA) toSnapshot() (*arimaSnapshot, error) {
 		LogL:                  m.logL,
 		Nobs:                  m.nobs,
 		NExog:                 m.nExog,
-		PsiInfN:               m.psiInfN,
 		Resids:                m.resids,
 		YTrain:                m.yTrain,
 		XTrain:                m.xTrain,
-		PsiInf:                m.psiInf,
-	}, nil
+	}
+	// Read the psi cache atomically; serialize the snapshot so a saved
+	// model can be loaded with the same forecast-variance behavior.
+	if cur := m.psi.Load(); cur != nil {
+		snap.PsiInfN = len(cur.values)
+		snap.PsiInf = cur.values
+	}
+	return snap, nil
 }
 
 // MarshalJSON implements encoding/json.Marshaler. Saving an unfitted model
@@ -244,11 +249,14 @@ func (m *ARIMA) fromSnapshot(snap *arimaSnapshot) error {
 	m.logL = snap.LogL
 	m.nobs = snap.Nobs
 	m.nExog = snap.NExog
-	m.psiInfN = snap.PsiInfN
 	m.resids = snap.Resids
 	m.yTrain = snap.YTrain
 	m.xTrain = snap.XTrain
-	m.psiInf = snap.PsiInf
+	// Restore the psi cache snapshot via atomic publish — keeps the
+	// concurrent-Predict-safe contract on a freshly loaded model.
+	if len(snap.PsiInf) > 0 {
+		m.psi.Store(&psiCache{values: snap.PsiInf})
+	}
 	m.fitted = true
 
 	// Regenerate Predict caches from yTrain. yMSCache is yTrain after Box-Cox;

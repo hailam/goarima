@@ -2,6 +2,7 @@ package arima
 
 import (
 	"math"
+	"sync"
 	"testing"
 )
 
@@ -111,9 +112,10 @@ func TestForecastSE_AirlineStyleIntegration(t *testing.T) {
 		2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, // h=12..23
 		3, 3, 3, 3, // h=24..27
 	}
+	psi := m.ensurePsiAtLeast(len(wantPsi))
 	for i, w := range wantPsi {
-		if m.psiInf[i] != w {
-			t.Errorf("psi[%d] = %g, want %g", i, m.psiInf[i], w)
+		if psi[i] != w {
+			t.Errorf("psi[%d] = %g, want %g", i, psi[i], w)
 		}
 	}
 }
@@ -150,9 +152,68 @@ func TestForecastSE_LongHorizon_NoTruncation(t *testing.T) {
 		}
 	}
 	// Sanity: cached psi was extended to cover the new horizon.
-	if len(m.psiInf) < horizon {
-		t.Errorf("psiInf len = %d, want ≥ %d", len(m.psiInf), horizon)
+	if cur := m.psi.Load(); cur == nil || len(cur.values) < horizon {
+		got := 0
+		if cur != nil {
+			got = len(cur.values)
+		}
+		t.Errorf("psi cache len = %d, want ≥ %d", got, horizon)
 	}
+}
+
+// L-1: concurrent Predict calls on the same fitted model with mixed
+// horizons (including some that exceed the initial 100-entry psi cache)
+// must not race. Pre-fix `Predict` mutated `m.psiInf` / `m.psiInfN` in
+// place; the race detector flagged this under -race.
+//
+// Run this test with `go test -race ./arima/...` to confirm.
+func TestPredict_ConcurrentMixedHorizons(t *testing.T) {
+	m := NewARIMA(Order{P: 0, D: 1, Q: 0})
+	m.sigma2 = 4.0
+	m.fitted = true
+	m.yTrain = []float64{0, 1, 0, 1, 2, 3, 4, 5}
+	m.yMSCache = append([]float64(nil), m.yTrain...)
+	m.wsCenteredCache = []float64{1, -1, 1, 1, 1, 1, 1}
+	m.resids = []float64{1, -1, 1, 1, 1, 1, 1}
+	m.nobs = 7
+	m.computePsi() // initial 100-entry cache
+
+	// Hammer the model concurrently with mixed horizons (some short,
+	// some past 100 to force CAS extension).
+	const nGoroutines = 16
+	const callsPerGoroutine = 32
+	horizons := []int{12, 24, 50, 100, 150, 200, 75, 30}
+	var wg sync.WaitGroup
+	for g := 0; g < nGoroutines; g++ {
+		g := g
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for c := 0; c < callsPerGoroutine; c++ {
+				h := horizons[(g*callsPerGoroutine+c)%len(horizons)]
+				_, lo, hi, err := m.Predict(h, 0.05, nil)
+				if err != nil {
+					t.Errorf("goroutine %d call %d: %v", g, c, err)
+					return
+				}
+				if len(lo) != h || len(hi) != h {
+					t.Errorf("goroutine %d call %d: len(lo)=%d len(hi)=%d, want %d",
+						g, c, len(lo), len(hi), h)
+					return
+				}
+				// Sanity: at horizon h the SE should match σ√h for ARIMA(0,1,0).
+				z := normPPF(0.975)
+				wantSE := math.Sqrt(m.sigma2 * float64(h))
+				gotSE := (hi[h-1] - lo[h-1]) / (2 * z)
+				if math.Abs(gotSE-wantSE)/wantSE > 1e-9 {
+					t.Errorf("goroutine %d call %d horizon=%d: SE got %g want %g",
+						g, c, h, gotSE, wantSE)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
 }
 
 // Stationary AR(1): no integration, so psi recursion alone is correct.
@@ -170,11 +231,12 @@ func TestForecastSE_AR1_Unchanged(t *testing.T) {
 	m.computePsi()
 
 	// AR(1) psi: psi[h] = 0.5^h.
+	psi := m.ensurePsiAtLeast(10)
 	for h := 0; h < 10; h++ {
 		want := math.Pow(0.5, float64(h))
-		if math.Abs(m.psiInf[h]-want) > 1e-12 {
+		if math.Abs(psi[h]-want) > 1e-12 {
 			t.Errorf("psi[%d] = %g, want %g (AR(1) should be unaffected by fix)",
-				h, m.psiInf[h], want)
+				h, psi[h], want)
 		}
 	}
 }

@@ -6,9 +6,20 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 
 	"gonum.org/v1/gonum/optimize"
 )
+
+// psiCache is an immutable snapshot of the truncated MA(∞) coefficients used
+// for forecast-variance computation. Published atomically via
+// `*ARIMA`.psi; readers load a pointer and treat the slice as read-only.
+// Cache extension allocates a NEW psiCache and CAS-installs it, so any
+// concurrent reader holding an older snapshot continues to see consistent
+// data through the end of its read.
+type psiCache struct {
+	values []float64
+}
 
 // InfoCriterion enumerates supported information criteria.
 type InfoCriterion int
@@ -127,8 +138,16 @@ type ARIMA struct {
 	xTrain  [][]float64 // original X, for forecasts (nil if not used)
 	nExog   int
 	fitted  bool
-	psiInf  []float64 // truncated MA(infinity) for forecast variance
-	psiInfN int
+
+	// psi holds the truncated MA(infinity) coefficient cache used for
+	// forecast-variance computation in Predict. Stored via atomic.Pointer
+	// so that concurrent Predict calls on the same fitted model are safe:
+	// the fast path is a single atomic load + slice reads, and the cache
+	// only ever grows (CAS publishes a new larger snapshot on extension).
+	// Pre-fix this was a plain []float64 + int pair mutated in place from
+	// inside Predict, which raced under concurrent forecasts with mixed
+	// horizons. Cache snapshots are immutable once published.
+	psi atomic.Pointer[psiCache]
 
 	// Predict caches (set at end of Fit, reused on every Predict call).
 	yMSCache       []float64 // yTrain on the model scale (Box-Cox-applied if used)
@@ -1284,23 +1303,22 @@ func (m *ARIMA) Predict(nPeriods int, alpha float64, futureExog [][]float64) (fo
 		out = full[len(head):]
 	}
 
-	// Confidence intervals using truncated MA(infinity) coefficients. If
-	// the cached psi is shorter than the horizon, extend it — pre-fix the
-	// hard-coded 100-entry truncation silently flattened CIs past horizon
-	// 100 (psi[h] for h ≥ 100 was absent, so var2 stopped accumulating
-	// even though every additional psi² term should add to the variance).
+	// Confidence intervals using truncated MA(infinity) coefficients. The
+	// psi cache is published via atomic.Pointer so concurrent Predict
+	// calls on the same fitted model are safe — every reader gets a
+	// stable immutable snapshot, and cache extension (when nPeriods
+	// exceeds the cached length) installs a new larger snapshot via CAS
+	// without invalidating any concurrent reader's view.
 	if alpha > 0 && alpha < 1 {
-		if len(m.psiInf) < nPeriods {
-			m.computePsiUpTo(nPeriods)
-		}
-		if len(m.psiInf) > 0 {
+		psi := m.ensurePsiAtLeast(nPeriods)
+		if len(psi) > 0 {
 			z := normPPF(1 - alpha/2)
 			lower = make([]float64, nPeriods)
 			upper = make([]float64, nPeriods)
 			var2 := 0.0
 			for h := 0; h < nPeriods; h++ {
-				if h < len(m.psiInf) {
-					var2 += m.psiInf[h] * m.psiInf[h]
+				if h < len(psi) {
+					var2 += psi[h] * psi[h]
 				}
 				se := math.Sqrt(m.sigma2 * var2)
 				lower[h] = out[h] - z*se
@@ -1390,7 +1408,10 @@ func cloneMat(x [][]float64) [][]float64 {
 	return out
 }
 
-// computePsi precomputes truncated MA(infinity) coefficients for forecast variance.
+// computePsi precomputes truncated MA(infinity) coefficients for forecast
+// variance and publishes them via the atomic psi cache. Called once from
+// Fit with a 100-entry default; Predict extends the cache if a longer
+// horizon is requested (see ensurePsiAtLeast).
 //
 // For ARIMA(p,d,q)(P,D,Q,m) the integrated process is
 //
@@ -1407,14 +1428,15 @@ func cloneMat(x [][]float64) [][]float64 {
 // the SD growing like √h. Matches R's `forecast::forecast` and
 // statsmodels' `SARIMAXResults.get_forecast` variance growth.
 func (m *ARIMA) computePsi() {
-	m.computePsiUpTo(100)
+	psi := m.buildPsi(100)
+	m.psi.Store(&psiCache{values: psi})
 }
 
-// computePsiUpTo recomputes psi with at least `maxLag` entries. Predict
-// calls this with `nPeriods` if its current cache is shorter — pre-fix the
-// hard-coded 100-entry limit silently flattened forecast CIs past horizon
-// 100 (psi[h] for h ≥ 100 was just absent, so var2 stopped accumulating).
-func (m *ARIMA) computePsiUpTo(maxLag int) {
+// buildPsi constructs an immutable MA(∞) coefficient slice of length maxLag.
+// Pure builder — no side effects on m. Callers either Store() the result
+// directly (Fit's initial publish) or CompareAndSwap a wrapping psiCache
+// to monotonically grow the published cache (Predict's lazy extension).
+func (m *ARIMA) buildPsi(maxLag int) []float64 {
 	if maxLag < 1 {
 		maxLag = 1
 	}
@@ -1448,8 +1470,31 @@ func (m *ARIMA) computePsiUpTo(maxLag int) {
 			}
 		}
 	}
-	m.psiInf = psi
-	m.psiInfN = maxLag
+	return psi
+}
+
+// ensurePsiAtLeast returns a psi slice of length ≥ minLen, atomically
+// extending the cached snapshot if needed. Concurrent-safe: every caller
+// gets a coherent slice (either the cached one or a freshly built one);
+// the cache only ever grows monotonically via CAS.
+//
+// Returns (nil) when nFree==0 (white-noise model — no psi to compute).
+func (m *ARIMA) ensurePsiAtLeast(minLen int) []float64 {
+	for {
+		cur := m.psi.Load()
+		if cur != nil && len(cur.values) >= minLen {
+			return cur.values
+		}
+		// Build a longer snapshot and CAS-publish. If another goroutine
+		// raced in with its own (possibly larger) snapshot, the CAS fails
+		// and we re-load — discarding our build but inheriting whatever
+		// won. Worst-case waste under contention is one redundant build,
+		// which is fine.
+		next := &psiCache{values: m.buildPsi(minLen)}
+		if m.psi.CompareAndSwap(cur, next) {
+			return next.values
+		}
+	}
 }
 
 // normPPF returns the inverse CDF of the standard normal.
