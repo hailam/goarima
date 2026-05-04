@@ -211,13 +211,23 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 			K[i] = P[i*r] * invF
 			a[i] += K[i] * v
 		}
-		// snapshot row 0; rank-1 P update: P -= K * row0.
+		// Joseph-form covariance update: P = (I - K·H)·P·(I - K·H)' + K·R·K'.
+		// With ARMA companion form H = [1,0,…,0] and observation noise R = 0:
+		//   P_new[i,j] = P[i,j] - K[i]·row0[j] - K[j]·row0[i] + K[i]·K[j]·F
+		// (row0 is a snapshot of P's first row taken BEFORE the update.)
+		// Symmetric by construction; preserves PSD against rounding error.
+		// Replaces the older rank-1 form `P -= K·row0` which is mathematically
+		// equivalent only in exact arithmetic — numerically it loses
+		// symmetry/PSD over many steps once BFGS pushes φ near the unit
+		// circle, causing F = P[0,0] to drift wildly. See KAL-1.
 		copy(row0, P[:r])
 		for i := 0; i < r; i++ {
 			ki := K[i]
+			r0i := row0[i]
 			off := i * r
 			for j := 0; j < r; j++ {
-				P[off+j] -= ki * row0[j]
+				kj := K[j]
+				P[off+j] += -ki*row0[j] - kj*r0i + ki*kj*F
 			}
 		}
 

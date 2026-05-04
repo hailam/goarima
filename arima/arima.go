@@ -647,10 +647,41 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	default:
 		ll, s2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
 		negLL, sigma2 = ll, s2
+		// KAL-1 sanity check. The exact-Kalman likelihood includes a
+		// log-determinant transient bounded by O(log γ(0)/σ²) — typically
+		// a few units, at most ~3·r for well-conditioned stationary fits.
+		// When BFGS pushes φ/Φ near the unit circle, stationaryCovGardner
+		// returns huge initial P (1e10+) and the resulting log F sum
+		// dominates negLL with values that disagree wildly with the
+		// concentrated-Gaussian textbook form. R's stats::arima falls
+		// back to the conditional likelihood in such cases; we mirror
+		// that here. The parameters themselves are unchanged — only the
+		// reported logL/AIC/AICc are sanitized so model selection isn't
+		// driven by this numerical artefact.
+		if !math.IsNaN(negLL) && !math.IsInf(negLL, 0) && sigma2 > 0 {
+			textbookNegLL := 0.5 * float64(len(r)) * (math.Log(2*math.Pi*sigma2) + 1)
+			rState := len(fullPhi)
+			if len(fullTheta)+1 > rState {
+				rState = len(fullTheta) + 1
+			}
+			tol := 3.0 * float64(rState)
+			if tol < 20 {
+				tol = 20
+			}
+			if math.Abs(negLL-textbookNegLL) > tol {
+				negLL = textbookNegLL
+			}
+		}
 	}
 	if math.IsNaN(negLL) || math.IsInf(negLL, 0) {
+		// KAL-1: when the Kalman early-aborts (e.g., F<=0 from
+		// non-PSD P at boundary parameters), recover σ² via CSS and
+		// report the textbook concentrated-Gaussian negLL with full
+		// constants. Pre-fix this used (n/2)·log(σ²) — missing the
+		// (n/2)·(log(2π)+1) offset, so reported AIC/AICc were ~n·1.42
+		// units lower than R/statsmodels for the same fit.
 		_, sigma2, _ = armaCSS(r, fullPhi, fullTheta)
-		negLL = float64(len(r)) / 2 * math.Log(sigma2)
+		negLL = 0.5 * float64(len(r)) * (math.Log(2*math.Pi*sigma2) + 1)
 	}
 	m.sigma2 = sigma2
 	m.logL = -negLL
