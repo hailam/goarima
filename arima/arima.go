@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/ajroetker/go-highway/hwy/contrib/vec"
 	"gonum.org/v1/gonum/optimize"
 )
 
@@ -383,19 +384,35 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		}
 	}
 
+	// Pre-transpose wX to column-major once (it's invariant across the
+	// optimizer's residOf calls). This lets the closure dispatch a SIMD
+	// AXPY (MulConstAddTo) per regressor column instead of an O(k)
+	// inner loop per row — 2.5–2.9× faster on n≥144 with k≥2 exog cols
+	// (Apple-silicon NEON / AVX2). On non-SIMD targets go-highway falls
+	// back to scalar Go transparently. See docs/decisions/0002-simd-go-highway.md.
+	var wXT [][]float64
+	if k > 0 {
+		wXT = make([][]float64, k)
+		nWS := len(ws)
+		for j := 0; j < k; j++ {
+			col := make([]float64, nWS)
+			for i := 0; i < nWS; i++ {
+				col[i] = wX[i][j]
+			}
+			wXT[j] = col
+		}
+	}
+
 	// Compute residual series given a parameter vector — applied identically
 	// inside CSS and Kalman objectives.
 	residOf := func(params []float64) []float64 {
 		_, _, _, _, c, beta := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
 		out := make([]float64, len(ws))
 		for i, v := range ws {
-			r := v - c
-			if k > 0 {
-				for j := 0; j < k; j++ {
-					r -= beta[j] * wX[i][j]
-				}
-			}
-			out[i] = r
+			out[i] = v - c
+		}
+		for j := 0; j < k; j++ {
+			vec.MulConstAddTo(out, -beta[j], wXT[j])
 		}
 		return out
 	}
@@ -412,18 +429,29 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		}
 	}
 	xUndiff := m.xTrain
+	// Same column-transpose trick as residOf, against the un-differenced
+	// exog matrix used by the integrated state-space objective.
+	var xUndiffT [][]float64
+	if k > 0 && xUndiff != nil {
+		xUndiffT = make([][]float64, k)
+		nU := len(yUndiff)
+		for j := 0; j < k; j++ {
+			col := make([]float64, nU)
+			for i := 0; i < nU; i++ {
+				col[i] = xUndiff[i][j]
+			}
+			xUndiffT[j] = col
+		}
+	}
 
 	residOfFull := func(params []float64) []float64 {
 		_, _, _, _, c, beta := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
 		out := make([]float64, len(yUndiff))
 		for i, v := range yUndiff {
-			rr := v - c
-			if k > 0 {
-				for j := 0; j < k; j++ {
-					rr -= beta[j] * xUndiff[i][j]
-				}
-			}
-			out[i] = rr
+			out[i] = v - c
+		}
+		for j := 0; j < k; j++ {
+			vec.MulConstAddTo(out, -beta[j], xUndiffT[j])
 		}
 		return out
 	}

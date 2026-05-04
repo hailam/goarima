@@ -45,6 +45,37 @@ func BenchmarkFitNonSimple_Airline(b *testing.B) {
 	}
 }
 
+// BenchmarkFitARIMA011_AirlineWithExog measures ARIMA(0,1,1) Airline fit
+// with a non-trivial exog matrix (k=5 random regressors). This is where
+// the SIMD path matters — residOf's inner k-loop is the dominant
+// vectorizable hot loop. Without exog (k=0) the SIMD path is never
+// entered, so this bench is the "pays-off-when-it-matters" check.
+func BenchmarkFitARIMA011_AirlineWithExog(b *testing.B) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	const k = 5
+	exog := make([][]float64, len(logAp))
+	for i := range exog {
+		row := make([]float64, k)
+		for j := 0; j < k; j++ {
+			row[j] = math.Sin(float64(i*7+j*13) * 0.1)
+		}
+		exog[i] = row
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		m := NewARIMA(Order{P: 0, D: 1, Q: 1})
+		m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+		m.MaxIter = 100
+		if err := m.Fit(logAp, exog); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
 // BenchmarkAutoArima_AirPassengers measures stepwise auto-selection on AirPassengers.
 func BenchmarkAutoArima_AirPassengers(b *testing.B) {
 	ap := datasets.LoadAirPassengers()

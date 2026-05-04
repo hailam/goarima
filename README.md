@@ -23,6 +23,33 @@ pipeline.
 go get github.com/hailam/goarima
 ```
 
+Requires Go 1.26+.
+
+### SIMD (optional, AMD64)
+
+A handful of vectorizable hot loops route through
+[`go-highway`](https://github.com/ajroetker/go-highway), a transitional
+SIMD library that anticipates Go's upcoming native SIMD support:
+
+- **ARM64 (Apple silicon, Graviton, etc.)**: NEON acceleration is on by
+  default — no flags needed.
+- **AMD64**: SIMD requires `GOEXPERIMENT=simd` at build time. Without
+  the flag, the affected loops fall back to scalar Go (correct, just
+  not faster).
+- **All other architectures**: scalar fallback, transparent.
+
+To enable on AMD64:
+```sh
+GOEXPERIMENT=simd go build ./...
+```
+
+The speedup is targeted (residual computation with non-trivial exog
+matrices); end-to-end Fit and AutoArima times are unlikely to move
+measurably on small models. The library is treated as a temporary
+adapter — when Go's native SIMD lands as GA, this dependency goes away.
+See `docs/decisions/0002-simd-go-highway.md` for the full investigation
+and bench numbers.
+
 ## Quick start
 
 ```go
