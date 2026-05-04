@@ -81,19 +81,20 @@ func CrossValScoreConcurrent(y []float64, exog [][]float64, cv CrossValidator, m
 	if nJobs < 1 {
 		nJobs = 1
 	}
+	// Direct indexed writes: each fold writes to its own out[idx] / errs[idx].
+	// Distinct slice indices are distinct memory locations, so no lock or
+	// results-channel coordination is needed. After wg.Wait() we scan errs
+	// in INDEX order, which produces deterministic error reporting (the
+	// lowest-index failing fold), unlike the previous results-channel path
+	// where error selection depended on goroutine scheduling.
 	out := make([]float64, len(splits))
+	errs := make([]error, len(splits))
 
 	type job struct {
 		idx int
 		s   Split
 	}
-	type res struct {
-		idx int
-		val float64
-		err error
-	}
 	jobs := make(chan job, len(splits))
-	results := make(chan res, len(splits))
 	var wg sync.WaitGroup
 	for w := 0; w < nJobs; w++ {
 		wg.Add(1)
@@ -109,24 +110,24 @@ func CrossValScoreConcurrent(y []float64, exog [][]float64, cv CrossValidator, m
 				}
 				mdl := mk()
 				if mdl == nil {
-					results <- res{idx: j.idx, err: fmt.Errorf("fold %d: nil model", j.idx)}
+					errs[j.idx] = fmt.Errorf("fold %d: nil model", j.idx)
 					continue
 				}
 				if e := mdl.Fit(yTrain, xTrain); e != nil {
-					results <- res{idx: j.idx, err: fmt.Errorf("fold %d fit: %w", j.idx, e)}
+					errs[j.idx] = fmt.Errorf("fold %d fit: %w", j.idx, e)
 					continue
 				}
 				fc, _, _, e := mdl.Predict(len(yTest), 0, xTest)
 				if e != nil {
-					results <- res{idx: j.idx, err: fmt.Errorf("fold %d predict: %w", j.idx, e)}
+					errs[j.idx] = fmt.Errorf("fold %d predict: %w", j.idx, e)
 					continue
 				}
 				sc, e := score(yTest, fc)
 				if e != nil {
-					results <- res{idx: j.idx, err: fmt.Errorf("fold %d score: %w", j.idx, e)}
+					errs[j.idx] = fmt.Errorf("fold %d score: %w", j.idx, e)
 					continue
 				}
-				results <- res{idx: j.idx, val: sc}
+				out[j.idx] = sc
 			}
 		}()
 	}
@@ -134,17 +135,11 @@ func CrossValScoreConcurrent(y []float64, exog [][]float64, cv CrossValidator, m
 		jobs <- job{idx: i, s: s}
 	}
 	close(jobs)
-	go func() { wg.Wait(); close(results) }()
-	var firstErr error
-	for r := range results {
-		if r.err != nil && firstErr == nil {
-			firstErr = r.err
-			continue
+	wg.Wait()
+	for _, e := range errs {
+		if e != nil {
+			return nil, e
 		}
-		out[r.idx] = r.val
-	}
-	if firstErr != nil {
-		return nil, firstErr
 	}
 	return out, nil
 }

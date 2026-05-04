@@ -78,8 +78,16 @@ type AutoArimaOpts struct {
 
 	// Trace receives one line per fitted candidate when non-nil. Mirrors
 	// pmdarima's trace=True (the printed lines are emitted programmatically).
-	// MAY BE CALLED CONCURRENTLY in stepwise/FullSearch modes; protect any
-	// shared state.
+	//
+	// In **stepwise mode** (the default) Trace is called only from the main
+	// goroutine in stable neighbor order, so callbacks do NOT need to be
+	// thread-safe and trace output is deterministic regardless of how the
+	// parallel candidate fits scheduled.
+	//
+	// In **FullSearch mode** Trace is still called from the result-collector
+	// goroutine on a single thread, so callbacks don't need to be
+	// thread-safe there either; only the order in which lines arrive is
+	// non-deterministic (worker arrival order).
 	Trace func(string)
 
 	// ErrorAction controls behavior when a candidate fit errors:
@@ -414,21 +422,22 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		return mdl, score, nil
 	}
 
-	// Fit one candidate; cached. Returns model and the chosen score (lower=better).
-	// Sequential entry point (used by the initial stepwise fit). Thread-safe
-	// against concurrent tryOrderCached / fitNeighborParallel via cacheMu.
-	// gradWorkers is the BFGS gradient concurrency budget — pass via
-	// closure-bound variable that callers update before parallel dispatch.
-	tryOrder := func(p, q, capP, capQ, gradWorkers int) (*ARIMA, float64, error) {
+	// tryOrderTraced fits one candidate (cached) and returns the trace
+	// string instead of calling emit() directly. Lets the caller decide
+	// WHEN to emit — sequential paths emit immediately, parallel paths
+	// collect strings and emit from the main goroutine after wg.Wait()
+	// so trace output is deterministic regardless of scheduler order
+	// AND user-supplied Trace callbacks don't need to be thread-safe.
+	tryOrderTraced := func(p, q, capP, capQ, gradWorkers int) (*ARIMA, float64, string, error) {
 		k := orderKey{p, q, capP, capQ}
 		cacheMu.Lock()
 		if cached, ok := cache[k]; ok {
 			score := cacheScore[k]
 			cacheMu.Unlock()
 			if cached == nil {
-				return nil, 0, fmt.Errorf("cached failure")
+				return nil, 0, "", fmt.Errorf("cached failure")
 			}
-			return cached, score, nil
+			return cached, score, "", nil // cache hit — no new trace line
 		}
 		cacheMu.Unlock()
 		mdl, score, err := independentFit(k, gradWorkers)
@@ -441,13 +450,23 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		}
 		cacheMu.Unlock()
 		if err != nil {
-			emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : fit failed: %v",
-				p, d, q, capP, D, capQ, opts.M, err))
-			return nil, 0, err
+			line := fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : fit failed: %v",
+				p, d, q, capP, D, capQ, opts.M, err)
+			return nil, 0, line, err
 		}
-		emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : score=%.4f",
-			p, d, q, capP, D, capQ, opts.M, score))
-		return mdl, score, nil
+		line := fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : score=%.4f",
+			p, d, q, capP, D, capQ, opts.M, score)
+		return mdl, score, line, nil
+	}
+
+	// tryOrder is the sequential variant: emits the trace line immediately.
+	// Used by the initial stepwise fit and by the sequential nJobs==1 path.
+	tryOrder := func(p, q, capP, capQ, gradWorkers int) (*ARIMA, float64, error) {
+		mdl, score, line, err := tryOrderTraced(p, q, capP, capQ, gradWorkers)
+		if line != "" {
+			emit(line)
+		}
+		return mdl, score, err
 	}
 
 	handleErr := func(err error) error {
@@ -634,6 +653,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		type stepResult struct {
 			model *ARIMA
 			score float64
+			trace string // collected trace line; emitted in stable order below
 			err   error
 		}
 		results := make([]stepResult, len(neighbors))
@@ -642,8 +662,8 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		if nJobs == 1 {
 			// Sequential — preserves zero goroutine overhead at small parallelism.
 			for i, n := range neighbors {
-				cand, score, err := tryOrder(n.p, n.q, n.P, n.Q, 0)
-				results[i] = stepResult{cand, score, err}
+				cand, score, line, err := tryOrderTraced(n.p, n.q, n.P, n.Q, 0)
+				results[i] = stepResult{cand, score, line, err}
 			}
 		} else {
 			var wg sync.WaitGroup
@@ -655,8 +675,8 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				go func() {
 					defer wg.Done()
 					defer func() { <-sem }()
-					cand, score, err := tryOrder(n.p, n.q, n.P, n.Q, gradBudget)
-					results[i] = stepResult{cand, score, err}
+					cand, score, line, err := tryOrderTraced(n.p, n.q, n.P, n.Q, gradBudget)
+					results[i] = stepResult{cand, score, line, err}
 				}()
 			}
 			wg.Wait()
@@ -665,8 +685,15 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		// Process results in stable original order so ties resolve identically
 		// to the sequential implementation (preserves determinism). Under
 		// ErrorAction="raise" any neighbor failure aborts the whole search,
-		// matching the documented contract.
+		// matching the documented contract. Trace lines collected from the
+		// workers are also emitted here in stable order — so a user's Trace
+		// callback (which previously had to be thread-safe per the
+		// documentation warning) now sees deterministic output and runs only
+		// on the main goroutine.
 		for i, r := range results {
+			if r.trace != "" {
+				emit(r.trace)
+			}
 			if r.err != nil || r.model == nil {
 				if e := handleErr(r.err); e != nil {
 					return nil, e
