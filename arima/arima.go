@@ -477,7 +477,9 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	}
 
 	objective := func(params []float64) float64 {
-		phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
+		s := acquireParamScratch()
+		defer releaseParamScratch(s)
+		phi, theta, sPhi, sTheta, _, _ := unpackParamsXInto(s, params, p, q, P, Q, m.WithIntercept, k)
 		if useStatsmodels {
 			Dord := 0
 			mPer := 0
@@ -487,7 +489,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			}
 			yEff := yUndiffScaled
 			if m.WithIntercept || k > 0 {
-				_, _, _, _, c, beta := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
+				_, _, _, _, c, beta := unpackParamsXInto(s, params, p, q, P, Q, m.WithIntercept, k)
 				yAdj := make([]float64, len(yUndiffScaled))
 				for i, v := range yUndiffScaled {
 					adj := v - c
@@ -524,8 +526,8 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			}
 			return ll
 		}
-		fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
-		fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
+		fullPhi := expandSARMAInto(s, phi, sPhi, m.Seasonal.M)
+		fullTheta := expandSMAInto(s, theta, sTheta, m.Seasonal.M)
 		r := residOf(params)
 		switch m.Method {
 		case MethodCSS:
@@ -546,9 +548,11 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	cssWarmedX := false
 	if m.Method == MethodCSSML && !useWarmStart {
 		cssObj := func(params []float64) float64 {
-			phi, theta, sPhi, sTheta, _, _ := unpackParamsX(params, p, q, P, Q, m.WithIntercept, k)
-			fullPhi := expandSARMA(phi, sPhi, m.Seasonal.M)
-			fullTheta := expandSMA(theta, sTheta, m.Seasonal.M)
+			s := acquireParamScratch()
+			defer releaseParamScratch(s)
+			phi, theta, sPhi, sTheta, _, _ := unpackParamsXInto(s, params, p, q, P, Q, m.WithIntercept, k)
+			fullPhi := expandSARMAInto(s, phi, sPhi, m.Seasonal.M)
+			fullTheta := expandSMAInto(s, theta, sTheta, m.Seasonal.M)
 			ll, _, _ := armaCSS(residOf(params), fullPhi, fullTheta)
 			return ll
 		}

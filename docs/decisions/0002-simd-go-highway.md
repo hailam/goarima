@@ -165,6 +165,66 @@ proposal status):
 This is what go-highway is explicitly designed for — it's a transition
 adapter, not a permanent dep.
 
+## Re-investigation 2026-05-05 (post CSS-1)
+
+After CSS-1 (5× speedup on default Fit), re-profiled to identify any
+remaining vectorizable hot loops. Findings:
+
+### Profile of post-CSS-1 Fit
+
+`go test -bench=FitARIMA011_Airline -cpuprofile`:
+
+- 70% of CPU is still `pthread_cond_signal` etc. from `parallelGradient`
+  (that's PG-1, separate concern — investigated, current threshold is
+  correct, not actionable).
+- User-code share: ~2% of total CPU, dominated by:
+  - `kalmanARMALikelihood`: 1.31% flat
+  - `armaCSS`: 0.22% cum
+  - `expandSMA` / `maTransparams`: <0.15% each
+
+### Kalman inner-loop break-even
+
+`BenchmarkTwoDot_*` in `arima/simd_bench_test.go` measures the matvec/
+dot pattern at actual ARIMA shapes:
+
+| n | Pattern | Scalar | SIMD | Verdict |
+|---|---|---|---|---|
+| 14 | monthly SARIMA simple-diff (r) | 4.89 ns | 9.13 ns | **SIMD 1.87× slower** |
+| 27 | monthly NonSimple (rd = r + d + D·M) | 8.79 ns | 11.59 ns | **SIMD 1.32× slower** |
+| 50 | high-frequency seasonal (M ≥ 24) | 16.15 ns | 15.83 ns | break-even |
+
+**SIMD break-even on this hardware is around n=50.** Below that, the
+per-call dispatch cost in `vec.Dot` / `vec.MulConstAddTo` exceeds the
+saved arithmetic.
+
+### Conclusion: no further SIMD wins for typical ARIMA shapes
+
+For the dominant use case (monthly data, M=12, r ≤ 14, rd ≤ 27), every
+remaining hot loop is below SIMD break-even. Converting them would
+**regress** performance.
+
+**SIMD only pays off for high-frequency seasonal models**: M=24 quarterly
+(rd ≈ 50), M=52 weekly (rd ≈ 100+), M=365 daily (rd ≈ 400+). When such
+a workload arrives — re-bench the same loops at the larger r and apply
+`vec.MulConstAddTo` / `vec.Dot` selectively. Until then, the existing
+residOf conversion is the only payoff site and the rest stays scalar.
+
+The compiler already auto-vectorizes simple AXPY loops well at small n
+(see Sum_Scalar at n=1000 matching Sum_SIMD), so we're not leaving
+performance on the table — Go's optimizer is handling the small cases.
+
+### Other vectorizable patterns ruled out
+
+| Site | Why not |
+|---|---|
+| `armaCSS` recursion | Sequential dep on `res[t-1-j]` — not vectorizable. Inner sum length p+q ≤ 14 also below break-even. |
+| `simulateOne` (bootstrap) | Same sequential dep as armaCSS. |
+| `buildPsi` ψ-recursion | Same sequential dep. |
+| `expandSMA` / `expandSARMA` | Polynomial mul ~3 × ~13 — tiny. |
+| `stationaryCovGardner` | Many r-sized inner loops, r=14. Below break-even. |
+| `olsFit` / Hannan-Rissanen | Already routed through gonum/BLAS. |
+| `kalmanARIMAFullConv` rd-sized loops | rd=27 for airline NonSimple, below break-even. Would help if rd > 50. |
+
 ## Open follow-ups
 
 - **parallelGradient overhead** (97% of Fit's CPU): convert to serial

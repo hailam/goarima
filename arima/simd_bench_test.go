@@ -220,3 +220,38 @@ func BenchmarkAxpy_Scalar_n14(b *testing.B) { benchSmallAxpy(b, 14) }
 func BenchmarkAxpy_SIMD_n14(b *testing.B)   { benchSmallAxpySIMD(b, 14) }
 func BenchmarkAxpy_Scalar_n28(b *testing.B) { benchSmallAxpy(b, 28) }
 func BenchmarkAxpy_SIMD_n28(b *testing.B)   { benchSmallAxpySIMD(b, 28) }
+
+// Kalman inner-loop shapes from real ARIMA fits — verify SIMD
+// break-even at r=14 (typical monthly SARIMA simple-diff) and rd=27
+// (NonSimpleDifferencing for the same model).
+//
+// Two-vec dot pattern from kalman_full.go:178-189 (Pinf and Pstar
+// matvecs share the same z multiplier per step).
+func benchTwoDot(b *testing.B, n int, simd bool) {
+	x := makeF64(n, 1)
+	y1 := makeF64(n, 2)
+	y2 := makeF64(n, 3)
+	b.ResetTimer()
+	var s1, s2 float64
+	for i := 0; i < b.N; i++ {
+		if simd {
+			s1 = vec.Dot(x, y1)
+			s2 = vec.Dot(x, y2)
+		} else {
+			s1 = 0
+			s2 = 0
+			for j, v := range x {
+				s1 += v * y1[j]
+				s2 += v * y2[j]
+			}
+		}
+	}
+	_, _ = s1, s2
+}
+
+func BenchmarkTwoDot_Scalar_n14(b *testing.B) { benchTwoDot(b, 14, false) }
+func BenchmarkTwoDot_SIMD_n14(b *testing.B)   { benchTwoDot(b, 14, true) }
+func BenchmarkTwoDot_Scalar_n27(b *testing.B) { benchTwoDot(b, 27, false) }
+func BenchmarkTwoDot_SIMD_n27(b *testing.B)   { benchTwoDot(b, 27, true) }
+func BenchmarkTwoDot_Scalar_n50(b *testing.B) { benchTwoDot(b, 50, false) }
+func BenchmarkTwoDot_SIMD_n50(b *testing.B)   { benchTwoDot(b, 50, true) }
