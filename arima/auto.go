@@ -16,6 +16,13 @@ type AutoArimaOpts struct {
 	// Seasonal period; if 0 or 1, only non-seasonal models are considered.
 	M int
 
+	// AutoM, when true, overrides M with FindFrequency(y) — an AR-spectral
+	// peak-detector matching R's forecast::findfrequency(). Useful for
+	// daily/hourly data where the seasonal period isn't obvious. If the
+	// detector finds no clear peak it returns 1 (non-seasonal). Mirrors
+	// the behavior R users get from `auto.arima(y)` when frequency(y)==1.
+	AutoM bool
+
 	// Optional fixed differencing terms; -1 means "estimate".
 	D     int
 	Dd    int // seasonal D
@@ -99,6 +106,19 @@ type AutoArimaOpts struct {
 	// MaxSteps caps the number of stepwise iterations (0 → 50).
 	MaxSteps int
 
+	// ParsimonyDelta requires a candidate with MORE parameters than the
+	// current best to beat its IC by at least this much before being
+	// adopted. Same-or-fewer-parameter candidates use the existing 1e-6
+	// tolerance, so down-shifting to a simpler model is unaffected.
+	//
+	// Default 0.0 disables the gate (legacy behavior — any IC drop wins).
+	// A common setting is 2.0, the conventional ΔAICc threshold for
+	// "meaningful" improvement (Burnham & Anderson). R's auto.arima uses
+	// a similar mechanism via its `ic` tolerance to keep the stepwise
+	// search from drifting onto over-parameterized models on flat IC
+	// landscapes; goarima now exposes the same lever explicitly.
+	ParsimonyDelta float64
+
 	// NJobs sets goroutine concurrency for both stepwise (4–8 neighbor fits
 	// per iteration) and FullSearch (whole search box) modes. 0 → GOMAXPROCS.
 	// Mirrors pmdarima's `n_jobs`. R/Python require pickling+IPC for parallel
@@ -140,6 +160,9 @@ type AutoArimaOpts struct {
 func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error) {
 	if len(y) < 10 {
 		return nil, fmt.Errorf("series too short: %d", len(y))
+	}
+	if opts.AutoM {
+		opts.M = FindFrequency(y)
 	}
 	// Defaults
 	if opts.MaxOrder == 0 {
@@ -700,7 +723,13 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				}
 				continue
 			}
-			if r.score < bestScore-1e-6 {
+			candParams := neighbors[i].p + neighbors[i].q + neighbors[i].P + neighbors[i].Q
+			bestParams := bestKey.p + bestKey.q + bestKey.P + bestKey.Q
+			threshold := 1e-6
+			if candParams > bestParams && opts.ParsimonyDelta > threshold {
+				threshold = opts.ParsimonyDelta
+			}
+			if r.score < bestScore-threshold {
 				best = r.model
 				bestScore = r.score
 				bestKey = neighbors[i]

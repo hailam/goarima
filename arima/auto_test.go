@@ -80,3 +80,69 @@ func TestAutoArimaTooShort(t *testing.T) {
 		t.Error("expected error for very short series")
 	}
 }
+
+// G-NEW-3c: with ParsimonyDelta set very high, the stepwise search must
+// never grow the parameter count past the initial seed (since no
+// higher-order neighbor can clear an arbitrarily large IC threshold).
+// Same-or-fewer-parameter candidates are unaffected, so simplification
+// must still be possible.
+func TestAutoArimaParsimonyDeltaCapsParams(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+
+	// Default delta = 0 baseline.
+	mDefault, err := AutoArima(ap, nil, AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 5, MaxD: 2, IC: AICc, MaxIter: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultParams := mDefault.Order.P + mDefault.Order.Q +
+		mDefault.Seasonal.P + mDefault.Seasonal.Q
+
+	// Same search box but with an effectively-infinite parsimony gate:
+	// no neighbor that adds a parameter can ever beat its current best.
+	// The result must have <= the default-run param count, and crucially
+	// no more than the seed's param count (StartP=2 → seed params = 2).
+	mStrict, err := AutoArima(ap, nil, AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 5, MaxD: 2, IC: AICc, MaxIter: 50,
+		StartP: 2, StartQ: 2, // seed at p=q=2 (4 params before P/Q)
+		ParsimonyDelta: 1e9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	strictParams := mStrict.Order.P + mStrict.Order.Q +
+		mStrict.Seasonal.P + mStrict.Seasonal.Q
+	seedParams := 2 + 2 + 0 + 0
+	if strictParams > seedParams {
+		t.Errorf("ParsimonyDelta=1e9 must cap params at seed (%d); got %d",
+			seedParams, strictParams)
+	}
+	t.Logf("default params=%d, strict params=%d (seed=%d)",
+		defaultParams, strictParams, seedParams)
+}
+
+// G-NEW-3c: simplification must still work with a high ParsimonyDelta.
+// Seed an over-specified model; the search should drop redundant terms
+// because dropping a parameter only needs the legacy 1e-6 tolerance,
+// not the parsimony delta.
+func TestAutoArimaParsimonyDeltaAllowsSimplification(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	m, err := AutoArima(ap, nil, AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder: 6, MaxD: 2, IC: AICc, MaxIter: 50,
+		StartP: 3, StartQ: 3, StartCapP: 1, StartCapQ: 1, // 8 params seed
+		ParsimonyDelta: 1e9,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	params := m.Order.P + m.Order.Q + m.Seasonal.P + m.Seasonal.Q
+	if params >= 8 {
+		t.Errorf("expected stepwise to simplify away from 8-param seed even "+
+			"under ParsimonyDelta=1e9; got params=%d", params)
+	}
+	t.Logf("simplified to params=%d from seed=8", params)
+}
