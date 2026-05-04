@@ -26,11 +26,27 @@ const (
 	Constant
 )
 
-// Approx performs R-style linear (or constant) interpolation.
+// ApproxTable holds a sorted, deduplicated reference grid (`xs`, `ys`)
+// suitable for many subsequent interpolation calls. Constructed once via
+// NewApproxTable; the table is immutable and safe to share concurrently
+// across goroutines.
 //
-// xRef and yRef are the reference points. xOut is the locations to interpolate at.
-// Mirrors pmdarima.arima.approx.approx (with ties='mean' regularization).
-func Approx(xRef, yRef, xOut []float64, method ApproxMethod, rule ApproxRule) ([]float64, error) {
+// Use ApproxTable when the same reference points feed multiple Approx
+// calls — it amortises the O(n log n) sort + dedupe across the calls
+// instead of paying it on every Approx invocation.
+type ApproxTable struct {
+	xs []float64
+	ys []float64
+}
+
+// NewApproxTable validates the input and builds the sorted/deduplicated
+// reference grid. Returns an error for empty or length-mismatched inputs.
+//
+// The returned table is immutable: subsequent Approx calls only read
+// from it, so a single ApproxTable can be safely reused by many
+// concurrent goroutines. The mirrors-pmdarima `ties='mean'` semantics
+// from the package-level Approx are preserved.
+func NewApproxTable(xRef, yRef []float64) (*ApproxTable, error) {
 	if len(xRef) != len(yRef) {
 		return nil, errors.New("xRef and yRef must have equal length")
 	}
@@ -38,11 +54,21 @@ func Approx(xRef, yRef, xOut []float64, method ApproxMethod, rule ApproxRule) ([
 		return nil, errors.New("xRef must be non-empty")
 	}
 	xs, ys := regularizeMean(xRef, yRef)
+	return &ApproxTable{xs: xs, ys: ys}, nil
+}
+
+// Approx interpolates this table at the requested xOut locations using
+// `method` (Linear or Constant). `rule` chooses extrapolation behavior:
+// RuleNaN returns NaN outside the table's x-range; RuleClip returns the
+// nearest endpoint value.
+//
+// Concurrency-safe: only reads the table.
+func (t *ApproxTable) Approx(xOut []float64, method ApproxMethod, rule ApproxRule) []float64 {
 	yLeft := math.NaN()
 	yRight := math.NaN()
 	if rule == RuleClip {
-		yLeft = ys[0]
-		yRight = ys[len(ys)-1]
+		yLeft = t.ys[0]
+		yRight = t.ys[len(t.ys)-1]
 	}
 	out := make([]float64, len(xOut))
 	for i, v := range xOut {
@@ -50,9 +76,29 @@ func Approx(xRef, yRef, xOut []float64, method ApproxMethod, rule ApproxRule) ([
 			out[i] = math.NaN()
 			continue
 		}
-		out[i] = approx1(v, xs, ys, yLeft, yRight, method, 1, 0)
+		out[i] = approx1(v, t.xs, t.ys, yLeft, yRight, method, 1, 0)
 	}
-	return out, nil
+	return out
+}
+
+// Len returns the number of (x, y) reference points after deduplication.
+// Useful for callers that want to know if many duplicates were collapsed.
+func (t *ApproxTable) Len() int { return len(t.xs) }
+
+// Approx performs R-style linear (or constant) interpolation.
+//
+// xRef and yRef are the reference points. xOut is the locations to interpolate at.
+// Mirrors pmdarima.arima.approx.approx (with ties='mean' regularization).
+//
+// One-shot wrapper around NewApproxTable + (*ApproxTable).Approx. For
+// repeated interpolation against the same reference grid, build an
+// ApproxTable once and reuse it.
+func Approx(xRef, yRef, xOut []float64, method ApproxMethod, rule ApproxRule) ([]float64, error) {
+	t, err := NewApproxTable(xRef, yRef)
+	if err != nil {
+		return nil, err
+	}
+	return t.Approx(xOut, method, rule), nil
 }
 
 func regularizeMean(x, y []float64) ([]float64, []float64) {
