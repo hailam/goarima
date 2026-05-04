@@ -684,19 +684,24 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 			}
 			return
 		}
-		// Cap workers at the number of jobs — extra workers would spin on an
-		// empty channel and consume scheduler cycles for no benefit.
+		// Cap workers at the number of jobs — extra workers would spin for
+		// no benefit.
 		nw := nWorkers
 		if nw > n {
 			nw = n
 		}
-		jobs := make(chan int, n)
+		// Static striding: worker w handles indices w, w+nw, w+2*nw, …
+		// Two wins over the previous jobs-channel pattern: (1) no channel
+		// send/receive overhead per gradient component, which fires on every
+		// BFGS gradient evaluation; (2) the access pattern (each worker
+		// touches grad[w], grad[w+nw], …) keeps cache lines hot per worker.
+		// Per-component objective cost is symmetric for numerical
+		// gradients (each runs 2 f() calls), so static partitioning is
+		// balanced.
+		//
+		// Per-worker xLocal: `nw * n` floats sliced into views — same
+		// single-alloc strategy as before, just without the channel.
 		var wg sync.WaitGroup
-		// Single allocation for all worker buffers — `nw * n` floats sliced
-		// into per-worker xLocal views. Pre-fix each worker called `make`
-		// independently, so a BFGS iteration with nw goroutines made nw
-		// fresh n-element slices. Modest savings; matters across many
-		// objective evaluations during the line search.
 		buf := make([]float64, nw*n)
 		for w := 0; w < nw; w++ {
 			w := w
@@ -704,7 +709,7 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 			go func() {
 				defer wg.Done()
 				xLocal := buf[w*n : (w+1)*n]
-				for i := range jobs {
+				for i := w; i < n; i += nw {
 					copy(xLocal, x)
 					xLocal[i] += eps
 					fp := f(xLocal)
@@ -715,10 +720,6 @@ func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []fl
 				}
 			}()
 		}
-		for i := 0; i < n; i++ {
-			jobs <- i
-		}
-		close(jobs)
 		wg.Wait()
 	}
 }
