@@ -34,30 +34,44 @@ func hannanRissanen(y []float64, p, q int) (phi, theta []float64) {
 	}
 
 	// Stage 1: AR(m) fit on y_t = sum_{k=1..m} a_k * y_{t-k} + e_t.
-	rows := n - m
-	X := make([][]float64, rows)
-	yt := make([]float64, rows)
-	for i := 0; i < rows; i++ {
-		t := m + i
-		yt[i] = y[t]
-		row := make([]float64, m)
-		for k := 1; k <= m; k++ {
-			row[k-1] = y[t-k]
+	// Use Burg's method instead of OLS — Burg always produces stationary
+	// AR coefficients (|reflection| ≤ 1 by construction) and uses all n
+	// samples without windowing, giving a warm-start that lands inside
+	// the invertibility region. Statsmodels uses Burg as the default AR
+	// estimator; R's ar() supports it via method="burg". Falls back to
+	// OLS if Burg errors (degenerate input).
+	a, burgErr := burgAR(y, m)
+	if burgErr != nil {
+		// Fallback to OLS on the off-chance Burg's lattice degenerates.
+		rows := n - m
+		X := make([][]float64, rows)
+		yt := make([]float64, rows)
+		for i := 0; i < rows; i++ {
+			t := m + i
+			yt[i] = y[t]
+			row := make([]float64, m)
+			for k := 1; k <= m; k++ {
+				row[k-1] = y[t-k]
+			}
+			X[i] = row
 		}
-		X[i] = row
+		var olsErr error
+		a, olsErr = olsFit(X, yt, false)
+		if olsErr != nil {
+			return nil, nil
+		}
 	}
-	a, err := olsFit(X, yt, false)
-	if err != nil {
-		return nil, nil
-	}
-	// Residuals.
+	// Residuals e[t] = y[t] - sum(a[k] * y[t-1-k]).
+	// Burg already operates on the demeaned series internally; the AR
+	// coefficients are valid for the original y (the mean shows up only
+	// as an additive constant which we don't need for residuals).
 	e := make([]float64, n)
-	for i := 0; i < rows; i++ {
+	for t := m; t < n; t++ {
 		s := 0.0
 		for k := 0; k < m; k++ {
-			s += a[k] * X[i][k]
+			s += a[k] * y[t-1-k]
 		}
-		e[m+i] = yt[i] - s
+		e[t] = y[t] - s
 	}
 	// Earlier residuals are unknown; leave at zero.
 
