@@ -3,6 +3,7 @@ package arima
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"runtime"
 	"sort"
@@ -11,23 +12,85 @@ import (
 
 // BootResult holds nSim simulated forecast paths plus bootstrap quantile CIs.
 type BootResult struct {
-	Mean  []float64   // mean of simulated paths
-	Lower []float64   // alpha/2 quantile per horizon
-	Upper []float64   // 1-alpha/2 quantile per horizon
-	Paths [][]float64 // nSim x nPeriods raw simulated paths
+	Mean     []float64   // mean of simulated paths per horizon
+	Variance []float64   // empirical variance of paths per horizon (PRED-VAR)
+	Lower    []float64   // alpha/2 quantile per horizon
+	Upper    []float64   // 1-alpha/2 quantile per horizon
+	Paths    [][]float64 // nSim x nPeriods raw simulated paths
 }
 
-// PredictBoot produces bootstrap forecast intervals via residual resampling.
+// PredictBootOpts configures PredictBootWithOpts. Default zero-value
+// matches the legacy PredictBoot signature: non-parametric residual
+// resampling, alpha=0.05 (when explicitly set), nSim=1000.
+type PredictBootOpts struct {
+	// Alpha is the two-sided coverage error rate. Lower/Upper bounds
+	// are the alpha/2 and 1-alpha/2 empirical quantiles. Required:
+	// must be in (0, 1).
+	Alpha float64
+
+	// NSim is the number of bootstrap paths to generate. ≤0 → 1000.
+	NSim int
+
+	// Seed for the per-path PCG RNG. Different seeds give different
+	// path realisations; same seed gives bit-identical results across
+	// runs and across worker counts (per-path PCG re-seed via golden-
+	// ratio salt).
+	Seed uint64
+
+	// FutureExog is an [nPeriods][k] matrix of regressors aligned with
+	// the forecast horizon. Required when the model was fitted with
+	// exog, must be nil when it wasn't. Drift-augmented automatically
+	// when m.DriftIncluded.
+	FutureExog [][]float64
+
+	// Parametric, when true, draws innovations from N(0, σ²) instead
+	// of resampling empirical residuals. Useful when:
+	//   - residuals are approximately Gaussian (the common case when
+	//     AR/MA structure was correctly specified)
+	//   - the residual sample is small (n<50) — empirical sampling is
+	//     unstable when the resample pool is tiny
+	//   - users want symmetric CIs that don't inherit residual
+	//     skewness or thin tails
+	//
+	// Default false → empirical residual resampling (legacy behaviour,
+	// matches pmdarima.ARIMA.predict(bootstrap=True)).
+	Parametric bool
+}
+
+// PredictBoot is the legacy positional-arg entry point. Equivalent to
+// PredictBootWithOpts with non-parametric (residual-resampling) mode.
+// New code should prefer PredictBootWithOpts which supports the
+// parametric option (innovations drawn from N(0, σ²)) and is easier
+// to extend.
 //
-// Approach: for each simulation, recursively forecast nPeriods ahead while
-// drawing innovations uniformly with replacement from the in-sample residuals.
-// Returns the per-step empirical mean and (alpha/2, 1-alpha/2) quantiles
-// across nSim paths. Mirrors pmdarima.ARIMA.predict(return_conf_int=True,
-// bootstrap=True).
+// Approach: for each simulation, recursively forecast nPeriods ahead
+// while drawing innovations uniformly with replacement from the in-
+// sample residuals. Returns the per-step empirical mean and (alpha/2,
+// 1-alpha/2) quantiles across nSim paths. Mirrors
+// pmdarima.ARIMA.predict(return_conf_int=True, bootstrap=True).
 //
-// Useful when the residuals are non-Gaussian and the standard parametric
-// CIs (Predict's built-in alpha) misstate uncertainty.
+// Useful when the residuals are non-Gaussian and the standard
+// parametric CIs (Predict's built-in alpha) misstate uncertainty.
 func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, futureExog [][]float64) (*BootResult, error) {
+	return m.PredictBootWithOpts(nPeriods, PredictBootOpts{
+		Alpha:      alpha,
+		NSim:       nSim,
+		Seed:       seed,
+		FutureExog: futureExog,
+		Parametric: false,
+	})
+}
+
+// PredictBootWithOpts produces bootstrap forecast intervals. See
+// PredictBootOpts for configuration. Set opts.Parametric=true to draw
+// innovations from N(0, σ²) instead of resampling empirical residuals
+// — useful on short series and when residuals are approximately
+// Gaussian.
+func (m *ARIMA) PredictBootWithOpts(nPeriods int, opts PredictBootOpts) (*BootResult, error) {
+	alpha := opts.Alpha
+	nSim := opts.NSim
+	seed := opts.Seed
+	futureExog := opts.FutureExog
 	if !m.fitted {
 		return nil, errors.New("model not fitted")
 	}
@@ -62,18 +125,30 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 	}
 
 	// Pull residuals from the differenced fit, drop the leading zeros that
-	// the CSS recursion left in place for warm-up indices.
-	residPool := make([]float64, 0, len(m.resids))
-	for _, r := range m.resids {
-		if r != 0 {
-			residPool = append(residPool, r)
+	// the CSS recursion left in place for warm-up indices. Skipped in the
+	// parametric branch where we draw from N(0, σ²) directly.
+	var residPool []float64
+	if !opts.Parametric {
+		residPool = make([]float64, 0, len(m.resids))
+		for _, r := range m.resids {
+			if r != 0 {
+				residPool = append(residPool, r)
+			}
+		}
+		if len(residPool) == 0 {
+			residPool = m.resids
+		}
+		if len(residPool) == 0 {
+			return nil, errors.New("no residuals to bootstrap from")
 		}
 	}
-	if len(residPool) == 0 {
-		residPool = m.resids
-	}
-	if len(residPool) == 0 {
-		return nil, errors.New("no residuals to bootstrap from")
+	// Pre-compute σ for the parametric branch (innovations ~ N(0, σ²)).
+	sigma := 0.0
+	if opts.Parametric {
+		if m.sigma2 <= 0 {
+			return nil, errors.New("model sigma2 ≤ 0; cannot draw parametric innovations")
+		}
+		sigma = math.Sqrt(m.sigma2)
 	}
 
 	fullPhi := expandSARMA(m.phi, m.Phi, m.Seasonal.M)
@@ -173,7 +248,12 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 					yh += th * residHist[idx]
 				}
 			}
-			eps := residPool[rng.IntN(len(residPool))]
+			var eps float64
+			if opts.Parametric {
+				eps = rng.NormFloat64() * sigma
+			} else {
+				eps = residPool[rng.IntN(len(residPool))]
+			}
 			yh += eps
 			simDiffed[h] = yh
 			hist = append(hist, yh)
@@ -249,6 +329,7 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 	// next horizon overwrites col entirely). Saves an nSim-float alloc
 	// per horizon vs `sorted := append([]float64{}, col...)`.
 	mean := make([]float64, nPeriods)
+	variance := make([]float64, nPeriods)
 	lower := make([]float64, nPeriods)
 	upper := make([]float64, nPeriods)
 	col := make([]float64, nSim)
@@ -263,11 +344,27 @@ func (m *ARIMA) PredictBoot(nPeriods int, alpha float64, nSim int, seed uint64, 
 			sum += v
 		}
 		mean[h] = sum / float64(nSim)
+		// Empirical variance (sample, divisor n−1). PRED-VAR exposes
+		// this so callers don't have to recompute from Paths.
+		ssq := 0.0
+		for _, v := range col {
+			d := v - mean[h]
+			ssq += d * d
+		}
+		if nSim > 1 {
+			variance[h] = ssq / float64(nSim-1)
+		}
 		sort.Float64s(col)
 		lower[h] = quantile(col, loQ)
 		upper[h] = quantile(col, hiQ)
 	}
-	return &BootResult{Mean: mean, Lower: lower, Upper: upper, Paths: paths}, nil
+	return &BootResult{
+		Mean:     mean,
+		Variance: variance,
+		Lower:    lower,
+		Upper:    upper,
+		Paths:    paths,
+	}, nil
 }
 
 // quantile linear-interpolates the q-th quantile of a sorted slice.

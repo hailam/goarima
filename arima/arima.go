@@ -1377,6 +1377,79 @@ func (m *ARIMA) extendDriftIfNeeded(futureExog [][]float64, nPeriods int) ([][]f
 	return out, nil
 }
 
+// PredictVar returns the per-step forecast variance for nPeriods ahead.
+// Variance at horizon h is `σ² · Σ_{i=0..h} psi[i]²` where `psi` are
+// the MA(∞) coefficients of the fitted ARIMA — same computation that
+// drives Predict's CI bands but exposed directly so callers can build
+// custom intervals (e.g. asymmetric or non-Gaussian) without
+// reverse-engineering the bands.
+//
+// When the model was fitted with Box-Cox (`m.Lambda != nil`), the
+// returned variance is on the **model (post-transform) scale**. There's
+// no closed-form variance on the original scale because the Box-Cox
+// inverse is non-linear. For original-scale uncertainty use Predict's
+// bands (which inverse-transform endpoints) or PredictBoot (empirical
+// quantiles on inverted paths).
+//
+// futureExog is required when the model was fitted with exog (validated
+// for shape) but does NOT affect the variance — variance is determined
+// by AR/MA structure and σ², not by the exog values. Argument kept for
+// API symmetry with Predict.
+//
+// Closes PRED-VAR.
+func (m *ARIMA) PredictVar(nPeriods int, futureExog [][]float64) ([]float64, error) {
+	if !m.fitted {
+		return nil, errors.New("model not fitted")
+	}
+	if nPeriods <= 0 {
+		return []float64{}, nil
+	}
+	var driftErr error
+	futureExog, driftErr = m.extendDriftIfNeeded(futureExog, nPeriods)
+	if driftErr != nil {
+		return nil, driftErr
+	}
+	if m.nExog > 0 {
+		if futureExog == nil || len(futureExog) != nPeriods {
+			return nil, fmt.Errorf("future exog rows (%d) must match nPeriods (%d)",
+				len(futureExog), nPeriods)
+		}
+		for i, row := range futureExog {
+			if len(row) != m.nExog {
+				return nil, fmt.Errorf("future exog row %d cols (%d) must match training (%d)",
+					i, len(row), m.nExog)
+			}
+		}
+	} else if futureExog != nil {
+		return nil, errors.New("model was fitted without exog; do not pass futureExog")
+	}
+	psi := m.ensurePsiAtLeast(nPeriods)
+	out := make([]float64, nPeriods)
+	cum := 0.0
+	for h := 0; h < nPeriods; h++ {
+		if h < len(psi) {
+			cum += psi[h] * psi[h]
+		}
+		out[h] = m.sigma2 * cum
+	}
+	return out, nil
+}
+
+// PredictSE returns per-step forecast standard error: sqrt(PredictVar).
+// See PredictVar for caveats (model-scale under Box-Cox; futureExog
+// kept for symmetry but doesn't affect output).
+func (m *ARIMA) PredictSE(nPeriods int, futureExog [][]float64) ([]float64, error) {
+	v, err := m.PredictVar(nPeriods, futureExog)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]float64, len(v))
+	for i, vi := range v {
+		out[i] = math.Sqrt(vi)
+	}
+	return out, nil
+}
+
 // Predict produces nPeriods forward forecasts. If alpha > 0, lower/upper
 // confidence intervals are returned alongside; otherwise lower/upper are nil.
 //
