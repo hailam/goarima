@@ -107,7 +107,7 @@ func kalmanSARIMAXAbs(
 			K[i] = PzT[i] * invF
 			a[i] += K[i] * v
 		}
-		// ZP[j] = sum_i z[i]*P[i,j]; then P -= K * ZP (rank-1 update).
+		// ZP[j] = sum_i z[i]*P[i,j].
 		for j := 0; j < rd; j++ {
 			s := 0.0
 			for i := 0; i < rd; i++ {
@@ -115,11 +115,25 @@ func kalmanSARIMAXAbs(
 			}
 			PzT[j] = s // reuse buffer as ZP
 		}
+		// KAL-2: Joseph-form covariance update (replaces rank-1 form).
+		// Generalises the kalman.go specialisation (where H = [1,0,…,0]
+		// makes ZP[j] = P[0,j] = row0[j]) to a general Z row vector:
+		//   P_new[i,j] = P[i,j] - K[i]·ZP[j] - K[j]·ZP[i] + K[i]·K[j]·F
+		// Symmetric by construction; preserves PSD against rounding.
+		// Same root-cause mitigation as kalman.go's KAL-1 fix.
+		//
+		// Implemented as full rd×rd traversal even though the result
+		// is symmetric — the alternative (upper-triangle + mirror)
+		// requires strided writes to P[j*rd+i] which cache-thrash
+		// more than the saved arithmetic costs. Sequential writes to
+		// P[base+j] beat the symmetric optimisation in benches.
 		for i := 0; i < rd; i++ {
 			ki := K[i]
+			zpi := PzT[i]
 			base := i * rd
 			for j := 0; j < rd; j++ {
-				P[base+j] -= ki * PzT[j]
+				kj := K[j]
+				P[base+j] += -ki*PzT[j] - kj*zpi + ki*kj*F
 			}
 		}
 		if t >= burn {

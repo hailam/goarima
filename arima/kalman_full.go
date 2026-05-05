@@ -223,11 +223,28 @@ func kalmanARIMAFullImpl(
 				K[i] = Mstar[i] * invF
 				a[i] += K[i] * v
 			}
+			// KAL-2: Joseph-form covariance update on the post-diffuse
+			// path (symmetric Pstar, generic z row → Mstar = Pstar·z'):
+			//   Pstar_new[i,j] = Pstar[i,j] - K[i]·Mstar[j] - K[j]·Mstar[i] + K[i]·K[j]·F
+			// PSD-preserving against rounding error; matches the
+			// Joseph fix in kalman.go (KAL-1) extended to the
+			// integrated-state-space NonSimpleDifferencing path.
+			//
+			// The DIFFUSE-phase update above uses Koopman-Durbin's
+			// (1997) different formulation (Pinf jointly updated with
+			// Pstar via Finf-scaling) and is intentionally not
+			// converted — that's a separate stability analysis.
+			//
+			// Full rd×rd traversal beats upper-triangle + mirror: the
+			// alternative cache-thrashes on the strided Pstar[j*rd+i]
+			// writes more than the saved arithmetic recovers.
 			for i := 0; i < rd; i++ {
 				ki := K[i]
+				mi := Mstar[i]
 				base := i * rd
 				for j := 0; j < rd; j++ {
-					Pstar[base+j] -= ki * Mstar[j]
+					kj := K[j]
+					Pstar[base+j] += -ki*Mstar[j] - kj*mi + ki*kj*F
 				}
 			}
 			logF += math.Log(F)
