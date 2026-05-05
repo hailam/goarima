@@ -10,6 +10,11 @@ import (
 // expandSMA) together account for >50% of allocations during a Fit;
 // pooling their internal buffers eliminates that pressure.
 //
+// KAL-WORKSPACE extends this with `kalman`, the buffer set used by
+// `kalmanARMALikelihoodInto` — 9 more allocations per likelihood call
+// pooled, which dominates Kalman-path Fit allocations once the
+// expand/transparams chain is pooled.
+//
 // Acquired via the package-level pool; each goroutine gets its own
 // scratch in the parallelGradient case.
 type paramScratch struct {
@@ -25,6 +30,28 @@ type paramScratch struct {
 
 	// expandSMA scratch.
 	expThetaA, expThetaB, expThetaC, expThetaOut []float64
+
+	// kalmanARMALikelihoodInto scratch — see KAL-WORKSPACE.
+	kalman kalmanWorkspace
+}
+
+// kalmanWorkspace holds the 9 reusable buffers that
+// kalmanARMALikelihood would otherwise allocate per call. Sized lazily
+// to fit the largest (n, r) seen in the current Fit; subsequent calls
+// with smaller shapes reuse the leading prefix.
+type kalmanWorkspace struct {
+	nzT  []tNZ     // sparse-T entries, len ≤ 2r
+	Rvec []float64 // R selection vector, len r
+	RRt  []float64 // RR' precomputed, len r*r (zeroed each call)
+	a    []float64 // state mean, len r (zeroed each call)
+	K    []float64 // Kalman gain, len r
+	row0 []float64 // P[0,:] snapshot, len r
+	newA []float64 // predicted state, len r
+	TP   []float64 // T·P, len r*r (zeroed each call)
+	newP []float64 // predicted covariance, len r*r
+	// (innov omitted from the workspace — Fit's compute closure throws
+	// it away; allocating it would be wasted. Internal callers that
+	// need innovations use the legacy kalmanARMALikelihood entry point.)
 }
 
 var paramScratchPool = sync.Pool{

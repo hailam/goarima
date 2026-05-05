@@ -558,7 +558,8 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			ll, _, _ := armaCSS(r, fullPhi, fullTheta)
 			return ll
 		default:
-			ll, _, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
+			// KAL-WORKSPACE: pooled buffers via paramScratch.kalman.
+			ll, _ := kalmanARMALikelihoodInto(r, fullPhi, fullTheta, &s.kalman)
 			if math.IsNaN(ll) || math.IsInf(ll, 0) {
 				return math.Inf(1)
 			}

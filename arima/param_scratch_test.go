@@ -81,6 +81,56 @@ func TestParamScratch_Equivalence(t *testing.T) {
 	}
 }
 
+// KAL-WORKSPACE: kalmanARMALikelihoodInto must produce bit-identical
+// (negLL, sigma²) to kalmanARMALikelihood across a range of input
+// shapes and reused workspaces.
+func TestKalmanARMALikelihoodInto_Equivalence(t *testing.T) {
+	rng := rand.New(rand.NewPCG(31, 32))
+	scratch := acquireParamScratch()
+	defer releaseParamScratch(scratch)
+
+	for trial := 0; trial < 20; trial++ {
+		// Random ARMA shape: p, q in 0..4, n in 50..200.
+		p := rng.IntN(5)
+		q := rng.IntN(5)
+		if p+q == 0 {
+			p = 1
+		}
+		n := 50 + rng.IntN(150)
+
+		// Synthesize a stationary ARMA series.
+		phi := make([]float64, p)
+		for i := range phi {
+			phi[i] = 0.1 + 0.1*rng.Float64() // small AR coefs to stay stationary
+		}
+		theta := make([]float64, q)
+		for i := range theta {
+			theta[i] = 0.1 + 0.2*rng.Float64()
+		}
+		y := make([]float64, n)
+		for i := 1; i < n; i++ {
+			ar := 0.0
+			for j, ph := range phi {
+				if i-1-j >= 0 {
+					ar += ph * y[i-1-j]
+				}
+			}
+			y[i] = ar + rng.NormFloat64()
+		}
+
+		wantNeg, wantSig, _ := kalmanARMALikelihood(y, phi, theta)
+		gotNeg, gotSig := kalmanARMALikelihoodInto(y, phi, theta, &scratch.kalman)
+
+		if gotNeg != wantNeg {
+			t.Errorf("trial %d (p=%d q=%d n=%d): negLL got %g want %g (Δ=%g)",
+				trial, p, q, n, gotNeg, wantNeg, gotNeg-wantNeg)
+		}
+		if gotSig != wantSig {
+			t.Errorf("trial %d: sigma² got %g want %g", trial, gotSig, wantSig)
+		}
+	}
+}
+
 // G-NEW-2: unpackParamsXInto must produce values matching unpackParamsX.
 func TestUnpackParamsXInto_Equivalence(t *testing.T) {
 	rng := rand.New(rand.NewPCG(11, 12))

@@ -79,6 +79,156 @@ func PublicKalmanLL(y, phi, theta []float64) (float64, float64, []float64) {
 	return kalmanARMALikelihood(y, phi, theta)
 }
 
+// kalmanARMALikelihoodInto is the buffer-reuse variant of
+// kalmanARMALikelihood used by Fit's hot path. Identical algorithm; the
+// 9 r-sized / r²-sized / 2r-sized scratch slices are taken from `ws`
+// instead of being allocated per call.
+//
+// Returns negLogLik and sigma². The innovations are NOT returned —
+// Fit's compute closure discards them, and skipping their allocation is
+// half the point of this entry point. Callers that need innovations
+// (Summary's Hessian probe, integration tests) keep using
+// kalmanARMALikelihood.
+func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (negLogLik, sigma2 float64) {
+	n := len(y)
+	p := len(phi)
+	q := len(theta)
+	r := p
+	if q+1 > r {
+		r = q + 1
+	}
+	if r == 0 {
+		sse := 0.0
+		for _, v := range y {
+			sse += v * v
+		}
+		s2 := sse / float64(n)
+		if s2 <= 0 {
+			return math.Inf(1), 0
+		}
+		return float64(n) / 2 * (math.Log(2*math.Pi*s2) + 1), s2
+	}
+
+	// nzT — capacity 2r, length grown to actual nz count below.
+	if cap(ws.nzT) < 2*r {
+		ws.nzT = make([]tNZ, 0, 2*r)
+	} else {
+		ws.nzT = ws.nzT[:0]
+	}
+	for i := 0; i < r; i++ {
+		if i < p && phi[i] != 0 {
+			ws.nzT = append(ws.nzT, tNZ{i, 0, phi[i]})
+		}
+		if i+1 < r {
+			ws.nzT = append(ws.nzT, tNZ{i, i + 1, 1})
+		}
+	}
+	nzT := ws.nzT
+
+	// Rvec — zeroed because we only set the [0..q] entries explicitly.
+	ws.Rvec = ensureLenZ(ws.Rvec, r)
+	Rvec := ws.Rvec
+	Rvec[0] = 1
+	for j := 0; j < q; j++ {
+		if j+1 < r {
+			Rvec[j+1] = theta[j]
+		}
+	}
+
+	// RRt — zeroed because the inner loop only writes when ri != 0.
+	ws.RRt = ensureLenZ(ws.RRt, r*r)
+	RRt := ws.RRt
+	for i := 0; i < r; i++ {
+		ri := Rvec[i]
+		if ri == 0 {
+			continue
+		}
+		off := i * r
+		for j := 0; j < r; j++ {
+			RRt[off+j] = ri * Rvec[j]
+		}
+	}
+
+	P, _ := stationaryCovGardner(phi, theta)
+
+	// a — must be zeroed (state mean starts at 0).
+	ws.a = ensureLenZ(ws.a, r)
+	a := ws.a
+	ws.K = ensureLen(ws.K, r)
+	K := ws.K
+	ws.row0 = ensureLen(ws.row0, r)
+	row0 := ws.row0
+	ws.newA = ensureLen(ws.newA, r)
+	newA := ws.newA
+	ws.TP = ensureLen(ws.TP, r*r)
+	TP := ws.TP
+	ws.newP = ensureLen(ws.newP, r*r)
+	newP := ws.newP
+
+	logF := 0.0
+	sumVF := 0.0
+
+	for t := 0; t < n; t++ {
+		v := y[t] - a[0]
+		F := P[0]
+		if F <= 0 || math.IsNaN(F) {
+			return math.Inf(1), 0
+		}
+		invF := 1.0 / F
+		for i := 0; i < r; i++ {
+			K[i] = P[i*r] * invF
+			a[i] += K[i] * v
+		}
+		copy(row0, P[:r])
+		for i := 0; i < r; i++ {
+			ki := K[i]
+			r0i := row0[i]
+			off := i * r
+			for j := 0; j < r; j++ {
+				kj := K[j]
+				P[off+j] += -ki*row0[j] - kj*r0i + ki*kj*F
+			}
+		}
+		logF += math.Log(F)
+		sumVF += v * v * invF
+
+		for i := 0; i < r; i++ {
+			newA[i] = 0
+		}
+		for _, e := range nzT {
+			newA[e.i] += e.v * a[e.j]
+		}
+		copy(a, newA)
+
+		for k := range TP {
+			TP[k] = 0
+		}
+		for _, e := range nzT {
+			ti := e.i * r
+			tj := e.j * r
+			tv := e.v
+			for j := 0; j < r; j++ {
+				TP[ti+j] += tv * P[tj+j]
+			}
+		}
+		copy(newP, RRt)
+		for i := 0; i < r; i++ {
+			row := i * r
+			for _, e := range nzT {
+				newP[row+e.i] += TP[row+e.j] * e.v
+			}
+		}
+		P, newP = newP, P
+	}
+
+	if sumVF <= 0 {
+		return math.Inf(1), 0
+	}
+	s2 := sumVF / float64(n)
+	negLL := 0.5 * (float64(n)*(math.Log(2*math.Pi*s2)+1) + logF)
+	return negLL, s2
+}
+
 // armaCSS evaluates the Conditional Sum of Squares for an ARMA(p,q) model
 // over a (centered) series y. Returns negLogLik (proportional to log SSE) and
 // the estimated sigma^2.
