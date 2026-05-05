@@ -183,6 +183,117 @@ func TestGAP2_ApproximationRespectsExplicitMethodML(t *testing.T) {
 	}
 }
 
+// GAP-3: Stationary=true must constrain the search to d=D=0 regardless
+// of the input series's actual differencing requirement. AirPassengers
+// would normally pick d=1 / D=1 (KPSS + OCSB both detect non-stationarity)
+// — under Stationary=true, the picked model must have d=D=0.
+func TestGAP3_StationaryConstrainsDifferencing(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m, err := AutoArima(logAp, nil, AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder:   5,
+		MaxIter:    50,
+		IC:         AICc,
+		Stationary: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Order.D != 0 || m.Seasonal.D != 0 {
+		t.Errorf("Stationary=true: got Order.D=%d Seasonal.D=%d, both must be 0",
+			m.Order.D, m.Seasonal.D)
+	}
+}
+
+// GAP-4: AllowDrift=BoolPtr(true) on a d>0 series must include the drift
+// term even though the default for d>0 is no-intercept. Symmetric for
+// AllowMean on d=0 series.
+func TestGAP4_AllowDriftOverride(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	// Force drift on a (0,1,1)(0,1,1) candidate that defaults to no-intercept.
+	m, err := AutoArima(logAp, nil, AutoArimaOpts{
+		M: 12, MaxP: 1, MaxQ: 1, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder:   3,
+		MaxIter:    50,
+		IC:         AICc,
+		AllowDrift: BoolPtr(true),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !m.WithIntercept {
+		t.Errorf("AllowDrift=true on d>0 model: WithIntercept must be true; got %v", m.WithIntercept)
+	}
+}
+
+func TestGAP4_AllowMeanOverride(t *testing.T) {
+	rng := rand.New(rand.NewPCG(11, 12))
+	n := 200
+	y := make([]float64, n)
+	for i := 1; i < n; i++ {
+		y[i] = 0.5*y[i-1] + rng.NormFloat64() // stationary AR(1)
+	}
+	// Force mean OFF on a stationary (d=0) series — opposite of the default.
+	m, err := AutoArima(y, nil, AutoArimaOpts{
+		M: 0, MaxP: 2, MaxQ: 2,
+		MaxOrder:   4,
+		MaxIter:    50,
+		IC:         AICc,
+		Stationary: true,
+		AllowMean:  BoolPtr(false),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.WithIntercept {
+		t.Errorf("AllowMean=false: WithIntercept must be false; got %v", m.WithIntercept)
+	}
+}
+
+// GAP-5: m.LjungBoxWithDF must accept an explicit fitdf and produce a
+// p-value that differs from m.LjungBox(h)'s when fitdf differs from
+// the auto-derived ARMA degrees-of-freedom.
+func TestGAP5_LjungBoxWithDFOverride(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m := NewARIMA(Order{P: 1, D: 1, Q: 1})
+	m.Seasonal = SeasonalOrder{P: 0, D: 1, Q: 1, M: 12}
+	m.MaxIter = 100
+	if err := m.Fit(logAp, nil); err != nil {
+		t.Fatal(err)
+	}
+	autoQ, autoP, err := m.LjungBox(24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Override fitdf to a deliberately-different value.
+	overrideQ, overrideP, err := m.LjungBoxWithDF(24, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if autoQ != overrideQ {
+		t.Errorf("Q-stat must be invariant to fitdf; got auto=%g override=%g", autoQ, overrideQ)
+	}
+	// p-value depends on fitdf via the chi-squared df adjustment; if the
+	// auto-derived fitdf and our override are different, p must change.
+	armaDoF := m.Order.P + m.Order.Q + m.Seasonal.P + m.Seasonal.Q
+	if armaDoF != 5 && autoP == overrideP {
+		t.Errorf("p-value should depend on fitdf (auto=%d, override=5): got %g == %g",
+			armaDoF, autoP, overrideP)
+	}
+}
+
 // GAP-1 regression: AutoArimaOpts{}.Method (zero value) must resolve to
 // MethodCSSML — matching documented default and pmdarima/R behaviour.
 // Pre-fix the iota order made MethodCSS the zero value, silently

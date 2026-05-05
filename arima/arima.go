@@ -961,6 +961,32 @@ func unpackParamsX(params []float64, p, q, P, Q int, withIntercept bool, k int) 
 }
 
 // IC returns the chosen information criterion of the fitted model.
+//
+// Convention: AIC / AICc / BIC / HQIC are computed as
+//
+//	AIC  = 2k − 2·logL
+//	AICc = AIC + 2k(k+1)/(n−k−1)
+//	BIC  = log(n)·k − 2·logL
+//	HQIC = 2·log(log(n))·k − 2·logL
+//
+// where k counts σ² (always +1) plus the AR/MA/seasonal-AR/seasonal-MA
+// counts, plus 1 if WithIntercept, plus the exog regressor count.
+//
+// `logL` is the maximised log-likelihood as stored in `m.logL`. Whether
+// it includes the Gaussian normalising constants `(n/2)·log(2π) + n/2`
+// depends on the fit Method:
+//
+//   - **MethodCSSML / MethodML** (Kalman path) — INCLUDES the constants.
+//     Reported logL = −0.5·(n·(log(2π·σ²)+1) + Σ log F_t). Same scale as
+//     R's `stats::arima` and Python's `statsmodels.SARIMAX` — directly
+//     comparable.
+//   - **MethodCSS** (CSS path) — EXCLUDES the constants. Reported
+//     logL = −(n/2)·log(σ²). To get an MLE-comparable value add
+//     `n·(log(2π) + 1) / 2`. R's `stats::arima(method="CSS")` follows
+//     the same drop-the-constants convention.
+//
+// Cross-method AIC comparisons therefore offset by `n·(log(2π) + 1)`;
+// within-method comparisons (the typical use case) are unaffected.
 func (m *ARIMA) IC(ic InfoCriterion) float64 {
 	if !m.fitted {
 		return math.Inf(1)
@@ -1000,6 +1026,12 @@ func (m *ARIMA) BIC() float64 { return m.IC(BIC) }
 func (m *ARIMA) AICc() float64 { return m.IC(AICc) }
 
 // LogLikelihood returns the maximised log-likelihood.
+//
+// **Includes Gaussian normalising constants under MethodCSSML / MethodML
+// (the Kalman path) — directly comparable to R's `logLik(stats::arima(...))`
+// and statsmodels SARIMAX results. EXCLUDES the constants under
+// MethodCSS, matching R's `stats::arima(method="CSS")` convention; add
+// `n·(log(2π) + 1) / 2` to convert.** See `IC()` doc for details.
 func (m *ARIMA) LogLikelihood() float64 { return m.logL }
 
 // Sigma2 returns the residual variance estimate.

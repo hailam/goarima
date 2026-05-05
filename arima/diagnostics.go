@@ -84,6 +84,30 @@ func (m *ARIMA) BoxPierce(h int) (Q, p float64, err error) {
 	return BoxPierce(m.Resid(), h, m.armaDoF())
 }
 
+// LjungBoxWithDF runs the Ljung-Box test with an explicit fitdf override
+// (model degrees-of-freedom adjustment). The default `m.LjungBox(h)`
+// auto-derives fitdf from `p+q+P+Q`; this variant lets callers match
+// R's `Box.test(resid, lag=h, fitdf=...)` when they need to override
+// (e.g. when comparing residuals from a model fit elsewhere or when
+// reproducing a published test where fitdf was set differently).
+//
+// Closes GAP-5.
+func (m *ARIMA) LjungBoxWithDF(h, fitdf int) (Q, p float64, err error) {
+	if !m.fitted {
+		return 0, 0, errors.New("arima: model not fitted")
+	}
+	return LjungBox(m.Resid(), h, fitdf)
+}
+
+// BoxPierceWithDF is the explicit-fitdf variant of m.BoxPierce(h).
+// See LjungBoxWithDF for rationale.
+func (m *ARIMA) BoxPierceWithDF(h, fitdf int) (Q, p float64, err error) {
+	if !m.fitted {
+		return 0, 0, errors.New("arima: model not fitted")
+	}
+	return BoxPierce(m.Resid(), h, fitdf)
+}
+
 // armaDoF returns p + q + P + Q — the count of fitted ARMA parameters
 // used to adjust df in the portmanteau test.
 func (m *ARIMA) armaDoF() int {

@@ -39,6 +39,17 @@ type AutoArimaOpts struct {
 	MaxD     int // upper bound for non-seasonal d (default 2)
 	MaxCapD  int // upper bound for seasonal D (default 1)
 
+	// Stationary, when true, restricts the search to (p, 0, q)(P, 0, Q)
+	// — d = D = 0 — and skips the unit-root tests entirely. Useful when
+	// you want to model the level series rather than its differences,
+	// e.g. when y is already stationary by construction (residuals from
+	// another model, demeaned arrival counts, etc.). Mirrors R's
+	// `auto.arima(..., stationary=TRUE)`.
+	//
+	// When false (default), the existing KPSS / OCSB / CH tests pick d
+	// and D as before. Closes GAP-3.
+	Stationary bool
+
 	Alpha float64    // alpha for diff tests
 	Test  NDiffsTest // unit-root test (default KPSS)
 
@@ -52,6 +63,22 @@ type AutoArimaOpts struct {
 	SeasonalTest NSDiffsTest
 
 	WithIntercept *bool // explicit override; nil = auto
+
+	// AllowDrift overrides WithIntercept's behaviour when d > 0 (i.e. when
+	// the model has a non-seasonal differencing operator). nil means
+	// "fall through to WithIntercept logic". Set to floatPtr(true) /
+	// floatPtr(false) to force drift on/off independently of the d=0
+	// mean-term decision.
+	//
+	// AllowMean is the symmetric override for the d = 0 case.
+	//
+	// Mirrors R's `auto.arima(..., allowdrift=TRUE, allowmean=TRUE)`
+	// which lets users control the two cases independently. goarima
+	// previously collapsed both into WithIntercept; these knobs let
+	// users separate them. Closes GAP-4. Helper `BoolPtr(v)` provided
+	// to make the call site readable.
+	AllowDrift *bool
+	AllowMean  *bool
 
 	// Information criterion to minimize.
 	IC InfoCriterion
@@ -163,6 +190,11 @@ type AutoArimaOpts struct {
 	DiffuseConvention DiffuseConv
 }
 
+// BoolPtr returns a pointer to the given bool. Convenience helper for
+// AutoArimaOpts fields that need explicit override (AllowDrift, AllowMean,
+// WithIntercept) — distinguishes "nil = use default" from "false = force off".
+func BoolPtr(v bool) *bool { return &v }
+
 // AutoArima runs model selection over ARIMA(p,d,q)(P,D,Q,m).
 // exog is optional (nil for none); if provided, every fitted candidate
 // includes the same regressors and the chosen IC compares like-for-like.
@@ -221,6 +253,17 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	}
 	if opts.MaxCapD == 0 {
 		opts.MaxCapD = 1
+	}
+	// GAP-3: Stationary forces d = D = 0 — applied AFTER the default-fill
+	// block so it overrides MaxD=2 / MaxCapD=1. We also pin manual
+	// D=0/Dd=0 so the KPSS / OCSB / CH unit-root tests don't run.
+	if opts.Stationary {
+		opts.MaxD = 0
+		opts.MaxCapD = 0
+		opts.D = 0
+		opts.HasD = true
+		opts.Dd = 0
+		opts.HasDd = true
 	}
 	if opts.Alpha == 0 {
 		opts.Alpha = 0.05
@@ -400,10 +443,23 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		}
 	}
 
+	// GAP-4: AllowDrift / AllowMean give independent control over the
+	// d > 0 (drift) vs d = 0 (mean) case. AllowDrift = nil and
+	// AllowMean = nil falls through to the existing WithIntercept logic.
 	withIntercept := false
-	if opts.WithIntercept != nil {
+	switch {
+	case (d+D) > 0 && opts.AllowDrift != nil:
+		// Drift case: explicit AllowDrift wins.
+		withIntercept = *opts.AllowDrift
+	case (d+D) == 0 && opts.AllowMean != nil:
+		// Mean case: explicit AllowMean wins.
+		withIntercept = *opts.AllowMean
+	case opts.WithIntercept != nil:
+		// Either case, no per-case override: WithIntercept applies.
 		withIntercept = *opts.WithIntercept
-	} else {
+	default:
+		// Auto: default-on for d=0 (mean), default-off for d>0 (drift) —
+		// matching R's auto.arima default of allowmean=TRUE, allowdrift=FALSE.
 		withIntercept = (d + D) == 0
 	}
 
