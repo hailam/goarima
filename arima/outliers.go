@@ -7,24 +7,36 @@ import (
 )
 
 // OutlierType enumerates the supported outlier intervention types.
+// goarima implements the four types from R's tsoutliers vocabulary:
 //
-// Additional types from R's tsoutliers vocabulary (TC = temporary change,
-// IO = innovational outlier) are not implemented; AO + LS cover the most
-// common contamination patterns (one-off shocks, regime changes).
+//   - AO (Additive Outlier): one-off shock at a single timestep.
+//   - LS (Level Shift): permanent step from a timestep onward.
+//   - TC (Temporary Change): exponentially-decaying impulse with rate
+//     δ ∈ (0, 1). Models a shock that fades over time (post-news effect,
+//     post-policy decay).
+//   - IO (Innovational Outlier): perturbation on the innovation rather
+//     than the observation; propagates through the ARMA filter as a
+//     ψ-weighted decay. Useful for cascading shocks.
 type OutlierType int
 
 const (
 	OutlierAO OutlierType = iota // Additive Outlier (impulse at one timestep)
 	OutlierLS                    // Level Shift  (step from a timestep onward)
+	OutlierTC                    // Temporary Change (geometrically-decaying impulse)
+	OutlierIO                    // Innovational Outlier (perturbation on the innovation)
 )
 
-// String returns "AO" or "LS".
+// String returns "AO", "LS", "TC", or "IO".
 func (t OutlierType) String() string {
 	switch t {
 	case OutlierAO:
 		return "AO"
 	case OutlierLS:
 		return "LS"
+	case OutlierTC:
+		return "TC"
+	case OutlierIO:
+		return "IO"
 	}
 	return fmt.Sprintf("OutlierType(%d)", int(t))
 }
@@ -65,10 +77,21 @@ type DetectOutliersOpts struct {
 	Method  Method
 	Lambda  *float64
 	Lambda2 float64
+
+	// TCDecayRate is the geometric decay rate δ ∈ (0, 1) used when
+	// scoring/building TC (Temporary Change) candidates. TC's
+	// regressor at time τ is δ^(t-τ) for t ≥ τ. Lower δ → faster
+	// decay; higher δ → slower fade. Default 0.7 (matches R's
+	// tsoutliers default).
+	//
+	// Only used when OutlierTC appears in Types.
+	TCDecayRate float64
 }
 
-// DetectOutliers identifies AO and LS outliers using a simplified
-// Chen-Liu (1993) iterative search:
+// DetectOutliers identifies AO, LS, TC, and IO outliers using a
+// simplified Chen-Liu (1993) iterative search. The Types option
+// selects which subset to scan — default is {AO, LS} for backward
+// compatibility; opt in to {AO, LS, TC, IO} for full coverage.
 //
 //  1. Fit a base ARIMA on y.
 //  2. Compute π-weights of the inverse ARMA filter (including the
@@ -108,7 +131,12 @@ func DetectOutliers(y []float64, opts DetectOutliersOpts) ([]Outlier, *ARIMA, er
 		}
 	}
 	if len(opts.Types) == 0 {
+		// Default kept at {AO, LS} for backward compatibility with
+		// pre-OUT-TC-IO callers. TC/IO must be explicitly opted in.
 		opts.Types = []OutlierType{OutlierAO, OutlierLS}
+	}
+	if opts.TCDecayRate <= 0 || opts.TCDecayRate >= 1 {
+		opts.TCDecayRate = 0.7
 	}
 	if opts.Order == (Order{}) && opts.Seasonal == (SeasonalOrder{}) {
 		opts.Order = Order{D: 1, Q: 1}
@@ -183,22 +211,39 @@ func DetectOutliers(y []float64, opts DetectOutliersOpts) ([]Outlier, *ARIMA, er
 					continue
 				}
 				// Build signature on the differenced timeline and project.
+				// AO:  sig(t,τ) = π_{t-τ}                         for t ≥ τ
+				// LS:  sig(t,τ) = Σ_{k=0..t-τ} π_k                 (cumulative)
+				// TC:  sig(t,τ) = Σ_{k=0..t-τ} π_k · δ^(t-τ-k)     (geometric ⊗ π)
+				// IO:  sig(t,τ) = 1 if t == τ, else 0              (residual impulse)
 				num := 0.0
 				den := 0.0
-				cum := 0.0 // running cumulative sum of π for LS
+				lsCum := 0.0
+				tcCum := 0.0
 				for t := tau; t < n; t++ {
 					k := t - tau
 					var sig float64
-					if k < len(pi) {
-						if typ == OutlierAO {
+					switch typ {
+					case OutlierAO:
+						if k < len(pi) {
 							sig = pi[k]
-						} else {
-							cum += pi[k]
-							sig = cum
 						}
-					} else {
-						if typ == OutlierLS {
-							sig = cum
+					case OutlierLS:
+						if k < len(pi) {
+							lsCum += pi[k]
+						}
+						sig = lsCum
+					case OutlierTC:
+						pk := 0.0
+						if k < len(pi) {
+							pk = pi[k]
+						}
+						tcCum = opts.TCDecayRate*tcCum + pk
+						sig = tcCum
+					case OutlierIO:
+						if k == 0 {
+							sig = 1
+						} else {
+							sig = 0
 						}
 					}
 					if t < dTotal {
@@ -229,7 +274,18 @@ func DetectOutliers(y []float64, opts DetectOutliersOpts) ([]Outlier, *ARIMA, er
 			break
 		}
 
-		col := buildOutlierRegressor(n, bestT, bestType)
+		// IO regressor uses the CURRENT model's MA(∞) ψ-weights (the
+		// shape of the innovation impulse response). Use cur.psi at
+		// the moment of detection — subsequent refits may shift psi
+		// slightly but the regressor is fixed once added (matches
+		// tsoutliers' fast-mode behaviour). For non-IO types ψ is unused.
+		var psiSnapshot []float64
+		if bestType == OutlierIO {
+			if pc := cur.psi.Load(); pc != nil {
+				psiSnapshot = pc.values
+			}
+		}
+		col := buildOutlierRegressor(n, bestT, bestType, opts.TCDecayRate, psiSnapshot)
 		reg = appendOutlierCol(reg, col)
 		next, ferr := fit(reg)
 		if ferr != nil {
@@ -258,7 +314,18 @@ func DetectOutliers(y []float64, opts DetectOutliersOpts) ([]Outlier, *ARIMA, er
 	return outliers, cur, nil
 }
 
-func buildOutlierRegressor(n, t int, typ OutlierType) []float64 {
+// buildOutlierRegressor builds the original-y-space exog column for an
+// outlier intervention at time t. delta is the TC decay rate (used only
+// for OutlierTC; ignored otherwise). psi is the ψ MA(∞) coefficient
+// vector of the current ARIMA model (used only for OutlierIO; ignored
+// otherwise).
+//
+//   - AO: impulse — col[t] = 1, 0 elsewhere
+//   - LS: step — col[i] = 1 for i ≥ t
+//   - TC: geometric decay — col[i] = δ^(i-t) for i ≥ t
+//   - IO: ψ-weighted impulse — col[i] = ψ_(i-t) for i ≥ t (the model's
+//     MA(∞) impulse response)
+func buildOutlierRegressor(n, t int, typ OutlierType, delta float64, psi []float64) []float64 {
 	col := make([]float64, n)
 	switch typ {
 	case OutlierAO:
@@ -268,6 +335,23 @@ func buildOutlierRegressor(n, t int, typ OutlierType) []float64 {
 	case OutlierLS:
 		for i := t; i < n; i++ {
 			col[i] = 1
+		}
+	case OutlierTC:
+		// δ^k recursion: col[t]=1, col[t+1]=δ, col[t+2]=δ², …
+		v := 1.0
+		for i := t; i < n; i++ {
+			col[i] = v
+			v *= delta
+		}
+	case OutlierIO:
+		// ψ-weighted impulse response (model's MA(∞)). For lags past
+		// len(psi) we leave the regressor at 0 — the truncation matches
+		// the model's psi-cache truncation.
+		for i := t; i < n; i++ {
+			k := i - t
+			if k < len(psi) {
+				col[i] = psi[k]
+			}
 		}
 	}
 	return col

@@ -55,20 +55,34 @@ That's `O(n × types × maxIter × fit_cost)`. For `n=200`, `types=2`,
 The residual-projection approach is `O(n × types × maxIter)` plus
 `maxIter` refits, i.e., ~5× a normal Fit on n=200 — a few hundred ms.
 
-### Chosen scope: AO + LS only
+### Scope expanded 2026-05-06: AO + LS + TC + IO (full R::tsoutliers parity)
 
-R's `tsoutliers` supports four types: AO, LS, TC (temporary change, geometric
-decay), IO (innovational outlier). We implement only AO and LS because:
+Originally shipped as AO + LS only (the dominant real-world cases). TC
+and IO added in OUT-TC-IO (2026-05-06), reaching parity with R's
+`tsoutliers::tso` vocabulary:
 
-- They cover the dominant real-world contamination shapes: one-off shocks
-  and regime changes.
-- TC adds a `δ ∈ (0,1)` decay parameter that requires a separate inner
-  search (or a pmdarima-style fixed `δ=0.7`); deferred.
-- IO is rarely useful in practice — it's mathematically equivalent to a
-  shock that propagates through the ARMA filter and is hard to interpret
-  for users who think in terms of "what happened on date X."
-- The API leaves room: `DetectOutliersOpts.Types []OutlierType` accepts
-  a list, so adding TC/IO later is non-breaking.
+- **TC (Temporary Change)**: a geometrically-decaying impulse with rate
+  δ ∈ (0, 1). The user-tunable `DetectOutliersOpts.TCDecayRate` sets δ;
+  default 0.7 matches R's `tsoutliers` default. Models a shock that
+  fades over time (post-news effect, post-policy decay).
+- **IO (Innovational Outlier)**: a perturbation on the innovation
+  rather than the observation. In residual space the signature
+  collapses to a single impulse at τ — the t-statistic is just the
+  standardized residual at τ, so detection is a max-residual scan.
+  IO's exog regressor is the model's MA(∞) impulse response ψ_(t-τ).
+
+Defaults preserved: `DetectOutliersOpts.Types` zero-value still
+produces `{AO, LS}` for backward-compatibility. Users opt in to
+`{AO, LS, TC, IO}` for full coverage.
+
+### Why TC and IO needed less code than originally feared
+
+- TC's residual-space signature is a recursion: `tcCum = δ·tcCum + π_k`.
+  Same `for t := tau; t < n` projection loop as AO/LS, just one
+  additional case.
+- IO's residual-space signature is `1 if t == τ else 0` — one trivial
+  case. The bulk of the work is the original-y exog column, which is
+  the model's ψ-vector aliased into the regressor.
 
 ### Outlier indices reported in original-time scale
 
@@ -125,7 +139,7 @@ joint estimate.
 
 ### Negative / known limitations
 
-- **No TC, no IO.** Series dominated by exponentially-decaying shocks
+- **TC and IO now supported as of 2026-05-06.** Series dominated by exponentially-decaying shocks
   (e.g. response to a marketing campaign that fades over weeks) won't
   be cleanly captured.
 - **No simultaneous-outlier refinement.** The "Stage 3" of full Chen-Liu

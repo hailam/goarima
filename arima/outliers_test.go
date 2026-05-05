@@ -78,6 +78,108 @@ func TestDetectOutliers_PlantedLS(t *testing.T) {
 	}
 }
 
+// OUT-TC-IO: detect a planted Temporary Change. A +18σ initial spike
+// at t=80 that decays geometrically with δ=0.7. Detector with TC enabled
+// must return at least one TC near 80.
+func TestDetectOutliers_PlantedTC(t *testing.T) {
+	rng := rand.New(rand.NewPCG(101, 102))
+	n := 250
+	y := make([]float64, n)
+	for i := 1; i < n; i++ {
+		y[i] = y[i-1] + rng.NormFloat64()
+	}
+	const plantIdx = 80
+	const plantMag = 18.0
+	const delta = 0.7
+	v := 1.0
+	for i := plantIdx; i < n; i++ {
+		y[i] += plantMag * v
+		v *= delta
+	}
+
+	outs, _, err := DetectOutliers(y, DetectOutliersOpts{
+		Types:       []OutlierType{OutlierAO, OutlierLS, OutlierTC, OutlierIO},
+		TCDecayRate: 0.7,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hasTC := false
+	for _, o := range outs {
+		if o.Type == OutlierTC && o.Index >= plantIdx-2 && o.Index <= plantIdx+2 {
+			hasTC = true
+			break
+		}
+	}
+	if !hasTC {
+		t.Errorf("expected TC near %d in result; got %+v", plantIdx, outs)
+	}
+}
+
+// OUT-TC-IO: detect a planted Innovational Outlier. An IO at τ
+// perturbs the innovation at time τ — equivalent to adding ω·ψ_(t-τ)
+// to y for t ≥ τ. For an ARIMA(0,1,1) random-walk-plus-MA1 default
+// model, ψ ≈ [1, 1, 1, …] (cumulative sum of MA), so an IO mimics a
+// level shift in shape but is structurally distinct.
+func TestDetectOutliers_PlantedIO(t *testing.T) {
+	rng := rand.New(rand.NewPCG(111, 112))
+	n := 200
+	// Generate ARMA(1,0) with phi=0.6 driven by epsilons we control.
+	const phi = 0.6
+	const plantIdx = 80
+	const plantMag = 25.0
+	eps := make([]float64, n)
+	for i := range eps {
+		eps[i] = rng.NormFloat64()
+	}
+	eps[plantIdx] += plantMag // innovation perturbation
+	y := make([]float64, n)
+	for i := 1; i < n; i++ {
+		y[i] = phi*y[i-1] + eps[i]
+	}
+
+	outs, _, err := DetectOutliers(y, DetectOutliersOpts{
+		Order: Order{P: 1, D: 0, Q: 0},
+		Types: []OutlierType{OutlierAO, OutlierLS, OutlierTC, OutlierIO},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Got outliers: %+v", outs)
+	// Direction check: at the plant index the largest standardised
+	// residual should appear. AO and IO are nearly indistinguishable
+	// for AR(1) (since IO becomes a single-impulse residual perturbation).
+	// Accept either type at the plant index.
+	hasAt := false
+	for _, o := range outs {
+		if o.Index >= plantIdx-1 && o.Index <= plantIdx+1 &&
+			(o.Type == OutlierIO || o.Type == OutlierAO) {
+			hasAt = true
+			break
+		}
+	}
+	if !hasAt {
+		t.Errorf("expected IO/AO near %d; got %+v", plantIdx, outs)
+	}
+}
+
+// String() coverage for new types.
+func TestOutlierType_StringCoverage(t *testing.T) {
+	for _, tc := range []struct {
+		typ  OutlierType
+		want string
+	}{
+		{OutlierAO, "AO"},
+		{OutlierLS, "LS"},
+		{OutlierTC, "TC"},
+		{OutlierIO, "IO"},
+	} {
+		if got := tc.typ.String(); got != tc.want {
+			t.Errorf("(%d).String() = %q, want %q", int(tc.typ), got, tc.want)
+		}
+	}
+}
+
 // G-NEW-3a: A clean random-walk series with no outliers should
 // return an empty outlier list — false-positive guard.
 func TestDetectOutliers_CleanSeriesIsEmpty(t *testing.T) {
