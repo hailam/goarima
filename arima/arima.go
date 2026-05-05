@@ -93,6 +93,29 @@ type ARIMA struct {
 	Lambda  *float64
 	Lambda2 float64 // additive shift before transform; ignored if Lambda is nil
 
+	// RidgePenalty is an L2 penalty on the optimizer's UNCONSTRAINED x
+	// vector — the pre-tanh AR/MA representation. Default 0.0 (off,
+	// R-parity safe).
+	//
+	// The penalty `λ · Σx²` is added to the negative log-likelihood
+	// during optimization. It prevents BFGS from pushing the
+	// unconstrained x to extreme values where `tanh(x) ≈ ±1`, i.e.
+	// where AR/MA coefficients hit the stationarity / invertibility
+	// boundary. Such boundary fits are the root cause of KAL-1: the
+	// exact-likelihood Kalman recursion blows up with `γ(0) → ∞`
+	// initial covariance.
+	//
+	// Recommended for short series (n ≤ ~50) where the likelihood
+	// surface is flat and BFGS is prone to drifting onto degenerate
+	// boundary solutions. A useful starting value is `λ = 1.0/n` —
+	// scales the regulariser to the data signal. Larger λ biases
+	// estimates more aggressively toward zero (shrinkage).
+	//
+	// Default 0.0 → KAL-1's textbook fallback handles boundary
+	// degeneracy after the fact. RidgePenalty fixes it before the
+	// fact.
+	RidgePenalty float64
+
 	// NonSimpleDifferencing fits via the integrated state-space form (R's
 	// `stats::arima` and statsmodels SARIMAX). Default false → simple
 	// differencing (pre-difference y, fit ARMA), which matches statsmodels
@@ -504,6 +527,24 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		s := acquireParamScratch()
 		defer releaseParamScratch(s)
 		phi, theta, sPhi, sTheta, _, _ := unpackParamsXInto(s, params, p, q, P, Q, m.WithIntercept, k)
+		// Small-n ridge penalty: applied to the AR/MA portion of the
+		// unconstrained x vector (indices 0..p+q+P+Q). Adding `λ·Σx²`
+		// to the negLL prevents BFGS from saturating tanh and pushing
+		// AR/MA coefs to the unit circle. Indices beyond the AR/MA
+		// region (intercept, exog β) are untouched — those don't have
+		// boundary issues. Default λ=0 makes this a no-op, preserving
+		// R-parity for existing tests.
+		var ridgePenalty float64
+		if m.RidgePenalty > 0 {
+			armaEnd := p + q + P + Q
+			if armaEnd > len(params) {
+				armaEnd = len(params)
+			}
+			for i := 0; i < armaEnd; i++ {
+				ridgePenalty += params[i] * params[i]
+			}
+			ridgePenalty *= m.RidgePenalty
+		}
 		if useStatsmodels {
 			Dord := 0
 			mPer := 0
@@ -534,7 +575,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			if math.IsNaN(ll) || math.IsInf(ll, 0) {
 				return math.Inf(1)
 			}
-			return ll
+			return ll + ridgePenalty
 		}
 		if m.NonSimpleDifferencing {
 			Dord := 0
@@ -548,7 +589,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			if math.IsNaN(ll) || math.IsInf(ll, 0) {
 				return math.Inf(1)
 			}
-			return ll
+			return ll + ridgePenalty
 		}
 		fullPhi := expandSARMAInto(s, phi, sPhi, m.Seasonal.M)
 		fullTheta := expandSMAInto(s, theta, sTheta, m.Seasonal.M)
@@ -556,14 +597,14 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		switch m.Method {
 		case MethodCSS:
 			ll, _, _ := armaCSS(r, fullPhi, fullTheta)
-			return ll
+			return ll + ridgePenalty
 		default:
 			// KAL-WORKSPACE: pooled buffers via paramScratch.kalman.
 			ll, _ := kalmanARMALikelihoodInto(r, fullPhi, fullTheta, &s.kalman)
 			if math.IsNaN(ll) || math.IsInf(ll, 0) {
 				return math.Inf(1)
 			}
-			return ll
+			return ll + ridgePenalty
 		}
 	}
 	objective := func(params []float64) float64 {
@@ -608,6 +649,20 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			fullPhi := expandSARMAInto(s, phi, sPhi, m.Seasonal.M)
 			fullTheta := expandSMAInto(s, theta, sTheta, m.Seasonal.M)
 			ll, _, _ := armaCSS(residOf(params), fullPhi, fullTheta)
+			// Ridge penalty applies in CSS warmup too — otherwise the
+			// warmup could land on a boundary point, propagating bad
+			// x0 into ML refinement.
+			if m.RidgePenalty > 0 {
+				armaEnd := p + q + P + Q
+				if armaEnd > len(params) {
+					armaEnd = len(params)
+				}
+				rp := 0.0
+				for i := 0; i < armaEnd; i++ {
+					rp += params[i] * params[i]
+				}
+				ll += m.RidgePenalty * rp
+			}
 			return ll
 		}
 		x0 = minimize(cssObj, x0, m.MaxIter, m.gradientWorkers())

@@ -169,6 +169,13 @@ type AutoArimaOpts struct {
 	// logL / σ² / AICc are reported on the Method scale, not CSS.
 	Approximation bool
 
+	// RidgePenalty propagates to every candidate fit's `m.RidgePenalty`.
+	// See ARIMA.RidgePenalty doc; default 0.0 = off (R-parity safe).
+	// Useful on short series (n ≤ 50) where AutoArima's stepwise search
+	// otherwise picks degenerate boundary models. Suggested starting
+	// value: `1.0 / len(y)`.
+	RidgePenalty float64
+
 	// Lambda (and Lambda2 shift) enable Box-Cox transformation on every
 	// candidate fit. nil → no transform. Use `floatPtr(0)` for log. Mirrors
 	// pmdarima's `lambda=` arg. Each candidate's AICc / forecast is
@@ -239,6 +246,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		m.NonSimpleDifferencing = opts.NonSimpleDifferencing
 		m.DiffuseConvention = opts.DiffuseConvention
 		m.GradientWorkers = mSearch.GradientWorkers
+		m.RidgePenalty = opts.RidgePenalty
 		if err := m.Fit(y, exog); err != nil {
 			return nil, fmt.Errorf("approximation refit failed: %w", err)
 		}
@@ -525,6 +533,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 			MaxIter:               opts.MaxIter,
 			GradientWorkers:       gradWorkers,
 			Lambda:                opts.Lambda,
+			RidgePenalty:          opts.RidgePenalty,
 			Lambda2:               opts.Lambda2,
 			NonSimpleDifferencing: opts.NonSimpleDifferencing,
 			DiffuseConvention:     opts.DiffuseConvention,
