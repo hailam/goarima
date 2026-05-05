@@ -1,6 +1,7 @@
 package arima
 
 import (
+	"math"
 	"math/rand/v2"
 	"testing"
 
@@ -122,6 +123,78 @@ func TestAutoArimaParsimonyDeltaCapsParams(t *testing.T) {
 	}
 	t.Logf("default params=%d, strict params=%d (seed=%d)",
 		defaultParams, strictParams, seedParams)
+}
+
+// GAP-2 regression: Approximation=true should produce a fitted model
+// whose Method is the user's actual choice (default MethodCSSML), even
+// though the candidate search ran under MethodCSS internally. Verifies
+// the two-stage flow restores Method correctly on the final fit.
+func TestGAP2_ApproximationRefitsAtUserMethod(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m, err := AutoArima(logAp, nil, AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder:      5,
+		MaxD:          2,
+		IC:            AICc,
+		MaxIter:       50,
+		Approximation: true,
+		// Method left as zero value → MethodCSSML
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Final fit must be on MethodCSSML scale (the user's effective Method),
+	// not MethodCSS (the search-time override).
+	if m.Method != MethodCSSML {
+		t.Errorf("final model Method = %v, want MethodCSSML", m.Method)
+	}
+	// The picked (Order, Seasonal) should be sensible — at minimum a non-trivial fit.
+	if m.LogLikelihood() == 0 {
+		t.Error("final model has logL=0 — refit may have failed silently")
+	}
+}
+
+// GAP-2: Approximation=true with explicit Method=MethodML should still
+// run the search under MethodCSS but refit at MethodML.
+func TestGAP2_ApproximationRespectsExplicitMethodML(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m, err := AutoArima(logAp, nil, AutoArimaOpts{
+		M: 12, MaxP: 2, MaxQ: 2, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder:      5,
+		MaxD:          2,
+		IC:            AICc,
+		MaxIter:       50,
+		Approximation: true,
+		Method:        MethodML,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.Method != MethodML {
+		t.Errorf("final model Method = %v, want MethodML (user's explicit choice)", m.Method)
+	}
+}
+
+// GAP-1 regression: AutoArimaOpts{}.Method (zero value) must resolve to
+// MethodCSSML — matching documented default and pmdarima/R behaviour.
+// Pre-fix the iota order made MethodCSS the zero value, silently
+// downgrading every caller who didn't explicitly set Method.
+func TestGAP1_MethodZeroValueIsCSSML(t *testing.T) {
+	if (Method(0)) != MethodCSSML {
+		t.Errorf("Method(0) = %v, want MethodCSSML — iota order must keep MethodCSSML at 0", Method(0))
+	}
+	var opts AutoArimaOpts
+	if opts.Method != MethodCSSML {
+		t.Errorf("AutoArimaOpts{}.Method = %v, want MethodCSSML", opts.Method)
+	}
 }
 
 // G-NEW-3c: simplification must still work with a high ParsimonyDelta.

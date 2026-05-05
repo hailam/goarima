@@ -56,12 +56,20 @@ const (
 type Method int
 
 const (
-	// MethodCSS uses Conditional Sum of Squares (fast).
-	MethodCSS Method = iota
+	// MethodCSSML starts with CSS and refines with ML. The zero value of
+	// Method, so structs left at their zero value (e.g. AutoArimaOpts{})
+	// pick this — matching pmdarima / R's default behaviour.
+	//
+	// Pre-fix the iota order placed MethodCSS at 0, which silently
+	// downgraded AutoArima callers who didn't explicitly set Method. This
+	// reorder fixes GAP-1 from the gap audit. Method is JSON-serialized
+	// as a string via methodToString (`serialize.go`) so the reorder
+	// doesn't invalidate previously-saved models.
+	MethodCSSML Method = iota
+	// MethodCSS uses Conditional Sum of Squares (fast, biased).
+	MethodCSS
 	// MethodML uses exact Gaussian likelihood via Kalman filter (state-space).
 	MethodML
-	// MethodCSSML starts with CSS and refines with ML.
-	MethodCSSML
 )
 
 // ARIMA fits an ARIMA(p,d,q)(P,D,Q,m) model with optional exogenous regressors.

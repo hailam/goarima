@@ -267,3 +267,24 @@ func BenchmarkAutoArima_NonSimple_Wineind(b *testing.B) {
 		}
 	}
 }
+
+// GAP-2: bench Approximation=true (CSS search + CSSML refit) vs full
+// CSSML candidate fits. Per the gap audit, R uses approximation=TRUE
+// by default for n>150 or m>12; goarima users now have the same lever.
+func BenchmarkAutoArima_AirPassengers_Approximation(b *testing.B) {
+	ap := datasets.LoadAirPassengers()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, err := AutoArima(ap, nil, AutoArimaOpts{
+			M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 1, MaxCapQ: 1,
+			MaxOrder:      5,
+			MaxD:          2,
+			IC:            AICc,
+			MaxIter:       50,
+			Approximation: true,
+		})
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}

@@ -1,0 +1,63 @@
+MIT License
+
+Copyright (c) 2026 Hailam (goarima contributors)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+================================================================================
+
+DATASET ATTRIBUTIONS
+
+The `datasets/` package bundles small example time series for testing and
+documentation. The data values are factual measurements from public/
+government sources and are not subject to copyright (per Feist v Rural
+Telephone Service Co., 499 U.S. 340 (1991), which held that compilations of
+factual data lack the originality required for copyright). The Go encoding
+of these values is MIT-licensed under this LICENSE.
+
+Specific source attributions per dataset are in each `datasets/*.go` file
+header. Summary:
+
+  AirPassengers  Box & Jenkins (1976), originally TWA airline statistics.
+                 Public-domain factual data (>30 years old).
+  Wineind        Australian Bureau of Statistics, monthly wine sales.
+                 Per ABS (cc-by-4.0): "ABS data may be used, reproduced,
+                 published [...] freely". Mirrors pmdarima version (MIT).
+  Lynx           MacKenzie River Hudson's Bay Company trapping records,
+                 1821-1934. Public domain (>100 years old).
+  Austres        Australian Bureau of Statistics, quarterly residents.
+                 Public ABS data; mirrors R's stats::austres.
+  Sunspots       SIDC / Royal Observatory Belgium. Public scientific data.
+  Woolyrnq       Australian Bureau of Statistics, quarterly wool yarn.
+                 Public ABS data.
+  Ausbeer        Australian Bureau of Statistics, quarterly beer production.
+                 Public ABS data; mirrors pmdarima version (MIT). The
+                 longer R::forecast version (218 obs through Q2 2010) is
+                 fetched on-demand via tools/fetch_datasets/.
+  Heartrate      MIT-BIH database / PhysioNet. Open data per ODC-by license.
+  Taylor         UK National Grid, half-hourly electricity demand.
+                 Open Government Licence (UK) v3.0.
+  Gasoline       US Energy Information Administration, weekly motor
+                 gasoline product supplied. US government work, public
+                 domain (17 USC 105). Mirrors pmdarima version. The longer
+                 R::forecast version is fetched on-demand via
+                 tools/fetch_datasets/.
+  WWWusage       Makridakis et al. (1998), classic forecasting textbook.
+                 Republished in many open educational sources.
+  Msft           Yahoo Finance historical pricing. Factual market data.
