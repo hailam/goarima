@@ -212,6 +212,50 @@ func TestAutoArima_GradientWorkersOverride(t *testing.T) {
 	}
 }
 
+// PG-4a: AutoArimaOpts.StepwiseDiagonals expands stepwise's neighbor
+// set with the 2-axis (p±,q±) and (P±,Q±) diagonal moves R's
+// auto.arima visits. With diagonals on, the search reaches more
+// candidates per iteration; with off, the search uses only single-axis
+// ±1 moves (legacy goarima behavior). Both must produce a usable
+// model; default (off) must not differ from a baseline OFF run.
+func TestAutoArima_StepwiseDiagonalsOptIn(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	base := AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 2, MaxCapQ: 2,
+		MaxOrder: 5,
+		MaxIter:  50,
+		IC:       AICc,
+	}
+	mOff, err := AutoArima(logAp, nil, base)
+	if err != nil {
+		t.Fatalf("OFF: %v", err)
+	}
+	if mOff.LogLikelihood() == 0 {
+		t.Error("OFF model not fitted (logL=0)")
+	}
+
+	on := base
+	on.StepwiseDiagonals = true
+	mOn, err := AutoArima(logAp, nil, on)
+	if err != nil {
+		t.Fatalf("ON: %v", err)
+	}
+	if mOn.LogLikelihood() == 0 {
+		t.Error("ON model not fitted (logL=0)")
+	}
+	// ON's pick should be at least as good as OFF (it explores a
+	// superset of OFF's neighbors). Allow a small tolerance for
+	// BFGS convergence noise.
+	if mOn.AICc() > mOff.AICc()+0.5 {
+		t.Errorf("ON AICc=%.4f should not exceed OFF AICc=%.4f by more than 0.5",
+			mOn.AICc(), mOff.AICc())
+	}
+}
+
 // GAP-3: Stationary=true must constrain the search to d=D=0 regardless
 // of the input series's actual differencing requirement. AirPassengers
 // would normally pick d=1 / D=1 (KPSS + OCSB both detect non-stationarity)

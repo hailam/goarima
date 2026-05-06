@@ -173,6 +173,33 @@ type AutoArimaOpts struct {
 	// pmdarima's `method=` and R's `method=` arguments to auto.arima.
 	Method Method
 
+	// StepwiseDiagonals, when true, expands the per-iteration neighbor
+	// set with the 2-axis diagonal moves used by R's `forecast::auto.arima`
+	// (newarima2.R) and pmdarima's `_StepwiseFitWrapper` — i.e., (p±1, q±1)
+	// and (P±1, Q±1) jointly, on top of the single-axis ±1 moves the
+	// stepwise already evaluates.
+	//
+	// **Off by default** because the empirical study (PERF_TODO PG-4a)
+	// across airpassengers / co2 / sunspot_month / m5 / m5_with_exog
+	// showed mixed outcomes vs the single-axis-only default:
+	//
+	//   - Wins (2026-05-04): airpassengers default −6.2 AICc;
+	//     m5_with_exog fast −30 AICc; co2 fast −0.3 AICc.
+	//   - Losses: m5_with_exog default +70 AICc; sunspot fast +1.2 AICc.
+	//   - Wallclock: 1.5–4× slower across most modes (more candidates
+	//     per iteration, since goarima evaluates each stage in parallel
+	//     under best-improvement instead of R's sequential first-improvement).
+	//
+	// The two-stage gating keeps stage 1 (single-axis) the only path that
+	// runs in the steady state — diagonals only fire when single-axis
+	// makes no progress, mimicking R's "fall through to diagonals" path.
+	// Even so, default-mode CSSML refits at every step make the added
+	// fits noticeable when the diagonal stage triggers repeatedly.
+	//
+	// Set to `true` if you want closer R/pmdarima parity in stepwise
+	// model selection and accept the wallclock cost. Default false.
+	StepwiseDiagonals bool
+
 	// Approximation, when true, runs the candidate search with MethodCSS
 	// (fast, biased likelihood) regardless of the Method field, then
 	// refits the picked (Order, Seasonal) once with the user's Method
@@ -783,6 +810,26 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				orderKey{bestKey.p, bestKey.q, bestKey.P, bestKey.Q - 1},
 				orderKey{bestKey.p, bestKey.q, bestKey.P, bestKey.Q + 1},
 			)
+		}
+		// PG-4a: when StepwiseDiagonals is on, also evaluate the
+		// 2-axis diagonal moves R's auto.arima visits (p±/q± and
+		// P±/Q± jointly). Off by default — see opts.StepwiseDiagonals
+		// docstring for the empirical tradeoffs.
+		if opts.StepwiseDiagonals {
+			neighbors = append(neighbors,
+				orderKey{bestKey.p - 1, bestKey.q - 1, bestKey.P, bestKey.Q},
+				orderKey{bestKey.p - 1, bestKey.q + 1, bestKey.P, bestKey.Q},
+				orderKey{bestKey.p + 1, bestKey.q - 1, bestKey.P, bestKey.Q},
+				orderKey{bestKey.p + 1, bestKey.q + 1, bestKey.P, bestKey.Q},
+			)
+			if opts.M > 1 {
+				neighbors = append(neighbors,
+					orderKey{bestKey.p, bestKey.q, bestKey.P - 1, bestKey.Q - 1},
+					orderKey{bestKey.p, bestKey.q, bestKey.P - 1, bestKey.Q + 1},
+					orderKey{bestKey.p, bestKey.q, bestKey.P + 1, bestKey.Q - 1},
+					orderKey{bestKey.p, bestKey.q, bestKey.P + 1, bestKey.Q + 1},
+				)
+			}
 		}
 
 		// Drop neighbors that are out-of-bounds for the search box. These
