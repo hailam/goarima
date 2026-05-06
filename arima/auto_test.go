@@ -183,6 +183,35 @@ func TestGAP2_ApproximationRespectsExplicitMethodML(t *testing.T) {
 	}
 }
 
+// AutoArimaOpts.GradientWorkers override — when set to 1, every
+// candidate fit gets nWorkers=1 in parallelGradient, forcing serial
+// gradient evaluation. Useful in environments where pthread_cond_signal
+// cost exceeds the parallel-arithmetic speedup. Verifies the override
+// propagates and produces a usable model.
+func TestAutoArima_GradientWorkersOverride(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m, err := AutoArima(logAp, nil, AutoArimaOpts{
+		M: 12, MaxP: 2, MaxQ: 2, MaxCapP: 1, MaxCapQ: 1,
+		MaxOrder:        4,
+		MaxIter:         50,
+		IC:              AICc,
+		GradientWorkers: 1, // force serial gradient
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.GradientWorkers != 1 {
+		t.Errorf("override should propagate; got m.GradientWorkers=%d", m.GradientWorkers)
+	}
+	if m.LogLikelihood() == 0 {
+		t.Error("model not fitted (logL=0)")
+	}
+}
+
 // GAP-3: Stationary=true must constrain the search to d=D=0 regardless
 // of the input series's actual differencing requirement. AirPassengers
 // would normally pick d=1 / D=1 (KPSS + OCSB both detect non-stationarity)

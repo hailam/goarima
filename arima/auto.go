@@ -152,6 +152,22 @@ type AutoArimaOpts struct {
 	// auto.arima, but Go's goroutines are essentially free.
 	NJobs int
 
+	// GradientWorkers, when > 0, overrides the per-candidate BFGS
+	// gradient parallelism budget that AutoArima would normally
+	// auto-compute from NJobs. Set to 1 to force serial gradient
+	// evaluation in every candidate fit.
+	//
+	// Useful in environments where pthread_cond_signal scheduling cost
+	// exceeds the parallel-arithmetic speedup — e.g., some Linux
+	// container setups with limited cores or NUMA effects, where
+	// profiles show goroutine wake/wait paths dominating CPU. The
+	// auto-computed default (split GOMAXPROCS among parallel
+	// candidates) is correct for most environments; this knob exists
+	// for the cases where it isn't.
+	//
+	// 0 (default) → auto-compute via gradientBudget(NJobs).
+	GradientWorkers int
+
 	// Method selects the per-candidate fitting estimator (CSS / ML / CSS-ML).
 	// Default 0 (MethodCSSML) — same as a hand-rolled `Fit`. Mirrors
 	// pmdarima's `method=` and R's `method=` arguments to auto.arima.
@@ -489,7 +505,15 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// fit when AutoArima dispatches K parallel candidates. Splits cores
 	// evenly so the total goroutines (outer K × inner GradientWorkers)
 	// stays at GOMAXPROCS instead of K × GOMAXPROCS.
+	//
+	// User override: opts.GradientWorkers > 0 forces every candidate
+	// fit to that exact value, bypassing the budget split. Set =1 to
+	// force serial gradient evaluation in environments where parallel
+	// scheduling cost exceeds the arithmetic speedup.
 	gradientBudget := func(nParallelFits int) int {
+		if opts.GradientWorkers > 0 {
+			return opts.GradientWorkers
+		}
 		if nParallelFits <= 1 {
 			return 0 // 0 → use full GOMAXPROCS in minimize
 		}

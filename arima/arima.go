@@ -698,7 +698,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			}
 			return ll
 		}
-		x0 = minimize(cssObj, x0, m.MaxIter, m.gradientWorkers())
+		x0 = minimize(cssObj, x0, m.MaxIter, m.gradientWorkers(), len(ws))
 		cssWarmedX = true
 	}
 
@@ -710,7 +710,7 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	// the Nelder-Mead polish when BFGS converges cleanly — CSS already did
 	// the global search, so NM here is mostly redundant.
 	mlWarmStarted := cssWarmedX || useWarmStart
-	best := minimizeNM(objective, x0, mi, m.gradientWorkers(), mlWarmStarted)
+	best := minimizeNM(objective, x0, mi, m.gradientWorkers(), mlWarmStarted, len(ws))
 	phi, theta, sPhi, sTheta, c, beta := unpackParamsX(best, p, q, P, Q, m.WithIntercept, k)
 	m.phi = phi
 	m.theta = theta
@@ -875,15 +875,26 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 // our objectives allocate fresh state per call and do not mutate captured
 // slices, which satisfies this. For tiny problems (<4 params) the goroutine
 // overhead can dominate, so we fall back to a sequential loop in that case.
-func parallelGradient(f func([]float64) float64, nWorkers int) func(grad, x []float64) {
+//
+// To force sequential gradient regardless of n, set the caller's
+// nWorkers=1. AutoArima exposes this via `AutoArimaOpts.GradientWorkers=1`
+// — useful in environments where pthread_cond_signal scheduling cost
+// exceeds the parallel arithmetic speedup (e.g. some Linux container
+// configurations with limited cores or NUMA effects).
+//
+// `dataLen` is reserved for future work-product-based gating heuristics;
+// currently only the n<4 floor applies.
+func parallelGradient(f func([]float64) float64, nWorkers, dataLen int) func(grad, x []float64) {
+	_ = dataLen // reserved for future work-product threshold
 	const eps = 1e-7
 	if nWorkers < 1 {
 		nWorkers = 1
 	}
 	return func(grad, x []float64) {
 		n := len(x)
-		if n < 4 {
-			// sequential — overhead exceeds gain at small n
+		// Sequential when nWorkers=1 (caller-forced) or n < 4
+		// (per-call goroutine overhead floor).
+		if nWorkers == 1 || n < 4 {
 			for i := 0; i < n; i++ {
 				save := x[i]
 				x[i] = save + eps
@@ -938,8 +949,8 @@ func (m *ARIMA) gradientWorkers() int {
 	return runtime.GOMAXPROCS(0)
 }
 
-func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers int) []float64 {
-	return minimizeNM(f, x0, maxIter, nWorkers, false)
+func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers, dataLen int) []float64 {
+	return minimizeNM(f, x0, maxIter, nWorkers, false, dataLen)
 }
 
 // minimizeNM is the BFGS+Nelder-Mead optimizer. When `warmStarted` is true,
@@ -954,11 +965,11 @@ func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers int) []
 // likelihood within ~1e-6 units (well under the parity test tolerances)
 // and saves the cost of a full second optimizer run. See PERF_TODO
 // CSS-1 for the bench numbers.
-func minimizeNM(f func([]float64) float64, x0 []float64, maxIter, nWorkers int, warmStarted bool) []float64 {
+func minimizeNM(f func([]float64) float64, x0 []float64, maxIter, nWorkers int, warmStarted bool, dataLen int) []float64 {
 	if nWorkers < 1 {
 		nWorkers = runtime.GOMAXPROCS(0)
 	}
-	gradFn := parallelGradient(f, nWorkers)
+	gradFn := parallelGradient(f, nWorkers, dataLen)
 	prob := optimize.Problem{Func: f, Grad: gradFn}
 	settings := &optimize.Settings{
 		MajorIterations:   maxIter,
