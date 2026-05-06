@@ -88,21 +88,23 @@ func hannanRissanen(y []float64, p, q int) (phi, theta []float64) {
 	if cols == 0 {
 		return nil, nil
 	}
-	X2 := make([][]float64, rows2)
+	// CDX-5: fill the flat design matrix directly to skip the
+	// per-row alloc churn of [][]float64. Saves ~rows2 allocs per HR
+	// call (484k alloc_objects in the codex profile).
+	flat := make([]float64, rows2*cols)
 	y2 := make([]float64, rows2)
 	for i := 0; i < rows2; i++ {
 		t := start + i
 		y2[i] = y[t]
-		row := make([]float64, cols)
+		off := i * cols
 		for k := 1; k <= p; k++ {
-			row[k-1] = y[t-k]
+			flat[off+k-1] = y[t-k]
 		}
 		for k := 1; k <= q; k++ {
-			row[p+k-1] = e[t-k]
+			flat[off+p+k-1] = e[t-k]
 		}
-		X2[i] = row
 	}
-	beta, err := olsFit(X2, y2, false)
+	beta, err := olsFitDense(flat, rows2, cols, y2)
 	if err != nil {
 		return nil, nil
 	}

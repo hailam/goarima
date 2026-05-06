@@ -218,22 +218,26 @@ func (m *ARIMA) PredictBootWithOpts(nPeriods int, opts PredictBootOpts) (*BootRe
 	phiWin := lastN(wsCentered, pLag)
 	thetaWin := lastN(baseRes, qLag)
 
+	// CDX-4: flat backing storage for paths. paths[s] aliases a row of
+	// `pathsFlat`, which is one contiguous allocation instead of nSim
+	// fresh per-path slices. Combines naturally with CDX-2's in-place
+	// integrateBackTail and the new in-place box-cox invert below.
+	pathsFlat := make([]float64, nSim*nPeriods)
 	paths := make([][]float64, nSim)
+	for s := 0; s < nSim; s++ {
+		paths[s] = pathsFlat[s*nPeriods : (s+1)*nPeriods]
+	}
 
-	// simulateOne runs simulation s with its own pre-allocated buffers and
-	// PCG seeded from (seed, s). Returns the output path on the user's
-	// original scale (Box-Cox-inverted if applicable). The per-path
-	// (seed, s) seeding makes paths[s] deterministic regardless of worker
-	// assignment — serial and parallel runs produce identical Paths for a
-	// given `seed`. RNG cost: PCG re-seed per path (constant time, no
-	// allocation thanks to PCG's value semantics on Seed).
+	// simulateOneInto writes simulation s's output path directly into
+	// `dst` (length nPeriods, sliced from pathsFlat). PCG seeded from
+	// (seed, s) so paths[s] is deterministic regardless of worker
+	// assignment.
 	const seedSalt = uint64(0x9E3779B97F4A7C15) // golden-ratio salt
-	simulateOne := func(s int, pcg *rand.PCG, hist, residHist []float64) []float64 {
+	simulateOneInto := func(s int, pcg *rand.PCG, hist, residHist, dst []float64) {
 		pcg.Seed(seed^seedSalt, uint64(s)+1)
 		rng := rand.New(pcg)
 		hist = append(hist[:0], phiWin...)
 		residHist = append(residHist[:0], thetaWin...)
-		simDiffed := make([]float64, nPeriods)
 		for h := 0; h < nPeriods; h++ {
 			yh := 0.0
 			for i, ph := range fullPhi {
@@ -255,36 +259,31 @@ func (m *ARIMA) PredictBootWithOpts(nPeriods int, opts PredictBootOpts) (*BootRe
 				eps = residPool[rng.IntN(len(residPool))]
 			}
 			yh += eps
-			simDiffed[h] = yh
+			dst[h] = yh
 			hist = append(hist, yh)
 			residHist = append(residHist, eps)
 		}
 		// Re-add intercept, mean, and exog contribution on differenced scale.
-		for i := range simDiffed {
-			simDiffed[i] += m.mean + m.c
+		for i := range dst {
+			dst[i] += m.mean + m.c
 			if futureWX != nil {
 				for j, b := range m.beta {
-					simDiffed[i] += b * futureWX[i][j]
+					dst[i] += b * futureWX[i][j]
 				}
 			}
 		}
-		// CDX-2: integrateBackTail writes only the forecast region to
-		// `out` (avoids alloc+copy of the head region that every caller
-		// immediately discards). For per-path work × nSim this is the
-		// largest single alloc reduction in PredictBoot — measured
-		// −68% mem / −65% allocs on BenchmarkPredictBoot.
-		out := simDiffed
+		// CDX-2: integrateBackTail writes the forecast region directly
+		// into dst (no alloc). Aliasing-safe.
 		if seasHead != nil {
-			out = integrateBackTail(out, out, seasHead, m.Seasonal.M, m.Seasonal.D)
+			integrateBackTail(dst, dst, seasHead, m.Seasonal.M, m.Seasonal.D)
 		}
 		if nonSeasHead != nil {
-			out = integrateBackTail(out, out, nonSeasHead, 1, m.Order.D)
+			integrateBackTail(dst, dst, nonSeasHead, 1, m.Order.D)
 		}
-		// Inverse Box-Cox so paths land in the user's original units.
+		// CDX-4: in-place box-cox invert (no alloc).
 		if m.Lambda != nil {
-			out = boxCoxInvert(out, *m.Lambda, m.Lambda2)
+			boxCoxInvertInto(dst, dst, *m.Lambda, m.Lambda2)
 		}
-		return out
 	}
 
 	// Worker count: dispatch to goroutines once nSim is big enough that the
@@ -301,13 +300,13 @@ func (m *ARIMA) PredictBootWithOpts(nPeriods int, opts PredictBootOpts) (*BootRe
 		hist := make([]float64, 0, pLag+nPeriods)
 		residHist := make([]float64, 0, qLag+nPeriods)
 		for s := 0; s < nSim; s++ {
-			paths[s] = simulateOne(s, pcg, hist, residHist)
+			simulateOneInto(s, pcg, hist, residHist, paths[s])
 		}
 	} else {
-		// Parallel path — each worker owns its scratch buffers and PCG; paths
-		// are partitioned by index modulo nWorkers (cheap, balanced for
-		// uniform-cost simulations). Each path writes only to paths[s], so no
-		// lock is needed.
+		// Parallel path — each worker owns its scratch buffers and PCG;
+		// paths are partitioned by index modulo nWorkers. Each goroutine
+		// writes only to its own paths[s] rows (sliced from pathsFlat),
+		// so no lock is needed.
 		var wg sync.WaitGroup
 		for w := 0; w < nWorkers; w++ {
 			w := w
@@ -318,7 +317,7 @@ func (m *ARIMA) PredictBootWithOpts(nPeriods int, opts PredictBootOpts) (*BootRe
 				hist := make([]float64, 0, pLag+nPeriods)
 				residHist := make([]float64, 0, qLag+nPeriods)
 				for s := w; s < nSim; s += nWorkers {
-					paths[s] = simulateOne(s, pcg, hist, residHist)
+					simulateOneInto(s, pcg, hist, residHist, paths[s])
 				}
 			}()
 		}

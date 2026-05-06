@@ -426,22 +426,34 @@ func olsFit(X [][]float64, y []float64, addIntercept bool) ([]float64, error) {
 		return nil, errors.New("x/y dimension mismatch")
 	}
 	cols := len(X[0])
+	totalCols := cols
 	if addIntercept {
-		cols++
+		totalCols++
 	}
-	flat := make([]float64, n*cols)
+	flat := make([]float64, n*totalCols)
 	for i, row := range X {
-		off := i * cols
+		off := i * totalCols
 		if addIntercept {
 			flat[off] = 1
 			off++
 		}
 		for j, v := range row {
-			flat[i*cols+j+boolToInt(addIntercept)] = v
+			flat[i*totalCols+j+boolToInt(addIntercept)] = v
 		}
 	}
-	A := mat.NewDense(n, cols, flat)
-	b := mat.NewVecDense(n, append([]float64{}, y...))
+	return olsFitDense(flat, n, totalCols, y)
+}
+
+// olsFitDense solves min ||X b - y||^2 via QR on a flat row-major design
+// matrix (rows × cols). Caller is responsible for prepending the
+// intercept column if needed. CDX-5: avoids the per-row alloc churn
+// of building a [][]float64 only to flatten it inside olsFit.
+func olsFitDense(flat []float64, rows, cols int, y []float64) ([]float64, error) {
+	if rows == 0 || rows != len(y) {
+		return nil, errors.New("x/y dimension mismatch")
+	}
+	A := mat.NewDense(rows, cols, flat)
+	b := mat.NewVecDense(rows, append([]float64{}, y...))
 	var qr mat.QR
 	qr.Factorize(A)
 	var beta mat.VecDense

@@ -32,15 +32,22 @@ func boxCoxApply(y []float64, lam1, lam2 float64) ([]float64, error) {
 // boxCoxInvert inverts boxCoxApply.
 func boxCoxInvert(y []float64, lam1, lam2 float64) []float64 {
 	out := make([]float64, len(y))
+	boxCoxInvertInto(out, y, lam1, lam2)
+	return out
+}
+
+// boxCoxInvertInto is the in-place variant: writes inverse-Box-Cox of
+// y into dst. dst and y may alias (dst === y is safe since each output
+// element depends only on the corresponding input element).
+func boxCoxInvertInto(dst, y []float64, lam1, lam2 float64) {
 	if math.Abs(lam1) < 1e-12 {
 		for i, v := range y {
-			out[i] = math.Exp(v) - lam2
+			dst[i] = math.Exp(v) - lam2
 		}
-		return out
+		return
 	}
 	for i, v := range y {
 		num := v*lam1 + 1
-		out[i] = math.Pow(num, 1/lam1) - lam2
+		dst[i] = math.Pow(num, 1/lam1) - lam2
 	}
-	return out
 }

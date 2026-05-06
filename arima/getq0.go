@@ -238,15 +238,11 @@ func stationaryCovGardnerInto(ws *gardnerWorkspace, phi, theta []float64) ([]flo
 		}
 	}
 
-	// Convert column-major P to row-major and return flat.
-	out := make([]float64, r*r)
-	for i := 0; i < r; i++ {
-		for j := 0; j < r; j++ {
-			// P (column-major) at row i, col j: P[i + r*j]
-			out[i*r+j] = P[i+r*j]
-		}
-	}
-	return out, r
+	// CDX-R1: P is symmetric after the symmetrization above, so its
+	// column-major and row-major linear layouts are bit-identical
+	// (P[i*r+j] equals M[i,j] in both, since M[i,j] = M[j,i]). Skip
+	// the redundant conversion that previously allocated `out`.
+	return P, r
 }
 
 // inclu2 is the Givens-rotation update used by stationaryCovGardner.
