@@ -507,15 +507,26 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// stays at GOMAXPROCS instead of K × GOMAXPROCS.
 	//
 	// User override: opts.GradientWorkers > 0 forces every candidate
-	// fit to that exact value, bypassing the budget split. Set =1 to
-	// force serial gradient evaluation in environments where parallel
-	// scheduling cost exceeds the arithmetic speedup.
+	// fit to that exact value, bypassing the budget split.
+	//
+	// Default for NJobs=1 (sequential candidates): SERIAL gradient
+	// (return 1). The previous default of "use full GOMAXPROCS when
+	// candidates are sequential" caused a goroutine-storm regression
+	// on small-n series — every BFGS step spawned up-to-nFree
+	// goroutines on every candidate, dominating CPU with
+	// pthread_cond_signal coordination cost (reported externally,
+	// 1.07s wall on airpassengers default vs 0.55s with serial).
+	//
+	// Sequential gradient inside the candidate is the safer default;
+	// users who want parallel-inside-candidate (large-n series where
+	// the coordination cost amortises) set `GradientWorkers > 1`
+	// explicitly via AutoArimaOpts.
 	gradientBudget := func(nParallelFits int) int {
 		if opts.GradientWorkers > 0 {
 			return opts.GradientWorkers
 		}
 		if nParallelFits <= 1 {
-			return 0 // 0 → use full GOMAXPROCS in minimize
+			return 1 // PG-2 fix: serial gradient by default for sequential dispatch
 		}
 		gp := runtime.GOMAXPROCS(0)
 		w := gp / nParallelFits
