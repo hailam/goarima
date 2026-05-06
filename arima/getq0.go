@@ -24,6 +24,17 @@ func PublicGardner(phi, theta []float64) [][]float64 {
 // Returns the flat row-major r×r covariance and r itself, where r = max(p, q+1).
 // The returned slice has length r*r; the caller can copy or alias as needed.
 func stationaryCovGardner(phi, theta []float64) ([]float64, int) {
+	var ws gardnerWorkspace
+	return stationaryCovGardnerInto(&ws, phi, theta)
+}
+
+// stationaryCovGardnerInto is the buffer-reuse variant of
+// stationaryCovGardner. All ~7 internal buffers come from `ws` instead
+// of being allocated per call. The returned []float64 aliases ws.P,
+// valid until the next call on the same workspace. Pre-pool, this
+// function was the single largest allocator in AutoArima
+// (~36% of total per-Fit allocations).
+func stationaryCovGardnerInto(ws *gardnerWorkspace, phi, theta []float64) ([]float64, int) {
 	p := len(phi)
 	q := len(theta)
 	r := p
@@ -40,7 +51,8 @@ func stationaryCovGardner(phi, theta []float64) ([]float64, int) {
 	}
 
 	// V[ind] = vi * vj where vk = (k == 0 ? 1 : (k-1 < q ? theta[k-1] : 0))
-	V := make([]float64, np)
+	ws.V = ensureLen(ws.V, np)
+	V := ws.V
 	{
 		ind := 0
 		for j := 0; j < r; j++ {
@@ -63,7 +75,8 @@ func stationaryCovGardner(phi, theta []float64) ([]float64, int) {
 		}
 	}
 
-	P := make([]float64, r*r) // final r×r matrix, flat column-major like R
+	ws.P = ensureLenZ(ws.P, r*r) // zeroed because we write only some cells
+	P := ws.P                    // final r×r matrix, flat column-major like R
 
 	if r == 1 {
 		if p == 0 {
@@ -76,11 +89,16 @@ func stationaryCovGardner(phi, theta []float64) ([]float64, int) {
 
 	if p > 0 {
 		// Givens-rotation based solver via inclu2.
-		xnext := make([]float64, np)
-		xrow := make([]float64, np)
-		rbar := make([]float64, nrbar)
-		thetab := make([]float64, np)
-		Pbuf := make([]float64, np)
+		ws.xnext = ensureLenZ(ws.xnext, np)
+		ws.xrow = ensureLenZ(ws.xrow, np)
+		ws.rbar = ensureLenZ(ws.rbar, nrbar)
+		ws.thetab = ensureLenZ(ws.thetab, np)
+		ws.Pbuf = ensureLenZ(ws.Pbuf, np)
+		xnext := ws.xnext
+		xrow := ws.xrow
+		rbar := ws.rbar
+		thetab := ws.thetab
+		Pbuf := ws.Pbuf
 
 		ind := 0
 		ind1 := -1
@@ -188,7 +206,8 @@ func stationaryCovGardner(phi, theta []float64) ([]float64, int) {
 		}
 	} else {
 		// Pure MA: backsubstitution with V
-		Pbuf := make([]float64, np)
+		ws.Pbuf = ensureLenZ(ws.Pbuf, np)
+		Pbuf := ws.Pbuf
 		indn := np
 		ind := np
 		for i := 0; i < r; i++ {

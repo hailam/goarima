@@ -149,7 +149,8 @@ func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (neg
 		}
 	}
 
-	P, _ := stationaryCovGardner(phi, theta)
+	// Pooled Gardner workspace from the kalmanWorkspace.
+	P, _ := stationaryCovGardnerInto(&ws.gardner, phi, theta)
 
 	// a — must be zeroed (state mean starts at 0).
 	ws.a = ensureLenZ(ws.a, r)

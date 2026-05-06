@@ -52,6 +52,22 @@ type kalmanWorkspace struct {
 	// (innov omitted from the workspace — Fit's compute closure throws
 	// it away; allocating it would be wasted. Internal callers that
 	// need innovations use the legacy kalmanARMALikelihood entry point.)
+
+	gardner gardnerWorkspace // pooled buffers for stationaryCovGardnerInto
+}
+
+// gardnerWorkspace holds the 7 reusable buffers that stationaryCovGardner
+// would otherwise allocate per call. Pre-G-NEW-3 profile showed
+// stationaryCovGardner as the largest single allocator in AutoArima
+// (~36% of total allocs); pooling these eliminates that pressure.
+type gardnerWorkspace struct {
+	V      []float64 // length np = r·(r+1)/2 (zeroed each call)
+	P      []float64 // length r*r (Gardner's output — caller aliases it)
+	xnext  []float64 // length np
+	xrow   []float64 // length np (zeroed each call by inclu2)
+	rbar   []float64 // length nrbar (zeroed each call)
+	thetab []float64 // length np (zeroed each call)
+	Pbuf   []float64 // length np (zeroed each call by inclu2)
 }
 
 var paramScratchPool = sync.Pool{
