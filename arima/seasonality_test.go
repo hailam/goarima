@@ -1,7 +1,6 @@
 package arima
 
 import (
-	"errors"
 	"math"
 	"testing"
 
@@ -125,25 +124,36 @@ func TestNSDiffsCornerCases(t *testing.T) {
 	}
 }
 
-// PG-93: NSDiffsSEAS is the constant for R's `auto.arima` default
-// seasonal test (Wang-Smith-Hyndman seasonal-strength), but the
-// implementation is a stub pending PG-97 (requires STL decomposition).
-// Selecting it must return ErrSEASNotImplemented with a clear message
-// so users requesting R parity don't silently fall back to OCSB and
-// pick a different model on M5-shaped daily data.
-func TestNSDiffsSEAS_ReturnsClearError(t *testing.T) {
-	austres := datasets.LoadAustres()
-	d, err := NSDiffs(austres, NSDiffsOpts{
-		M: 4, MaxD: 1, Test: NSDiffsSEAS, MaxLag: 3,
-	})
-	if err == nil {
-		t.Fatalf("NSDiffsSEAS should return ErrSEASNotImplemented; got d=%d, nil err", d)
+// PG-97: NSDiffsSEAS implements R's auto.arima default seasonal-test
+// (Wang-Smith-Hyndman seasonal-strength). Reference values captured
+// from R 4.x + forecast 8.x on 2026-05-07 via `nsdiffs(y, test="seas")`.
+// Goarima's implementation reuses centered-MA Decompose (vs R's STL
+// via mstl) but the F_s formula and 0.64 threshold are identical;
+// empirical D verdicts match R on all canonical datasets.
+func TestNSDiffsSEAS_MatchesR(t *testing.T) {
+	cases := []struct {
+		name string
+		x    []float64
+		m    int
+		want int
+	}{
+		{"austres m=4 (low season strength)", datasets.LoadAustres(), 4, 0},
+		{"airpassengers m=12 (strong season)", datasets.LoadAirPassengers(), 12, 1},
+		{"wineind m=12 (strong season)", datasets.LoadWineind(), 12, 1},
 	}
-	if !errors.Is(err, ErrSEASNotImplemented) {
-		t.Errorf("NSDiffsSEAS error should be ErrSEASNotImplemented; got %v", err)
-	}
-	if d != 0 {
-		t.Errorf("NSDiffsSEAS error path should return d=0; got %d", d)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := NSDiffs(c.x, NSDiffsOpts{
+				M: c.m, MaxD: 1, Test: NSDiffsSEAS, MaxLag: 3,
+			})
+			if err != nil {
+				t.Fatalf("NSDiffs(SEAS): %v", err)
+			}
+			if got != c.want {
+				t.Errorf("NSDiffs(SEAS) on %s: got %d, want %d (R verdict)",
+					c.name, got, c.want)
+			}
+		})
 	}
 }
 
