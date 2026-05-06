@@ -212,6 +212,46 @@ func TestAutoArima_GradientWorkersOverride(t *testing.T) {
 	}
 }
 
+// PG-91: parallelGradient's serial path (n<4 or nWorkers=1) must produce
+// bit-equivalent gradients to its parallel path. Pre-fix the serial path
+// used `save+eps` / `save-eps` direct subtraction while parallel used
+// `+= eps; -= 2*eps` — differing by 1 ulp on the perturbed values. On
+// ill-conditioned problems (m5_with_exog intermittent demand has many
+// close-by local minima) that ulp drift pushed BFGS into a different
+// basin, surfacing as same-orderKey/different-AICc when stepwise visited
+// more candidates first. This test fits the same problem with several
+// GradientWorkers values and asserts the AICc is identical regardless.
+func TestParallelGradient_SerialMatchesParallel(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	// ARIMA(1,1,1)(1,1,1)[12] gives nFree = 4 — large enough that
+	// the parallel path is reachable, while still letting the serial
+	// path trigger via GradientWorkers=1.
+	gws := []int{1, 2, 4, 8, 16}
+	results := make([]float64, len(gws))
+	for i, gw := range gws {
+		m := NewARIMA(Order{P: 1, D: 1, Q: 1})
+		m.Seasonal = SeasonalOrder{P: 1, D: 1, Q: 1, M: 12}
+		m.MaxIter = 100
+		m.GradientWorkers = gw
+		if err := m.Fit(logAp, nil); err != nil {
+			t.Fatalf("GW=%d: %v", gw, err)
+		}
+		results[i] = m.AICc()
+	}
+	// All variants must converge to the same AICc — the gradient
+	// computation must be path-independent.
+	for i := 1; i < len(results); i++ {
+		if math.Abs(results[i]-results[0]) > 1e-9 {
+			t.Errorf("GW sweep AICc inconsistency: GW=%d→%.6f, GW=%d→%.6f (gap=%.6f)",
+				gws[0], results[0], gws[i], results[i], results[i]-results[0])
+		}
+	}
+}
+
 // PG-4a: AutoArimaOpts.StepwiseDiagonals expands stepwise's neighbor
 // set with the 2-axis (p±,q±) and (P±,Q±) diagonal moves R's
 // auto.arima visits. With diagonals on, the search reaches more

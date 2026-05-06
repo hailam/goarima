@@ -890,18 +890,44 @@ func parallelGradient(f func([]float64) float64, nWorkers, dataLen int) func(gra
 	if nWorkers < 1 {
 		nWorkers = 1
 	}
+	// serialBuf is reused across gradient calls in the serial path; sized
+	// to len(x) on first call, grown if needed.
+	var serialBuf []float64
 	return func(grad, x []float64) {
 		n := len(x)
 		// Sequential when nWorkers=1 (caller-forced) or n < 4
-		// (per-call goroutine overhead floor).
+		// (per-call goroutine overhead floor). Use a local copy of x
+		// so the perturbation pattern mirrors the parallel path exactly
+		// (fresh `copy(xLocal, x); xLocal[i]+=eps; …`). The earlier
+		// in-place version mutated x[] across f-calls, which interacted
+		// non-deterministically with optimizer-side x reuse on certain
+		// problems (m5_with_exog, sunspot fast) — same orderKey, two
+		// different local minima depending on which worker count was
+		// used. The local copy fully serializes f-input identity so
+		// serial-vs-parallel produce bit-equivalent gradients.
 		if nWorkers == 1 || n < 4 {
+			// Bit-equivalent to the parallel-branch perturbation
+			// (`+= eps; -= 2*eps`). The earlier in-place serial used
+			// `save+eps` / `save-eps` directly, which differs from
+			// the parallel pattern by 1 ulp at the perturbation
+			// arithmetic. On most problems that ulp drift is harmless
+			// noise, but on ill-conditioned objectives (m5_with_exog
+			// intermittent demand has many close-by local minima)
+			// even ulp-level gradient drift can push BFGS into a
+			// different basin, surfacing as same-orderKey/different-
+			// AICc when the search visited more candidates first.
+			// Aligning serial bit-for-bit with parallel makes the
+			// fit deterministic regardless of nWorkers.
+			if cap(serialBuf) < n {
+				serialBuf = make([]float64, n)
+			}
+			xLocal := serialBuf[:n]
 			for i := 0; i < n; i++ {
-				save := x[i]
-				x[i] = save + eps
-				fp := f(x)
-				x[i] = save - eps
-				fm := f(x)
-				x[i] = save
+				copy(xLocal, x)
+				xLocal[i] += eps
+				fp := f(xLocal)
+				xLocal[i] -= 2 * eps
+				fm := f(xLocal)
 				grad[i] = (fp - fm) / (2 * eps)
 			}
 			return
