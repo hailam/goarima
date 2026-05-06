@@ -1,6 +1,7 @@
 package arima
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -121,6 +122,28 @@ func TestNSDiffsCornerCases(t *testing.T) {
 				t.Errorf("test=%v m=%d should error", tst, mm)
 			}
 		}
+	}
+}
+
+// PG-93: NSDiffsSEAS is the constant for R's `auto.arima` default
+// seasonal test (Wang-Smith-Hyndman seasonal-strength), but the
+// implementation is a stub pending PG-97 (requires STL decomposition).
+// Selecting it must return ErrSEASNotImplemented with a clear message
+// so users requesting R parity don't silently fall back to OCSB and
+// pick a different model on M5-shaped daily data.
+func TestNSDiffsSEAS_ReturnsClearError(t *testing.T) {
+	austres := datasets.LoadAustres()
+	d, err := NSDiffs(austres, NSDiffsOpts{
+		M: 4, MaxD: 1, Test: NSDiffsSEAS, MaxLag: 3,
+	})
+	if err == nil {
+		t.Fatalf("NSDiffsSEAS should return ErrSEASNotImplemented; got d=%d, nil err", d)
+	}
+	if !errors.Is(err, ErrSEASNotImplemented) {
+		t.Errorf("NSDiffsSEAS error should be ErrSEASNotImplemented; got %v", err)
+	}
+	if d != 0 {
+		t.Errorf("NSDiffsSEAS error path should return d=0; got %d", d)
 	}
 }
 

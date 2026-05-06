@@ -665,7 +665,26 @@ const (
 	NSDiffsOCSB NSDiffsTest = iota
 	// NSDiffsCH uses the Canova-Hansen test.
 	NSDiffsCH
+	// NSDiffsSEAS uses the Wang-Smith-Hyndman seasonal-strength test
+	// (Hyndman FPP3 §6.7). This is R's `forecast::auto.arima` default
+	// when `seasonal.test` isn't set explicitly. Selecting it here
+	// currently returns ErrSEASNotImplemented — the test is a stub
+	// pending PG-97 (Wang-Smith-Hyndman implementation requires STL
+	// decomposition, which goarima doesn't yet have). The constant
+	// exists so the API gap is visible and so callers requesting R
+	// parity get a clear, actionable error instead of silently falling
+	// back to OCSB and getting a different model on M5-shaped daily
+	// data (where SEAS=1 / OCSB=0 / Δ AICc ≈ 50–150).
+	NSDiffsSEAS
 )
+
+// ErrSEASNotImplemented is returned by NSDiffs when the caller requests
+// the Wang-Smith-Hyndman seasonal-strength test. See NSDiffsSEAS.
+var ErrSEASNotImplemented = errors.New(
+	"NSDiffsSEAS (Wang-Smith-Hyndman) not yet implemented; tracked as PG-97. " +
+		"Use NSDiffsOCSB (current default) or NSDiffsCH; note that R's " +
+		"auto.arima default is SEAS, so picks may differ on series where " +
+		"SEAS and OCSB disagree (notably daily M5).")
 
 // NSDiffsOpts groups the configuration for NSDiffs.
 type NSDiffsOpts struct {
@@ -697,6 +716,8 @@ func NSDiffs(x []float64, opts NSDiffsOpts) (int, error) {
 		switch opts.Test {
 		case NSDiffsCH:
 			return CHTest(s, opts.M)
+		case NSDiffsSEAS:
+			return 0, ErrSEASNotImplemented
 		default:
 			return OCSBTest(s, opts.M, opts.LagMethod, opts.MaxLag)
 		}
