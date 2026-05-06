@@ -306,6 +306,50 @@ func TestAutoArima_RankedCandidatesPopulated(t *testing.T) {
 	}
 }
 
+// PG-100: When AllowDrift=true (and d+D > 0), the stepwise constant-
+// toggle move is enabled. The picked model's intercept reflects
+// whichever produced lower AICc — toggle MAY pick true OR false,
+// whichever fits better. We only assert the search converges and
+// the toggle option doesn't break it.
+//
+// Default behaviour (AllowDrift=nil, AllowMean=nil) is unchanged —
+// no toggle, opt-in only. A separate sub-test verifies that.
+func TestAutoArima_ConstantTogglePG100(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	t.Run("default-no-toggle", func(t *testing.T) {
+		// AllowDrift=nil, AllowMean=nil → toggle gated off.
+		m, err := AutoArima(logAp, nil, AutoArimaOpts{
+			M: 12, MaxP: 2, MaxQ: 2, MaxCapP: 1, MaxCapQ: 1,
+			MaxOrder: 4, MaxIter: 50, IC: AICc,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.LogLikelihood() == 0 {
+			t.Error("model not fitted")
+		}
+	})
+	t.Run("allow-drift-toggle-on", func(t *testing.T) {
+		// AllowDrift=true → toggle enabled (since d+D > 0 for log-AP).
+		// Search must converge and produce a valid model.
+		m, err := AutoArima(logAp, nil, AutoArimaOpts{
+			M: 12, MaxP: 2, MaxQ: 2, MaxCapP: 1, MaxCapQ: 1,
+			MaxOrder:   4, MaxIter: 50, IC: AICc,
+			AllowDrift: BoolPtr(true),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.LogLikelihood() == 0 {
+			t.Error("model not fitted")
+		}
+	})
+}
+
 // PG-99: Approximation refit must succeed on standard cases (the
 // fallback only fires on rare numerical edge cases). This test
 // verifies a fast-mode AutoArima fit on log-airpassengers returns

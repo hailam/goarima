@@ -647,7 +647,13 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// gradWorkers is the per-fit BFGS gradient concurrency budget; pass 0
 	// to use full GOMAXPROCS (sequential fit context) or a smaller value
 	// when this fit is one of K running concurrently (so outer×inner ≤ GOMAXPROCS).
-	independentFit := func(k orderKey, gradWorkers int) (*ARIMA, float64, error) {
+	//
+	// intercept is the explicit WithIntercept setting for this fit.
+	// PG-100: extracted as a parameter so the stepwise constant-toggle move
+	// can refit `bestKey` with the flipped intercept without rebuilding the
+	// closure or relying on a captured variable that the toggle would need
+	// to mutate mid-iteration.
+	independentFit := func(k orderKey, gradWorkers int, intercept bool) (*ARIMA, float64, error) {
 		if k.p < 0 || k.q < 0 || k.P < 0 || k.Q < 0 {
 			return nil, 0, fmt.Errorf("negative orders")
 		}
@@ -666,7 +672,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		mdl := &ARIMA{
 			Order:                 ord,
 			Seasonal:              ssn,
-			WithIntercept:         withIntercept,
+			WithIntercept:         intercept,
 			Method:                method,
 			MaxIter:               opts.MaxIter,
 			GradientWorkers:       gradWorkers,
@@ -714,7 +720,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 			return cached, score, "", nil // cache hit — no new trace line
 		}
 		cacheMu.Unlock()
-		mdl, score, err := independentFit(k, gradWorkers)
+		mdl, score, err := independentFit(k, gradWorkers, withIntercept)
 		cacheMu.Lock()
 		if err != nil {
 			cache[k] = nil
@@ -816,7 +822,7 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 			go func() {
 				defer wg.Done()
 				for k := range jobs {
-					mdl, score, err := independentFit(k, gradBudget)
+					mdl, score, err := independentFit(k, gradBudget, withIntercept)
 					results <- result{key: k, model: mdl, score: score, err: err}
 				}
 			}()
@@ -1017,6 +1023,49 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				bestScore = r.score
 				bestKey = neighbors[i]
 				improved = true
+			}
+		}
+
+		// PG-100: constant-toggle stepwise move. R's auto.arima
+		// (newarima2.R:1054-1075) tries flipping the intercept once
+		// per stepwise iteration when allowdrift || allowmean is true.
+		// Goarima gates on the user explicitly setting AllowDrift=true
+		// (when d+D > 0) or AllowMean=true (when d+D == 0) — opt-in to
+		// preserve the legacy default behaviour. When the toggle
+		// accepts, we update best/withIntercept and clear the
+		// candidate cache so subsequent iterations refit with the new
+		// intercept.
+		toggleAllowed := false
+		if (d+D) > 0 && opts.AllowDrift != nil && *opts.AllowDrift {
+			toggleAllowed = true
+		} else if (d+D) == 0 && opts.AllowMean != nil && *opts.AllowMean {
+			toggleAllowed = true
+		}
+		if toggleAllowed {
+			flipped := !withIntercept
+			toggleMdl, toggleScore, toggleErr := independentFit(bestKey, 0, flipped)
+			if toggleErr == nil && toggleMdl != nil {
+				emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] [intercept=%v] : score=%.4f",
+					bestKey.p, d, bestKey.q, bestKey.P, D, bestKey.Q, opts.M, flipped, toggleScore))
+				if toggleScore < bestScore-1e-6 {
+					best = toggleMdl
+					bestScore = toggleScore
+					withIntercept = flipped
+					improved = true
+					// Clear candidate cache: existing entries have the
+					// stale intercept and would mislead subsequent iters.
+					cacheMu.Lock()
+					for k := range cache {
+						delete(cache, k)
+					}
+					for k := range cacheScore {
+						delete(cacheScore, k)
+					}
+					// Re-seed the cache with bestKey under new intercept.
+					cache[bestKey] = best
+					cacheScore[bestKey] = bestScore
+					cacheMu.Unlock()
+				}
 			}
 		}
 	}
