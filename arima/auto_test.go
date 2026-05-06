@@ -252,6 +252,92 @@ func TestParallelGradient_SerialMatchesParallel(t *testing.T) {
 	}
 }
 
+// PG-99: candidatesOut sink populates with ranked candidates from the
+// CSS search, sorted ascending by IC. Used internally by the
+// Approximation wrapper for fallback-on-refit-failure (R-aligned
+// robustness). This test verifies the bookkeeping is correct so the
+// fallback has the right inputs when it fires.
+func TestAutoArima_RankedCandidatesPopulated(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	var ranked []rankedCandidate
+	opts := AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 2, MaxCapQ: 2,
+		MaxOrder:      5,
+		MaxIter:       50,
+		IC:            AICc,
+		candidatesOut: &ranked,
+	}
+	if _, err := AutoArima(logAp, nil, opts); err != nil {
+		t.Fatalf("AutoArima: %v", err)
+	}
+	if len(ranked) == 0 {
+		t.Fatal("ranked list empty — search visited no candidates")
+	}
+	// Ascending by IC.
+	for i := 1; i < len(ranked); i++ {
+		if ranked[i].ic < ranked[i-1].ic {
+			t.Errorf("ranked[%d].ic=%.4f < ranked[%d].ic=%.4f — not sorted ascending",
+				i, ranked[i].ic, i-1, ranked[i-1].ic)
+		}
+	}
+	// All candidates must share the same (d, D) — the unit-root tests
+	// determine these once at the start of the search and stepwise only
+	// varies (p, q, P, Q). On log-airpassengers under default SEAS the
+	// verdict is d=0, D=1; on raw AirPassengers it'd be d=1, D=1. We
+	// don't hardcode the value — just assert consistency.
+	d0 := ranked[0].order.D
+	cap0 := ranked[0].seasonal.D
+	for i, c := range ranked {
+		if c.order.D != d0 {
+			t.Errorf("ranked[%d] d=%d, ranked[0] d=%d — d should be fixed",
+				i, c.order.D, d0)
+		}
+		if c.seasonal.D != cap0 {
+			t.Errorf("ranked[%d] D=%d, ranked[0] D=%d — D should be fixed",
+				i, c.seasonal.D, cap0)
+		}
+		if c.seasonal.M != 12 && (c.seasonal.P+c.seasonal.D+c.seasonal.Q) > 0 {
+			t.Errorf("ranked[%d] non-empty seasonal but m=%d (expected 12)", i, c.seasonal.M)
+		}
+	}
+}
+
+// PG-99: Approximation refit must succeed on standard cases (the
+// fallback only fires on rare numerical edge cases). This test
+// verifies a fast-mode AutoArima fit on log-airpassengers returns
+// a usable model — the fallback path doesn't degrade the success
+// case. The fallback is hard to trigger deterministically with real
+// data; coverage here is the success path + the construction path
+// of the candidate list.
+func TestAutoArima_ApproximationRefitFallback_SuccessCase(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	m, err := AutoArima(logAp, nil, AutoArimaOpts{
+		M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 2, MaxCapQ: 2,
+		MaxOrder:      5,
+		MaxIter:       50,
+		IC:            AICc,
+		Approximation: true,
+	})
+	if err != nil {
+		t.Fatalf("Approximation refit must succeed on log-airpassengers: %v", err)
+	}
+	if m.LogLikelihood() == 0 {
+		t.Error("model not fitted (logL=0)")
+	}
+	// The picked model must be a valid SARIMA on m=12 data.
+	if m.Seasonal.M != 12 {
+		t.Errorf("expected seasonal m=12, got %d", m.Seasonal.M)
+	}
+}
+
 // PG-4a: AutoArimaOpts.StepwiseDiagonals expands stepwise's neighbor
 // set with the 2-axis (p±,q±) and (P±,Q±) diagonal moves R's
 // auto.arima visits. With diagonals on, the search reaches more

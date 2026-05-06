@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"runtime"
+	"sort"
 	"sync"
 
 	"github.com/hailam/goarima/metrics"
@@ -246,7 +247,36 @@ type AutoArimaOpts struct {
 	// DiffuseR (default) matches R's stats::arima; DiffuseStatsmodels
 	// matches SARIMAX(simple_differencing=False).
 	DiffuseConvention DiffuseConv
+
+	// candidatesOut, when non-nil, is populated by AutoArima with the
+	// search's evaluated candidates sorted ascending by IC. Internal
+	// hook used by the Approximation wrapper (PG-99) to fall back to
+	// the next-best CSS candidate if CSSML refit on the CSS-best
+	// fails. Lowercase field — set via the searchOpts inside
+	// approximation, not part of the user API.
+	candidatesOut *[]rankedCandidate
 }
+
+// rankedCandidate carries the search-time information needed by the
+// Approximation refit fallback (PG-99) to walk candidates in CSS-IC
+// order on refit failure.
+type rankedCandidate struct {
+	order         Order
+	seasonal      SeasonalOrder
+	ic            float64
+	withIntercept bool
+	gradWorkers   int
+}
+
+// orderKey is the cache key for a fitted ARIMA candidate during
+// AutoArima's stepwise / FullSearch loops. Only the (p, q, P, Q)
+// dimensions vary during a single search — d / D are fixed by the
+// upstream unit-root tests, so they're not part of the key.
+//
+// Promoted to package scope so the PG-99 ranked-candidate helper
+// (`fillRankedCandidates`) can use it from outside AutoArima's
+// lexical scope.
+type orderKey struct{ p, q, P, Q int }
 
 // BoolPtr returns a pointer to the given bool. Convenience helper for
 // AutoArimaOpts fields that need explicit override (AllowDrift, AllowMean,
@@ -278,30 +308,69 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		searchOpts := opts
 		searchOpts.Method = MethodCSS
 		searchOpts.Approximation = false // prevent recursive Approximation
+		// PG-99: collect ranked candidates from the CSS search so a
+		// CSSML refit failure on the CSS-best can fall back to the
+		// next-best CSS candidate, mirroring R's auto.arima behaviour
+		// at newarima2.R:1093-1116:
+		//
+		//   icorder <- order(results[, 8])
+		//   for (i in seq_len(nmodels)) {
+		//     fit <- myarima(..., approximation = FALSE)
+		//     if (fit$ic < Inf) { bestfit <- fit; break }
+		//   }
+		//
+		// In practice the CSS-best almost always refits cleanly, so the
+		// fallback is a robustness net for numerical-edge cases — but it
+		// closes one of the documented R-divergences (PG-4 #9).
+		var rankedSearch []rankedCandidate
+		searchOpts.candidatesOut = &rankedSearch
 		mSearch, err := AutoArima(y, exog, searchOpts)
 		if err != nil {
 			return nil, err
 		}
-		// Refit the picked order with the user's actual Method, preserving
-		// every other configuration knob from the search.
-		m := NewARIMA(mSearch.Order)
-		m.Seasonal = mSearch.Seasonal
-		m.Method = finalMethod
-		m.MaxIter = opts.MaxIter
-		if m.MaxIter == 0 {
-			m.MaxIter = 100
+		refit := func(o Order, s SeasonalOrder, withIntercept bool, gradWorkers int) (*ARIMA, error) {
+			m := NewARIMA(o)
+			m.Seasonal = s
+			m.Method = finalMethod
+			m.MaxIter = opts.MaxIter
+			if m.MaxIter == 0 {
+				m.MaxIter = 100
+			}
+			m.WithIntercept = withIntercept
+			m.Lambda = opts.Lambda
+			m.Lambda2 = opts.Lambda2
+			m.NonSimpleDifferencing = opts.NonSimpleDifferencing
+			m.DiffuseConvention = opts.DiffuseConvention
+			m.GradientWorkers = gradWorkers
+			m.RidgePenalty = opts.RidgePenalty
+			if err := m.Fit(y, exog); err != nil {
+				return nil, err
+			}
+			return m, nil
 		}
-		m.WithIntercept = mSearch.WithIntercept
-		m.Lambda = opts.Lambda
-		m.Lambda2 = opts.Lambda2
-		m.NonSimpleDifferencing = opts.NonSimpleDifferencing
-		m.DiffuseConvention = opts.DiffuseConvention
-		m.GradientWorkers = mSearch.GradientWorkers
-		m.RidgePenalty = opts.RidgePenalty
-		if err := m.Fit(y, exog); err != nil {
+		// Try CSS-best first.
+		if m, err := refit(mSearch.Order, mSearch.Seasonal, mSearch.WithIntercept, mSearch.GradientWorkers); err == nil {
+			return m, nil
+		} else if len(rankedSearch) == 0 {
 			return nil, fmt.Errorf("approximation refit failed: %w", err)
 		}
-		return m, nil
+		// Fallback: walk the ranked list (best-CSS-IC first), skipping the
+		// already-tried CSS-best, taking the first that refits successfully.
+		var lastErr error
+		for _, c := range rankedSearch {
+			if c.order == mSearch.Order && c.seasonal == mSearch.Seasonal {
+				continue // already tried
+			}
+			m, err := refit(c.order, c.seasonal, c.withIntercept, c.gradWorkers)
+			if err == nil {
+				return m, nil
+			}
+			lastErr = err
+		}
+		if lastErr == nil {
+			return nil, fmt.Errorf("approximation refit failed and no fallback candidates available")
+		}
+		return nil, fmt.Errorf("approximation refit failed (all %d candidates): %w", len(rankedSearch), lastErr)
 	}
 	// Defaults
 	if opts.MaxOrder == 0 {
@@ -525,7 +594,6 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// Default to stepwise unless caller opted into full enumeration.
 	stepwise := !opts.FullSearch
 
-	type orderKey struct{ p, q, P, Q int }
 	cache := map[orderKey]*ARIMA{}
 	cacheScore := map[orderKey]float64{}
 	var cacheMu sync.Mutex // protects cache, cacheScore (stepwise parallel access)
@@ -769,10 +837,17 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 				}
 				emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : fit failed: %v",
 					r.key.p, d, r.key.q, r.key.P, D, r.key.Q, opts.M, r.err))
+				// PG-99: track failed candidates as nil-cache entries so
+				// fillRankedCandidates skips them. Stepwise's tryOrderTraced
+				// already does this; FullSearch uses independentFit directly
+				// and we must mirror the bookkeeping here.
+				cache[r.key] = nil
 				continue
 			}
 			emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] : score=%.4f",
 				r.key.p, d, r.key.q, r.key.P, D, r.key.Q, opts.M, r.score))
+			cache[r.key] = r.model
+			cacheScore[r.key] = r.score
 			if r.score < bestScore {
 				bestScore = r.score
 				best = r.model
@@ -787,6 +862,11 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		}
 		if best == nil {
 			return nil, errors.New("no candidate fit succeeded")
+		}
+		// PG-99: populate ranked-candidate list for the Approximation
+		// wrapper to fall back through on CSSML refit failure.
+		if opts.candidatesOut != nil {
+			fillRankedCandidates(opts.candidatesOut, cache, cacheScore)
 		}
 		return best, nil
 	}
@@ -943,7 +1023,41 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	if best == nil {
 		return nil, errors.New("no successful fit")
 	}
+	if opts.candidatesOut != nil {
+		fillRankedCandidates(opts.candidatesOut, cache, cacheScore)
+	}
 	return best, nil
+}
+
+// fillRankedCandidates populates *out with all successfully-fitted
+// candidates from `cache`, sorted ascending by their score in
+// `cacheScore`. Used by the Approximation wrapper (PG-99) for
+// fallback-on-refit-failure behaviour.
+func fillRankedCandidates(
+	out *[]rankedCandidate,
+	cache map[orderKey]*ARIMA,
+	cacheScore map[orderKey]float64,
+) {
+	list := make([]rankedCandidate, 0, len(cache))
+	for k, mdl := range cache {
+		_ = k
+		if mdl == nil {
+			continue
+		}
+		ic, ok := cacheScore[k]
+		if !ok {
+			continue
+		}
+		list = append(list, rankedCandidate{
+			order:         mdl.Order,
+			seasonal:      mdl.Seasonal,
+			ic:            ic,
+			withIntercept: mdl.WithIntercept,
+			gradWorkers:   mdl.GradientWorkers,
+		})
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].ic < list[j].ic })
+	*out = list
 }
 
 // minInt returns the smaller of two ints.
