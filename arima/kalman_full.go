@@ -108,6 +108,21 @@ func kalmanARIMAFullImpl(
 	if dInt > 0 {
 		copy(zRow[r:], deltaCoefs)
 	}
+	// CDX-3: zRow is structurally sparse (1 at index 0, plus differencing
+	// coefficients at indices [r..rd)). For airline NonSimple (rd=27,
+	// d=D=1, M=12) only 4 entries are nonzero. Pre-compute the sparse
+	// representation once; matvecs below iterate over nonzero z-entries
+	// only, dropping inner-loop work from O(rd) per row to O(nnz(z)).
+	type zNZ struct {
+		j int
+		v float64
+	}
+	var nzZ []zNZ
+	for j := 0; j < rd; j++ {
+		if zRow[j] != 0 {
+			nzZ = append(nzZ, zNZ{j, zRow[j]})
+		}
+	}
 
 	// R column: (1, theta_1, ..., theta_{r-1}, 0, ..., 0). RR' precomputed.
 	rCol := make([]float64, rd)
@@ -166,32 +181,32 @@ func kalmanARIMAFullImpl(
 	newPinf := make([]float64, rd2)
 
 	for t := 0; t < n; t++ {
-		// v_t = y_t - Z * a
+		// CDX-3: v_t = y_t - Z * a (sparse z).
 		predY := 0.0
-		for i := 0; i < rd; i++ {
-			predY += zRow[i] * a[i]
+		for _, z := range nzZ {
+			predY += z.v * a[z.j]
 		}
 		v := y[t] - predY
 		innov[t] = v
 
-		// Minf = Pinf @ z, Mstar = Pstar @ z (row-major matvec).
+		// CDX-3: Minf = Pinf @ z, Mstar = Pstar @ z — O(nnz(z)) per row.
 		for i := 0; i < rd; i++ {
 			base := i * rd
 			si := 0.0
 			ss := 0.0
-			for j := 0; j < rd; j++ {
-				zj := zRow[j]
-				si += Pinf[base+j] * zj
-				ss += Pstar[base+j] * zj
+			for _, z := range nzZ {
+				si += Pinf[base+z.j] * z.v
+				ss += Pstar[base+z.j] * z.v
 			}
 			Minf[i] = si
 			Mstar[i] = ss
 		}
+		// CDX-3: Finf = z' @ Minf, Fstar = z' @ Mstar (sparse z).
 		Finf := 0.0
 		Fstar := 0.0
-		for i := 0; i < rd; i++ {
-			Finf += zRow[i] * Minf[i]
-			Fstar += zRow[i] * Mstar[i]
+		for _, z := range nzZ {
+			Finf += z.v * Minf[z.j]
+			Fstar += z.v * Mstar[z.j]
 		}
 
 		if !diffuseDone && Finf > tol {
