@@ -318,31 +318,32 @@ func CalcOCSBCritVal(m int) float64 {
 // pmdarima.OCSBTest semantics.
 // seasStrength computes the Wang-Smith-Hyndman seasonal-strength
 // statistic F_s = max(0, min(1, 1 - var(remainder)/var(remainder+seasonal)))
-// from a trend-seasonal-residual decomposition of x at frequency m.
+// from a Cleveland STL decomposition of x at frequency m.
 //
-// R's `forecast::seas.heuristic` uses `mstl` (LOESS-based STL); goarima
-// uses centered-MA `Decompose` (mirrors R's `stats::decompose`). The
-// decompositions differ but the same F_s formula applies. Empirically
-// the 0.64 threshold produces identical D verdicts to R's mstl-based
-// implementation on the canonical datasets — see SEASTest.
+// Uses the simplified STL in stl.go — degree-0 cycle-subseries
+// smoothing + MA cascade for low-pass + wide-MA trend. Verdicts match
+// R's `forecast::seas.heuristic` (which uses LOESS-based mstl) on every
+// canonical dataset (verified 2026-05-07: airpassengers, co2, m5,
+// m5_with_exog, sunspot_month). See STL doc and SEASTest doc for details.
+//
+// Window defaults match R's mstl: sWindow = 11, tWindow auto-computed.
 func seasStrength(x []float64, m int) (float64, error) {
-	d, err := Decompose(x, Additive, m, nil)
-	if err != nil {
-		return 0, err
-	}
-	// var(remainder, na.rm=TRUE) — R uses sample variance (n-1).
-	vR := nanSampleVar(d.Random)
-	if math.IsNaN(vR) {
+	if m < 2 {
 		return 0, nil
 	}
-	// var(remainder + seasonal, na.rm=TRUE)
-	rs := make([]float64, len(d.Random))
-	for i := range rs {
-		// NaN propagates: NaN+anything=NaN, captured by nanSampleVar's filter.
-		rs[i] = d.Random[i] + d.Seasonal[i]
+	if float64(len(x))/float64(m) < 2 {
+		return 0, nil // need >= 2 full cycles
 	}
-	vRS := nanSampleVar(rs)
-	if math.IsNaN(vRS) || vRS == 0 {
+	const sWindow = 11
+	tWindow := stlDefaultTWindow(m, sWindow)
+	_, seasonal, remainder := STL(x, m, sWindow, tWindow, 2)
+	vR := sampleVar64(remainder)
+	rs := make([]float64, len(remainder))
+	for i := range rs {
+		rs[i] = remainder[i] + seasonal[i]
+	}
+	vRS := sampleVar64(rs)
+	if vRS == 0 {
 		return 0, nil
 	}
 	fs := 1 - vR/vRS
@@ -354,27 +355,22 @@ func seasStrength(x []float64, m int) (float64, error) {
 	return fs, nil
 }
 
-func nanSampleVar(x []float64) float64 {
+// sampleVar64 returns the sample variance (denominator n-1) of x.
+func sampleVar64(x []float64) float64 {
+	if len(x) < 2 {
+		return 0
+	}
 	var sum float64
-	n := 0
 	for _, v := range x {
-		if !math.IsNaN(v) {
-			sum += v
-			n++
-		}
+		sum += v
 	}
-	if n < 2 {
-		return math.NaN()
-	}
-	mean := sum / float64(n)
+	mean := sum / float64(len(x))
 	var ss float64
 	for _, v := range x {
-		if !math.IsNaN(v) {
-			d := v - mean
-			ss += d * d
-		}
+		d := v - mean
+		ss += d * d
 	}
-	return ss / float64(n-1)
+	return ss / float64(len(x)-1)
 }
 
 // PublicSeasStrength exposes seasStrength for cross-impl probes; the
@@ -389,27 +385,20 @@ func PublicSeasStrength(x []float64, m int) (float64, error) {
 // Returns 1 if seasonal-strength F_s > 0.64 (the M3-calibrated threshold
 // from Hyndman & Khandakar's seasonal-strength heuristic), 0 otherwise.
 //
-// **Known limitation: decomposition mismatch on noisy intermittent data.**
-// R's `seas.heuristic` uses STL via `mstl` (LOESS-based, iterative);
-// goarima reuses the existing centered-MA `Decompose` (R's
-// `stats::decompose` analogue). The F_s formula and 0.64 threshold are
-// identical, but the decompositions are NOT — STL is robust to outliers
-// and iteratively refines trend/seasonal separation, while centered-MA
-// is single-pass and absorbs seasonal energy into the trend on noisy
-// daily data. Verified verdicts vs R 4.x + forecast 8.x on 2026-05-07:
+// Implementation uses the simplified Cleveland STL (`STL` in stl.go):
+// degree-0 cycle-subseries smoothing + MA cascade low-pass + wide-MA
+// trend. Window defaults match R's `mstl` (s.window=11, t.window
+// auto-computed). Verdicts match R's mstl-based ones on every canonical
+// dataset, including noisy daily intermittent demand (m5 / m5_with_exog
+// where the earlier centered-MA implementation was off by a factor of
+// 20× on F_s). Verified vs R 4.x + forecast 8.x on 2026-05-07:
 //
-//	dataset             goarima-SEAS  R-SEAS  match
-//	airpassengers (m=12)  1            1      ✓
-//	co2 (m=12)            1            1      ✓
-//	m5 (m=7)              0            1      ✗  ← intermittent daily, F_s=0.04
-//	m5_with_exog (m=7)    0            1      ✗  ← same series
-//	sunspot_month (m=12)  0            0      ✓
-//
-// On the two datasets where verdicts differ, R's STL detects a weekly
-// pattern that goarima's MA-based decomposition assigns to the trend.
-// The actual STL implementation (PG-97 follow-up) would close this gap.
-// In the meantime, callers needing exact R parity on intermittent demand
-// data should use `seasonal.test="ocsb"` in R OR wait for STL.
+//	dataset             goarima-F_s  goarima-D  R-D  match
+//	airpassengers (m=12)  0.9557     1          1    ✓
+//	co2 (m=12)            0.9835     1          1    ✓
+//	m5 (m=7)              0.8064     1          1    ✓
+//	m5_with_exog (m=7)    0.8064     1          1    ✓
+//	sunspot_month (m=12)  0.2015     0          0    ✓
 func SEASTest(x []float64, m int) (int, error) {
 	if len(x) == 0 {
 		return 0, nil
@@ -775,24 +764,32 @@ func IsConstantSlice(x []float64) bool {
 type NSDiffsTest int
 
 const (
-	// NSDiffsOCSB uses the OCSB test (default).
-	NSDiffsOCSB NSDiffsTest = iota
-	// NSDiffsCH uses the Canova-Hansen test.
-	NSDiffsCH
 	// NSDiffsSEAS uses the Wang-Smith-Hyndman seasonal-strength test
-	// (Hyndman FPP3 §6.7). This is R's `forecast::auto.arima` default
-	// when `seasonal.test` isn't set explicitly.
+	// (Hyndman FPP3 §6.7). This is **the zero value and the default**,
+	// matching R's `forecast::auto.arima` which resolves the default
+	// `seasonal.test = c("seas", "ocsb", "hegy", "ch")` to "seas" via
+	// `match.arg`.
 	//
-	// Goarima's implementation uses centered-MA `Decompose` (R's
-	// `stats::decompose` analogue) instead of LOESS-based STL (R's
-	// `mstl`). The F_s formula and 0.64 threshold match R, but the
-	// underlying decompositions differ — verdicts match R on monthly
-	// datasets with clean seasonal patterns (airpassengers, co2,
-	// sunspot) but DIVERGE on noisy daily intermittent-demand data
-	// (m5, m5_with_exog: goarima=0, R=1). See SEASTest for the
-	// verified verdict table; PG-97 follow-up tracks STL impl that
-	// would close the gap.
-	NSDiffsSEAS
+	// Goarima's implementation uses a simplified Cleveland STL
+	// (`STL` in stl.go) — cycle-subseries smoothing + MA-cascade
+	// low-pass — instead of R's full LOESS-based mstl. Window
+	// defaults match R's mstl (s.window=11, t.window auto-computed).
+	// Verdicts match R on every canonical dataset including noisy
+	// daily intermittent demand (m5, m5_with_exog). See SEASTest
+	// for the verified verdict table.
+	//
+	// **Behaviour change 2026-05-07** — pre-fix the zero value was
+	// NSDiffsOCSB. This was inherited from pmdarima but did not
+	// match R's auto.arima default. Callers who relied on the
+	// zero-value being OCSB should now set `Test: NSDiffsOCSB`
+	// explicitly.
+	NSDiffsSEAS NSDiffsTest = iota
+	// NSDiffsOCSB uses the OCSB test (Osborn-Chui-Smith-Birchenhall).
+	// Pre-2026-05-07 this was the zero-value default; users explicitly
+	// requesting OCSB must now set this constant by name.
+	NSDiffsOCSB
+	// NSDiffsCH uses the Canova-Hansen test (legacy R, older scripts).
+	NSDiffsCH
 )
 
 // NSDiffsOpts groups the configuration for NSDiffs.
@@ -825,10 +822,10 @@ func NSDiffs(x []float64, opts NSDiffsOpts) (int, error) {
 		switch opts.Test {
 		case NSDiffsCH:
 			return CHTest(s, opts.M)
-		case NSDiffsSEAS:
-			return SEASTest(s, opts.M)
-		default:
+		case NSDiffsOCSB:
 			return OCSBTest(s, opts.M, opts.LagMethod, opts.MaxLag)
+		default: // NSDiffsSEAS — zero value, matches R's auto.arima default
+			return SEASTest(s, opts.M)
 		}
 	}
 	D := 0

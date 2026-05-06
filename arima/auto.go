@@ -54,24 +54,20 @@ type AutoArimaOpts struct {
 	Test  NDiffsTest // unit-root test (default KPSS)
 
 	// SeasonalTest selects the seasonal-differencing test. Defaults to
-	// NSDiffsOCSB (zero value), matching pmdarima.auto_arima.
+	// NSDiffsSEAS (zero value) — Wang-Smith-Hyndman seasonal-strength,
+	// matching R's `forecast::auto.arima` which resolves
+	// `seasonal.test = c("seas", "ocsb", "hegy", "ch")` to "seas" by
+	// default.
 	//
-	// **NOT a match for R's `forecast::auto.arima` default**, despite the
-	// pre-2026-05-07 docstring's claim. R defaults to
-	// `seasonal.test = c("seas", "ocsb", "hegy", "ch")` and `match.arg`
-	// resolves that to **"seas"** — the Wang-Smith-Hyndman seasonal-strength
-	// test (Hyndman, FPP3 §6.7). Goarima does not yet implement SEAS, so
-	// users wanting R parity on datasets where SEAS and OCSB disagree
-	// (notably daily M5 series, where SEAS=1 / OCSB=0 / Δ AICc ≈ 50–150)
-	// currently have no way to match R's pick. See PG-97 for the SEAS
-	// implementation TODO; PG-94/95 for the parity tests that surface
-	// the gap.
+	// Set to NSDiffsOCSB to use Osborn-Chui-Smith-Birchenhall (matches
+	// pmdarima's default and R's `seasonal.test="ocsb"`); NSDiffsCH for
+	// the legacy Canova-Hansen test.
 	//
-	// Set to NSDiffsCH for the legacy Canova-Hansen test (older R /
-	// hand-rolled scripts).
-	//
-	// Pre-fix this field didn't exist and the search hard-coded CH, which
-	// underpicks D on short seasonal series where the two tests disagree.
+	// **Behaviour change 2026-05-07**: previously the zero-value default
+	// was NSDiffsOCSB. Picks may differ on datasets where SEAS and OCSB
+	// disagree (notably daily M5-shaped series). Callers who depended on
+	// the OCSB-default behavior should set `SeasonalTest: NSDiffsOCSB`
+	// explicitly.
 	SeasonalTest NSDiffsTest
 
 	WithIntercept *bool // explicit override; nil = auto
