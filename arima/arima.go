@@ -621,6 +621,11 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		}
 		fullPhi := expandSARMAInto(s, phi, sPhi, m.Seasonal.M)
 		fullTheta := expandSMAInto(s, theta, sTheta, m.Seasonal.M)
+		// Note: residOf and armaCSS still allocate per call. Pooling
+		// these (DEEP-AUDIT followup attempt) was empirically a net
+		// loss — Go's mcache amortises small-slice allocations more
+		// efficiently than ensureLenZ's explicit O(n) zeroing.
+		// Documented in PERF_TODO.
 		r := residOf(params)
 		switch m.Method {
 		case MethodCSS:
