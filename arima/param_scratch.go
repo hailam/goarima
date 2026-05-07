@@ -35,19 +35,21 @@ type paramScratch struct {
 	kalman kalmanWorkspace
 }
 
-// kalmanWorkspace holds the 9 reusable buffers that
-// kalmanARMALikelihood would otherwise allocate per call. Sized lazily
-// to fit the largest (n, r) seen in the current Fit; subsequent calls
-// with smaller shapes reuse the leading prefix.
+// kalmanWorkspace holds the reusable buffers that kalmanARMALikelihood
+// would otherwise allocate per call. Sized lazily to fit the largest
+// (n, r) seen in the current Fit; subsequent calls with smaller shapes
+// reuse the leading prefix.
+//
+// PG-113: nzT and TP were dropped — the predict step now exploits T's
+// companion structure directly (shift + phi-broadcast), eliminating the
+// sparse-T iteration and the TP intermediate.
 type kalmanWorkspace struct {
-	nzT  []tNZ     // sparse-T entries, len ≤ 2r
 	Rvec []float64 // R selection vector, len r
 	RRt  []float64 // RR' precomputed, len r*r (zeroed each call)
 	a    []float64 // state mean, len r (zeroed each call)
 	K    []float64 // Kalman gain, len r
 	row0 []float64 // P[0,:] snapshot, len r
 	newA []float64 // predicted state, len r
-	TP   []float64 // T·P, len r*r (zeroed each call)
 	newP []float64 // predicted covariance, len r*r
 	// (innov omitted from the workspace — Fit's compute closure throws
 	// it away; allocating it would be wasted. Internal callers that

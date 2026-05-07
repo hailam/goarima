@@ -17,7 +17,7 @@ import (
 // and large negative values, producing wrong logL / AIC / AICc that
 // disagree with R::stats::arima and statsmodels.SARIMAX.
 //
-// Status: tracked as KAL-1 in docs/.scratched/PERF_TODO.md.
+// Status: tracked as KAL-1.
 //
 // These probes capture the diagnostic data so that any future fix can
 // be verified to bring sum_log_F back into the expected band.

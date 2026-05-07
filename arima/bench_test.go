@@ -153,6 +153,37 @@ func BenchmarkKalmanARIMAFull(b *testing.B) {
 	}
 }
 
+// BenchmarkKalmanARMA_SeasMA_r27 is the PG-113 target case — Kalman
+// likelihood for an expanded SARIMA(1,0,2)(0,0,2)[12] (state r=27)
+// at n=3310, mirroring the sunspot_month seasonal-MA refit profile.
+// This is the inner kernel that the audit measured at 62% flat.
+func BenchmarkKalmanARMA_SeasMA_r27(b *testing.B) {
+	y := simulateAR1(3310, 0.5, 1.0, 7)
+	phi := expandSARMA([]float64{0.4}, nil, 12)
+	theta := expandSMA([]float64{-0.3, -0.1}, []float64{-0.5, -0.2}, 12)
+	var ws kalmanWorkspace
+	_, _ = kalmanARMALikelihoodInto(y, phi, theta, &ws)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = kalmanARMALikelihoodInto(y, phi, theta, &ws)
+	}
+}
+
+// BenchmarkKalmanARMA_Airline_r13 is the smaller airline-shape case
+// (0,1,1)(0,1,1)[12] giving expanded q=13 → r=14 — the typical monthly
+// SARIMA. Used to verify PG-113 changes don't regress the common case.
+func BenchmarkKalmanARMA_Airline_r13(b *testing.B) {
+	y := simulateAR1(132, 0.0, 1.0, 7)
+	phi := []float64{}
+	theta := expandSMA([]float64{-0.4}, []float64{-0.6}, 12)
+	var ws kalmanWorkspace
+	_, _ = kalmanARMALikelihoodInto(y, phi, theta, &ws)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_, _ = kalmanARMALikelihoodInto(y, phi, theta, &ws)
+	}
+}
+
 // BenchmarkPredictBoot measures bootstrap CIs on a fitted SARIMA model.
 // This path is dominated by the per-simulation forecast loop; it benefits
 // strongly from the cache-reuse + window-only history optimization.

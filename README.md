@@ -27,7 +27,7 @@ result, this project decides in this order:
    diagnostics), we keep the divergence and document it.
 
 Specific currently-shipped divergences from R, with rationale, are
-listed in `docs/.scratched/PERF_TODO.md` PG-92 through PG-100.
+tracked internally as PG-92 through PG-100.
 
 ## Status
 

@@ -109,22 +109,6 @@ func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (neg
 		return float64(n) / 2 * (math.Log(2*math.Pi*s2) + 1), s2
 	}
 
-	// nzT — capacity 2r, length grown to actual nz count below.
-	if cap(ws.nzT) < 2*r {
-		ws.nzT = make([]tNZ, 0, 2*r)
-	} else {
-		ws.nzT = ws.nzT[:0]
-	}
-	for i := 0; i < r; i++ {
-		if i < p && phi[i] != 0 {
-			ws.nzT = append(ws.nzT, tNZ{i, 0, phi[i]})
-		}
-		if i+1 < r {
-			ws.nzT = append(ws.nzT, tNZ{i, i + 1, 1})
-		}
-	}
-	nzT := ws.nzT
-
 	// Rvec — zeroed because we only set the [0..q] entries explicitly.
 	ws.Rvec = ensureLenZ(ws.Rvec, r)
 	Rvec := ws.Rvec
@@ -161,13 +145,16 @@ func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (neg
 	row0 := ws.row0
 	ws.newA = ensureLen(ws.newA, r)
 	newA := ws.newA
-	ws.TP = ensureLen(ws.TP, r*r)
-	TP := ws.TP
 	ws.newP = ensureLen(ws.newP, r*r)
 	newP := ws.newP
 
 	logF := 0.0
 	sumVF := 0.0
+
+	// PG-113: P is symmetric, so we only maintain its upper triangle in the
+	// hot loop. The lower triangle of {P, newP} is not read; first-step
+	// reads come from Gardner's full output (which is symmetric anyway).
+	// Reads of "first column" P[i, 0] are remapped to P[0, i] by symmetry.
 
 	for t := 0; t < n; t++ {
 		v := y[t] - a[0]
@@ -176,47 +163,87 @@ func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (neg
 			return math.Inf(1), 0
 		}
 		invF := 1.0 / F
+		// K[i] = P[i,0]/F = P[0,i]/F by symmetry — read upper.
 		for i := 0; i < r; i++ {
-			K[i] = P[i*r] * invF
+			K[i] = P[i] * invF
 			a[i] += K[i] * v
 		}
+		// Joseph P-update (upper triangle only).
+		// P[i,j] += -K[i]·row0[j] + (K[i]·F - row0[i])·K[j]
+		// Hoisted coef + 2-AXPY shape; restricted to j ≥ i since P is
+		// symmetric. The Joseph form preserves PSD against rounding error
+		// (KAL-1) — cannot be replaced by the rank-1 `P -= K·row0` form.
 		copy(row0, P[:r])
 		for i := 0; i < r; i++ {
 			ki := K[i]
-			r0i := row0[i]
+			coef := ki*F - row0[i]
 			off := i * r
-			for j := 0; j < r; j++ {
-				kj := K[j]
-				P[off+j] += -ki*row0[j] - kj*r0i + ki*kj*F
+			for j := i; j < r; j++ {
+				P[off+j] += coef*K[j] - ki*row0[j]
 			}
 		}
 		logF += math.Log(F)
 		sumVF += v * v * invF
 
-		for i := 0; i < r; i++ {
-			newA[i] = 0
+		// Predict step (PG-113). T is the ARMA companion matrix with
+		// T[i, 0] = phi[i] (i<p) and T[i, i+1] = 1 (i+1<r).
+		//
+		// Fused TP+newP: newP[i,k] = (T·P·T')[i,k] + RRt[i,k] decomposes as
+		//   • diagonal-shift bulk:    P[i+1, k+1]               (i+1<r, k+1<r)
+		//   • phi-row broadcast:      phi[i] · P[0, k+1]        (i<p, k+1<r)
+		//   • phi-col broadcast:      phi[k] · P[0, i+1]        (k<p, i+1<r)  [via symmetry]
+		//   • phi-phi corner:         phi[i] · phi[k] · P[0,0]  (i<p, k<p)
+		// We compute only the upper triangle (j ≥ i).
+
+		a0 := a[0]
+		for i := 0; i+1 < r; i++ {
+			newA[i] = a[i+1]
 		}
-		for _, e := range nzT {
-			newA[e.i] += e.v * a[e.j]
+		newA[r-1] = 0
+		for i := 0; i < p; i++ {
+			if pi := phi[i]; pi != 0 {
+				newA[i] += pi * a0
+			}
 		}
 		copy(a, newA)
 
-		for k := range TP {
-			TP[k] = 0
+		// Diagonal-shift bulk + RRt (upper only).
+		for i := 0; i+1 < r; i++ {
+			rowOut := i * r
+			rowIn := (i + 1) * r
+			for k := i; k+1 < r; k++ {
+				newP[rowOut+k] = P[rowIn+k+1] + RRt[rowOut+k]
+			}
+			newP[rowOut+r-1] = RRt[rowOut+r-1]
 		}
-		for _, e := range nzT {
-			ti := e.i * r
-			tj := e.j * r
-			tv := e.v
-			for j := 0; j < r; j++ {
-				TP[ti+j] += tv * P[tj+j]
+		newP[(r-1)*r+r-1] = RRt[(r-1)*r+r-1]
+
+		// phi-row: newP[i, k] += phi[i] · P[0, k+1] for i<p, i ≤ k, k+1<r.
+		for i := 0; i < p; i++ {
+			pi := phi[i]
+			if pi == 0 {
+				continue
+			}
+			rowOut := i * r
+			for k := i; k+1 < r; k++ {
+				newP[rowOut+k] += pi * P[k+1]
 			}
 		}
-		copy(newP, RRt)
-		for i := 0; i < r; i++ {
-			row := i * r
-			for _, e := range nzT {
-				newP[row+e.i] += TP[row+e.j] * e.v
+		// phi-col + phi-corner contribute only to the small (0..p-1, 0..p-1)
+		// upper-triangular block. P[i+1, 0] = P[0, i+1] by symmetry.
+		P0 := P[0]
+		for k := 0; k < p; k++ {
+			pk := phi[k]
+			if pk == 0 {
+				continue
+			}
+			for i := 0; i <= k; i++ {
+				if i+1 < r {
+					newP[i*r+k] += pk * P[i+1]
+				}
+				if pi := phi[i]; pi != 0 {
+					newP[i*r+k] += pi * pk * P0
+				}
 			}
 		}
 		P, newP = newP, P
@@ -302,17 +329,6 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		return float64(n) / 2 * (math.Log(2*math.Pi*s2) + 1), s2, nil
 	}
 
-	// T (companion form) as sparse triples: T[i,0] = phi[i] for i<p,
-	// T[i,i+1] = 1 for i+1<r. At most p + (r-1) ≤ 2r-1 nonzero entries.
-	nzT := make([]tNZ, 0, 2*r)
-	for i := 0; i < r; i++ {
-		if i < p && phi[i] != 0 {
-			nzT = append(nzT, tNZ{i, 0, phi[i]})
-		}
-		if i+1 < r {
-			nzT = append(nzT, tNZ{i, i + 1, 1})
-		}
-	}
 	// R selection: (1, theta_1, ..., theta_{r-1}, 0...). Build RR' once.
 	Rvec := make([]float64, r)
 	Rvec[0] = 1
@@ -344,12 +360,14 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 	K := make([]float64, r)
 	row0 := make([]float64, r)
 	newA := make([]float64, r)
-	TP := make([]float64, r*r)
 	newP := make([]float64, r*r)
 
 	innov := make([]float64, n)
 	logF := 0.0
 	sumVF := 0.0
+
+	// PG-113: upper-triangle-only — see kalmanARMALikelihoodInto for the
+	// detailed case decomposition.
 
 	for t := 0; t < n; t++ {
 		v := y[t] - a[0]
@@ -359,26 +377,16 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		}
 		invF := 1.0 / F
 		for i := 0; i < r; i++ {
-			K[i] = P[i*r] * invF
+			K[i] = P[i] * invF
 			a[i] += K[i] * v
 		}
-		// Joseph-form covariance update: P = (I - K·H)·P·(I - K·H)' + K·R·K'.
-		// With ARMA companion form H = [1,0,…,0] and observation noise R = 0:
-		//   P_new[i,j] = P[i,j] - K[i]·row0[j] - K[j]·row0[i] + K[i]·K[j]·F
-		// (row0 is a snapshot of P's first row taken BEFORE the update.)
-		// Symmetric by construction; preserves PSD against rounding error.
-		// Replaces the older rank-1 form `P -= K·row0` which is mathematically
-		// equivalent only in exact arithmetic — numerically it loses
-		// symmetry/PSD over many steps once BFGS pushes φ near the unit
-		// circle, causing F = P[0,0] to drift wildly. See KAL-1.
 		copy(row0, P[:r])
 		for i := 0; i < r; i++ {
 			ki := K[i]
-			r0i := row0[i]
+			coef := ki*F - row0[i]
 			off := i * r
-			for j := 0; j < r; j++ {
-				kj := K[j]
-				P[off+j] += -ki*row0[j] - kj*r0i + ki*kj*F
+			for j := i; j < r; j++ {
+				P[off+j] += coef*K[j] - ki*row0[j]
 			}
 		}
 
@@ -386,35 +394,51 @@ func kalmanARMALikelihood(y, phi, theta []float64) (negLogLik, sigma2 float64, i
 		logF += math.Log(F)
 		sumVF += v * v * invF
 
-		// Predict via sparse T:
-		//   a' = T*a
-		//   P' = T*P*T' + RR'
-		for i := 0; i < r; i++ {
-			newA[i] = 0
+		a0 := a[0]
+		for i := 0; i+1 < r; i++ {
+			newA[i] = a[i+1]
 		}
-		for _, e := range nzT {
-			newA[e.i] += e.v * a[e.j]
+		newA[r-1] = 0
+		for i := 0; i < p; i++ {
+			if pi := phi[i]; pi != 0 {
+				newA[i] += pi * a0
+			}
 		}
 		copy(a, newA)
 
-		// TP = T @ P (sparse-T, dense-P).
-		for k := range TP {
-			TP[k] = 0
+		for i := 0; i+1 < r; i++ {
+			rowOut := i * r
+			rowIn := (i + 1) * r
+			for k := i; k+1 < r; k++ {
+				newP[rowOut+k] = P[rowIn+k+1] + RRt[rowOut+k]
+			}
+			newP[rowOut+r-1] = RRt[rowOut+r-1]
 		}
-		for _, e := range nzT {
-			ti := e.i * r
-			tj := e.j * r
-			tv := e.v
-			for j := 0; j < r; j++ {
-				TP[ti+j] += tv * P[tj+j]
+		newP[(r-1)*r+r-1] = RRt[(r-1)*r+r-1]
+
+		for i := 0; i < p; i++ {
+			pi := phi[i]
+			if pi == 0 {
+				continue
+			}
+			rowOut := i * r
+			for k := i; k+1 < r; k++ {
+				newP[rowOut+k] += pi * P[k+1]
 			}
 		}
-		// P' = TP @ T' + RR'.
-		copy(newP, RRt)
-		for i := 0; i < r; i++ {
-			row := i * r
-			for _, e := range nzT {
-				newP[row+e.i] += TP[row+e.j] * e.v
+		P0 := P[0]
+		for k := 0; k < p; k++ {
+			pk := phi[k]
+			if pk == 0 {
+				continue
+			}
+			for i := 0; i <= k; i++ {
+				if i+1 < r {
+					newP[i*r+k] += pk * P[i+1]
+				}
+				if pi := phi[i]; pi != 0 {
+					newP[i*r+k] += pi * pk * P0
+				}
 			}
 		}
 		P, newP = newP, P
