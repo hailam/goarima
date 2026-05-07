@@ -671,21 +671,48 @@ const (
 	// NDiffsKPSS uses the KPSS test (default).
 	NDiffsKPSS NDiffsTest = iota
 	// NDiffsADF uses the Augmented Dickey-Fuller test.
+	//
+	// **Regression formulation: type="trend" (intercept + linear time trend).**
+	// This is the so-called "τ_τ" form, matching `tseries::adf.test`.
+	//
+	// R's `forecast::ndiffs(test="adf")` uses **`urca::ur.df`** (NOT
+	// `tseries::adf.test`), and ur.df defaults to **type="drift"**
+	// (intercept only, no trend) when `ndiffs(... type="level")` —
+	// which is the ndiffs default. The critical-value tables differ
+	// between τ_τ (trend) and τ_μ (drift) and so do the verdicts on
+	// trending series. On airpassengers (visibly trending), goarima
+	// τ_τ-ADF rejects the unit root because the trend regressor
+	// absorbs the trend; R τ_μ-ADF leaves the trend in the residual
+	// and fails to reject. Both verdicts are statistically defensible
+	// for the formulation chosen — goarima diverges from R on
+	// airpassengers (goarima=0, R=1) for this reason. Other canonical
+	// datasets agree.
+	//
+	// Use NDiffsKPSS for R-aligned `auto.arima` defaults (this is what
+	// goarima's stepwise actually uses). NDiffsADF is here as an
+	// alternative for users who explicitly want the τ_τ formulation.
+	// A future Type field (PG-110) would let callers select τ_μ for
+	// strict R parity; not yet implemented.
 	NDiffsADF
 	// NDiffsPP uses the Phillips-Perron test.
 	//
-	// Available as an alternative to KPSS (default) and ADF, matching R's
-	// `ndiffs(x, test="pp")`. Empirical parity vs R 4.x + forecast 8.x
-	// (verified 2026-05-07): matches R on m5, m5_with_exog, sunspot_month;
-	// diverges on airpassengers (goarima=0, R=1) and co2 (goarima=0, R=1)
-	// because of small-sample bandwidth/lag-truncation default differences
-	// vs `tseries::pp.test`. Both verdicts are statistically defensible
-	// — different default LShort / kernel choices land on different sides
-	// of the 5% threshold on borderline series.
+	// **Regression formulation: τ_τ (intercept + linear time trend).**
+	// Matches `tseries::pp.test`. R's `forecast::ndiffs(test="pp")`
+	// uses `urca::ur.pp(... model="constant")` — the τ_μ formulation
+	// (intercept only). Same root cause as the ADF divergence
+	// documented at NDiffsADF: different formulations have different
+	// critical-value tables and disagree on trending series.
 	//
-	// Use NDiffsKPSS for R-aligned `auto.arima` defaults. Use NDiffsPP
-	// when you specifically want a Newey-West-corrected unit-root test
-	// (e.g., heteroskedastic financial / count data).
+	// Empirical parity vs R 4.x + forecast 8.x (verified 2026-05-07):
+	// matches R on m5, m5_with_exog, sunspot_month; diverges on
+	// airpassengers (goarima τ_τ=0, R τ_μ=1) and co2 (goarima τ_τ=0,
+	// R τ_μ=1). Both verdicts are statistically defensible.
+	//
+	// Use NDiffsKPSS for R-aligned `auto.arima` defaults (this is what
+	// goarima's stepwise actually uses). NDiffsPP is here as an
+	// alternative for the τ_τ formulation. PG-110 tracks adding a
+	// Type field to PPTestOpts so callers can select τ_μ for strict
+	// R parity.
 	NDiffsPP
 )
 
