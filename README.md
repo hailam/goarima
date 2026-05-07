@@ -1,10 +1,33 @@
 # goarima
 
-A Go port of [pmdarima](https://github.com/alkaline-ml/pmdarima) and R's
-[`stats::arima`](https://www.rdocumentation.org/packages/stats/topics/arima) /
-[`forecast::Arima`](https://pkg.robjhyndman.com/forecast/reference/Arima.html) —
-auto ARIMA, exact-diffuse Kalman filter, unit-root tests, and a sklearn-style
-pipeline.
+A Go implementation of the **Hyndman-Khandakar `auto.arima` algorithm**
+([`forecast::auto.arima`](https://pkg.robjhyndman.com/forecast/reference/auto.arima.html))
+with the same `stats::arima` Kalman likelihood it builds on. Surface API
+mirrors [pmdarima](https://github.com/alkaline-ml/pmdarima) so existing
+Python users feel at home — but R `forecast` is the canonical reference
+when implementations diverge.
+
+Includes auto ARIMA, the exact-diffuse Kalman filter, unit-root tests
+(KPSS / OCSB / SEAS / CH), and a sklearn-style pipeline.
+
+## Divergence-decision policy
+
+When R `forecast::auto.arima`, pmdarima, and goarima disagree on a
+result, this project decides in this order:
+
+1. **R first.** R's `forecast::auto.arima` is the canonical Hyndman-
+   Khandakar reference. Behaviour aligns with R unless empirical
+   evidence on canonical datasets shows R is genuinely worse.
+2. **pmdarima second.** pmdarima models its API on R closely; we use
+   it as a tiebreaker reference and to keep the option / field names
+   familiar to Python users. We do not chase pmdarima compatibility
+   when it conflicts with R.
+3. **Empirical winner third.** When goarima's behaviour beats R on
+   the canonical threeway-tests-goarima grid (verified AICc / fit
+   diagnostics), we keep the divergence and document it.
+
+Specific currently-shipped divergences from R, with rationale, are
+listed in `docs/.scratched/PERF_TODO.md` PG-92 through PG-100.
 
 ## Status
 
@@ -189,11 +212,14 @@ to R or to statsmodels' default is required.
 
 ## Coming from pmdarima or R? API map
 
-goarima ships as a port of *both* pmdarima and `forecast::auto.arima` /
-`stats::arima`. Where pmdarima and R agree on shape/behavior, goarima matches
-them. Where they disagree, goarima exposes a knob (e.g.
-`DiffuseConvention`, `Method`) and picks a sensible default. The table below
-lists the surface differences that bite users porting code over.
+goarima implements `forecast::auto.arima` (R) on top of a `stats::arima`-
+equivalent Kalman likelihood, with the API surface modelled on pmdarima
+so Python users find option names familiar. **When pmdarima and R
+disagree, R wins** (see "Divergence-decision policy" above). Where
+both references agree, goarima matches them. Where neither has a
+clear answer, goarima exposes a knob (e.g. `DiffuseConvention`,
+`Method`) and picks a sensible default. The table below lists the
+surface differences that bite users porting code over.
 
 | Concern | pmdarima | R | goarima |
 |---|---|---|---|

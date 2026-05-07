@@ -306,6 +306,50 @@ func TestAutoArima_RankedCandidatesPopulated(t *testing.T) {
 	}
 }
 
+// PG-104: MultiStart=true fits the four H-K initial seeds, picks the
+// lowest-IC one, and runs stepwise from there. This test verifies the
+// flag is wired correctly and produces a usable model on a clean
+// monthly seasonal series. Default (MultiStart=false) is unchanged.
+func TestAutoArima_MultiStartPG104(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	logAp := make([]float64, len(ap))
+	for i, v := range ap {
+		logAp[i] = math.Log(v)
+	}
+	t.Run("default-off", func(t *testing.T) {
+		m, err := AutoArima(logAp, nil, AutoArimaOpts{
+			M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 2, MaxCapQ: 2,
+			MaxOrder: 5, MaxIter: 50, IC: AICc,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.LogLikelihood() == 0 {
+			t.Error("model not fitted")
+		}
+	})
+	t.Run("multi-start-on", func(t *testing.T) {
+		m, err := AutoArima(logAp, nil, AutoArimaOpts{
+			M: 12, MaxP: 3, MaxQ: 3, MaxCapP: 2, MaxCapQ: 2,
+			MaxOrder:   5, MaxIter: 50, IC: AICc,
+			MultiStart: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if m.LogLikelihood() == 0 {
+			t.Error("multi-start model not fitted")
+		}
+		// On airpassengers default mode, multi-start should match or
+		// beat the default-seed AICc (1017.76 in the canonical grid).
+		// Allow small tolerance for BFGS convergence noise.
+		if m.AICc() > 1018.5 {
+			t.Errorf("multi-start AICc on log-airpassengers default: got %.4f, expected ≤ 1018.5",
+				m.AICc())
+		}
+	})
+}
+
 // PG-100: When AllowDrift=true (and d+D > 0), the stepwise constant-
 // toggle move is enabled. The picked model's intercept reflects
 // whichever produced lower AICc — toggle MAY pick true OR false,

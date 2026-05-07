@@ -1,5 +1,10 @@
 // Package arima provides ARIMA / SARIMAX model fitting and forecasting
-// ported from pmdarima.arima.
+// implementing R's Hyndman-Khandakar `forecast::auto.arima` algorithm
+// on top of an exact-diffuse Kalman likelihood that matches
+// `stats::arima`. The Go API surface is kept aligned with pmdarima.arima
+// (option names, method signatures) so Python users find the package
+// familiar; when R and pmdarima conflict, R is canonical — see
+// README "Divergence-decision policy".
 package arima
 
 import "fmt"

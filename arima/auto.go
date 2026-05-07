@@ -209,6 +209,41 @@ type AutoArimaOpts struct {
 	// model selection and accept the wallclock cost. Default false.
 	StepwiseDiagonals bool
 
+	// MultiStart, when true, fits the four Hyndman-Khandakar initial
+	// seeds at the start of stepwise search (per R `newarima2.R:489-625`),
+	// picks the lowest-IC seed, and runs stepwise from there:
+	//
+	//   1. (start.p, d, start.q)(start.P, D, start.Q) — defaults to (2,2,1,1)
+	//   2. (0, d, 0)(0, D, 0)                          — null model
+	//   3. (1, d, 0)(1, D, 0)                          — basic AR
+	//   4. (0, d, 1)(0, D, 1)                          — basic MA
+	//
+	// **Off by default** because R's "pick best initial by standalone
+	// IC" heuristic isn't reliable: on noisy daily intermittent-demand
+	// data (m5 fast), the seed with lowest standalone IC leads to a
+	// stepwise basin that's catastrophically worse than goarima's
+	// default-seed basin (+579 AICc on m5 fast in the 2026-05-07
+	// empirical study). The "best of 4 stepwise outcomes" oracle would
+	// avoid this, but capturing it requires running all 4 paths
+	// (4× search work).
+	//
+	// Empirical study (2026-05-07, post-PG-98 SEAS) on canonical
+	// threeway-tests-goarima datasets, comparing PG-104's R-style
+	// "pick best initial" to goarima's default single-seed:
+	//
+	//   - Wins: co2 fast (−2.86 AICc), m5_with_exog default (−30 AICc)
+	//   - Ties: airpassengers default/fast, co2 default, m5 default,
+	//     sunspot default
+	//   - **Catastrophic loss**: m5 fast (+579 AICc)
+	//
+	// Set true if your input series are unlikely to have m5-shaped
+	// (daily, intermittent, noisy) characteristics and you want the
+	// co2 fast / m5_with_exog default wins. Cost: 4 standalone initial
+	// fits at the start of each AutoArima call. The "run all 4 paths"
+	// alternative is tracked as a follow-up if/when there's enough
+	// real-world demand.
+	MultiStart bool
+
 	// Approximation, when true, runs the candidate search with MethodCSS
 	// (fast, biased likelihood) regardless of the Method field, then
 	// refits the picked (Order, Seasonal) once with the user's Method
@@ -287,8 +322,14 @@ func BoolPtr(v bool) *bool { return &v }
 // exog is optional (nil for none); if provided, every fitted candidate
 // includes the same regressors and the chosen IC compares like-for-like.
 //
-// Mirrors pmdarima.auto_arima: chooses d/D via unit-root tests, then
-// either explores neighbors stepwise (default) or enumerates the search box.
+// Implements the Hyndman-Khandakar (2008) algorithm — R's
+// `forecast::auto.arima`. Chooses d / D via unit-root tests
+// (KPSS for d, Wang-Smith-Hyndman SEAS by default for D, matching
+// R), then either explores neighbours stepwise (default) or
+// enumerates the search box. The option names mirror
+// pmdarima.auto_arima for Python-side familiarity, but R is the
+// canonical reference for behaviour — see README "Divergence-
+// decision policy".
 func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error) {
 	if len(y) < 10 {
 		return nil, fmt.Errorf("series too short: %d", len(y))
@@ -589,6 +630,118 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		// Auto: default-on for d=0 (mean), default-off for d>0 (drift) —
 		// matching R's auto.arima default of allowmean=TRUE, allowdrift=FALSE.
 		withIntercept = (d + D) == 0
+	}
+
+	// PG-104: H-K multi-start. Fit the four R `forecast::auto.arima`
+	// initial seeds (newarima2.R:489-625), pick the one with lowest IC,
+	// override (p, q, P, Q) so stepwise expands from that seed.
+	//
+	// R uses initial seeds that mirror the ones below; `start.P=1,
+	// start.Q=1` defaults give `(2,d,2)(1,D,1)` for seed1, which sums
+	// to 6 and exceeds the default MaxOrder=5. R does not clamp on
+	// the initial fits — the seeds are fit at their full size and
+	// only stepwise-neighbour expansion later respects MaxOrder.
+	// Goarima follows the same pattern: seeds are fit unclamped, then
+	// the picked seed is clamped to MaxOrder for stepwise compatibility.
+	if opts.MultiStart && !opts.FullSearch {
+		type hkSeed struct{ p, q, P, Q int }
+		// Default H-K seed1 uses (start.p=2, start.q=2, start.P=1,
+		// start.Q=1) per R; overridden by explicit user values.
+		seedP := opts.StartP
+		if seedP == 0 {
+			seedP = 2
+		}
+		seedQ := opts.StartQ
+		if seedQ == 0 {
+			seedQ = 2
+		}
+		seedCapP := opts.StartCapP
+		seedCapQ := opts.StartCapQ
+		if opts.M > 1 {
+			if opts.StartCapP == 0 {
+				seedCapP = 1
+			}
+			if opts.StartCapQ == 0 {
+				seedCapQ = 1
+			}
+		} else {
+			seedCapP, seedCapQ = 0, 0
+		}
+		btoi := func(b bool) int {
+			if b {
+				return 1
+			}
+			return 0
+		}
+		seeds := []hkSeed{
+			{seedP, seedQ, seedCapP, seedCapQ},                        // hk1: (2,2,1,1) by default
+			{0, 0, 0, 0},                                              // hk2: null
+			{btoi(opts.MaxP > 0), 0, btoi(opts.MaxCapP > 0 && opts.M > 1), 0}, // hk3: basic AR
+			{0, btoi(opts.MaxQ > 0), 0, btoi(opts.MaxCapQ > 0 && opts.M > 1)}, // hk4: basic MA
+		}
+		bestSeedIC := math.Inf(1)
+		bestSeed := seeds[0]
+		for _, sd := range seeds {
+			// Drop max-bound violators (in case of pathological MaxP/MaxQ).
+			if sd.p > opts.MaxP || sd.q > opts.MaxQ ||
+				sd.P > opts.MaxCapP || sd.Q > opts.MaxCapQ {
+				continue
+			}
+			ord := Order{P: sd.p, D: d, Q: sd.q}
+			var ssn SeasonalOrder
+			if opts.M > 1 && (sd.P+sd.Q+D > 0) {
+				ssn = SeasonalOrder{P: sd.P, D: D, Q: sd.Q, M: opts.M}
+			}
+			mdl := &ARIMA{
+				Order:                 ord,
+				Seasonal:              ssn,
+				WithIntercept:         withIntercept,
+				Method:                opts.Method,
+				MaxIter:               opts.MaxIter,
+				Lambda:                opts.Lambda,
+				RidgePenalty:          opts.RidgePenalty,
+				Lambda2:               opts.Lambda2,
+				NonSimpleDifferencing: opts.NonSimpleDifferencing,
+				DiffuseConvention:     opts.DiffuseConvention,
+			}
+			if err := mdl.Fit(yFit, xFit); err != nil {
+				continue
+			}
+			ic := mdl.IC(opts.IC)
+			if ic < bestSeedIC {
+				bestSeedIC = ic
+				bestSeed = sd
+			}
+		}
+		if !math.IsInf(bestSeedIC, 1) {
+			// Override the stepwise starting point with the best seed.
+			p, q, P, Q = bestSeed.p, bestSeed.q, bestSeed.P, bestSeed.Q
+			// Clamp to MaxOrder for stepwise compatibility (stepwise
+			// neighbour expansion enforces MaxOrder; the initial
+			// `tryOrder(p, q, P, Q, 0)` call below would error otherwise).
+			for p+q+P+Q > opts.MaxOrder {
+				switch {
+				case Q > 0:
+					Q--
+				case P > 0:
+					P--
+				case q > 0:
+					q--
+				case p > 0:
+					p--
+				default:
+					p, q, P, Q = 0, 0, 0, 0
+				}
+				if p+q+P+Q == 0 {
+					break
+				}
+			}
+			if opts.Trace != nil {
+				opts.Trace(fmt.Sprintf(
+					"multi-start: best initial = (%d,%d,%d)(%d,%d,%d)[%d] IC=%.4f",
+					bestSeed.p, d, bestSeed.q, bestSeed.P, D, bestSeed.Q, opts.M, bestSeedIC))
+			}
+		}
 	}
 
 	// Default to stepwise unless caller opted into full enumeration.

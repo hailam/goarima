@@ -74,10 +74,16 @@ const (
 
 // ARIMA fits an ARIMA(p,d,q)(P,D,Q,m) model with optional exogenous regressors.
 //
-// API mirrors pmdarima.arima.ARIMA. Exogenous regressors X enter the model as
-// linear predictors: y_t = X_t @ beta + u_t, where u_t follows the ARIMA
-// process. Beta is estimated jointly with the ARMA parameters by maximising
-// the Gaussian log-likelihood.
+// Likelihood and search behaviour follow R's `stats::arima` /
+// `forecast::Arima` (the Hyndman-Khandakar reference); the option and
+// method names are kept aligned with pmdarima.arima.ARIMA so Python
+// users find the API familiar. When the two references conflict, R
+// is canonical — see README "Divergence-decision policy".
+//
+// Exogenous regressors X enter the model as linear predictors:
+// y_t = X_t @ beta + u_t, where u_t follows the ARIMA process. Beta
+// is estimated jointly with the ARMA parameters by maximising the
+// Gaussian log-likelihood.
 type ARIMA struct {
 	// Configuration
 	Order         Order
