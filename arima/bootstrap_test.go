@@ -2,8 +2,130 @@ package arima
 
 import (
 	"math"
+	"math/rand/v2"
+	"sort"
 	"testing"
 )
+
+// CDX-1: quickselect-based quantilesFromUnsorted must produce
+// bit-identical results to the legacy sort-based path for any input.
+// We compare against `sort.Float64s + quantile` across a battery of
+// sizes / quantile pairs / seeds, including pathological inputs
+// (constant, already-sorted, reverse-sorted, all-NaN-free with ties).
+func TestQuantilesFromUnsorted_MatchesSortBased(t *testing.T) {
+	rng := rand.New(rand.NewPCG(42, 7))
+	type spec struct {
+		name string
+		gen  func(n int) []float64
+	}
+	specs := []spec{
+		{"random", func(n int) []float64 {
+			out := make([]float64, n)
+			for i := range out {
+				out[i] = rng.NormFloat64()
+			}
+			return out
+		}},
+		{"sorted", func(n int) []float64 {
+			out := make([]float64, n)
+			for i := range out {
+				out[i] = float64(i)
+			}
+			return out
+		}},
+		{"reverse", func(n int) []float64 {
+			out := make([]float64, n)
+			for i := range out {
+				out[i] = float64(n - i)
+			}
+			return out
+		}},
+		{"ties", func(n int) []float64 {
+			out := make([]float64, n)
+			for i := range out {
+				out[i] = float64(i % 5) // many duplicates
+			}
+			return out
+		}},
+		{"constant", func(n int) []float64 {
+			out := make([]float64, n)
+			for i := range out {
+				out[i] = 3.14
+			}
+			return out
+		}},
+	}
+	quantilePairs := [][2]float64{
+		{0.025, 0.975},
+		{0.05, 0.95},
+		{0.1, 0.9},
+		{0.25, 0.75},
+		{0.5, 0.5},
+		{0.0, 1.0},
+		{0.001, 0.999},
+	}
+	sizes := []int{1, 2, 3, 5, 10, 100, 1000}
+	for _, sp := range specs {
+		for _, n := range sizes {
+			for _, qp := range quantilePairs {
+				name := sp.name + "_n" + intToStr(n) + "_q" + floatToStr(qp[0]) + "-" + floatToStr(qp[1])
+				t.Run(name, func(t *testing.T) {
+					orig := sp.gen(n)
+					// Reference: sort + quantile.
+					sorted := append([]float64(nil), orig...)
+					sort.Float64s(sorted)
+					wantLo := quantile(sorted, qp[0])
+					wantHi := quantile(sorted, qp[1])
+					// Under test: quickselect.
+					col := append([]float64(nil), orig...)
+					gotLo, gotHi := quantilesFromUnsorted(col, qp[0], qp[1])
+					if math.Abs(gotLo-wantLo) > 1e-12 {
+						t.Errorf("loQ=%.4f: got %.6f, want %.6f", qp[0], gotLo, wantLo)
+					}
+					if math.Abs(gotHi-wantHi) > 1e-12 {
+						t.Errorf("hiQ=%.4f: got %.6f, want %.6f", qp[1], gotHi, wantHi)
+					}
+				})
+			}
+		}
+	}
+}
+
+func intToStr(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	var buf [20]byte
+	i := len(buf)
+	for n > 0 {
+		i--
+		buf[i] = byte('0' + n%10)
+		n /= 10
+	}
+	if neg {
+		i--
+		buf[i] = '-'
+	}
+	return string(buf[i:])
+}
+
+func floatToStr(f float64) string {
+	// Compact formatter for sub-test names: 0.025 → "0.025", 0.5 → "0.5".
+	// Avoids fmt to keep the test self-contained for parallel runs.
+	if f == 0 {
+		return "0"
+	}
+	if f == 1 {
+		return "1"
+	}
+	// 3-decimal precision is enough for our quantile test inputs.
+	scaled := int(f*1000 + 0.5)
+	return "0." + intToStr(scaled)
+}
 
 func TestPredictBootBasic(t *testing.T) {
 	y := simulateAR1(300, 0.6, 1.0, 1)

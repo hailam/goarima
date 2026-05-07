@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"sort"
 )
 
 // BootstrapInferenceResult holds parameter-level inference statistics
@@ -182,9 +181,8 @@ func (m *ARIMA) BootstrapInference(opts BootstrapInferenceOpts) (*BootstrapInfer
 		for i, row := range samples {
 			col[i] = row[j]
 		}
-		sort.Float64s(col)
-		res.Lower[j] = quantile(col, loQ)
-		res.Upper[j] = quantile(col, hiQ)
+		// CDX-1: quickselect-based quantiles avoid the full sort.
+		res.Lower[j], res.Upper[j] = quantilesFromUnsorted(col, loQ, hiQ)
 	}
 
 	if !opts.OmitSamples {
