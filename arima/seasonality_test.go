@@ -125,26 +125,33 @@ func TestNSDiffsCornerCases(t *testing.T) {
 	}
 }
 
-// PG-105: NSDiffsHEGY is exposed as a constant to match R's
-// `nsdiffs(test="hegy")` API surface, but the implementation is a
-// stub returning ErrHEGYNotImplemented. R itself gates HEGY behind
-// the optional `uroot` package — calling it without the package
-// errors similarly. This test pins the stub-with-clear-error
-// contract so users who request HEGY get an actionable message
-// instead of a silent fallback.
-func TestNSDiffsHEGY_ReturnsClearError(t *testing.T) {
-	austres := datasets.LoadAustres()
-	d, err := NSDiffs(austres, NSDiffsOpts{
-		M: 4, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
+// PG-106: NSDiffsHEGY runs the Hylleberg-Engle-Granger-Yoo seasonal
+// unit-root test for m∈{4, 12} (quarterly + monthly canonical cases).
+// Other m return ErrHEGYNotSupportedForM. Verdicts match R's
+// `forecast::nsdiffs(test="hegy")` on canonical datasets — see
+// threeway TestNSDiffsHEGYParityWithR for cross-impl assertions.
+func TestNSDiffsHEGY_BasicShape(t *testing.T) {
+	// Unsupported m on a real-world series → clear error.
+	ap := datasets.LoadAirPassengers()
+	d, err := NSDiffs(ap, NSDiffsOpts{
+		M: 7, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
 	})
 	if err == nil {
-		t.Fatalf("NSDiffsHEGY must return ErrHEGYNotImplemented; got d=%d, nil err", d)
+		t.Fatalf("NSDiffsHEGY at m=7 must return ErrHEGYNotSupportedForM; got d=%d", d)
 	}
-	if !errors.Is(err, ErrHEGYNotImplemented) {
-		t.Errorf("NSDiffsHEGY error must be ErrHEGYNotImplemented; got %v", err)
+	if !errors.Is(err, ErrHEGYNotSupportedForM) {
+		t.Errorf("expected ErrHEGYNotSupportedForM; got %v", err)
 	}
-	if d != 0 {
-		t.Errorf("NSDiffsHEGY error path must return d=0; got %d", d)
+	// Supported m=12 on AirPassengers (real seasonal data).
+	d, err = NSDiffs(ap, NSDiffsOpts{
+		M: 12, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
+	})
+	if err != nil {
+		t.Fatalf("NSDiffsHEGY m=12 on airpassengers: %v", err)
+	}
+	// AirPassengers has strong seasonality; R verdict is D=1.
+	if d != 1 {
+		t.Errorf("HEGY airpassengers: got D=%d, want 1 (matches R)", d)
 	}
 }
 

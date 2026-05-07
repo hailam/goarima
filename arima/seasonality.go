@@ -815,37 +815,19 @@ const (
 	NSDiffsCH
 	// NSDiffsHEGY uses the Hylleberg-Engle-Granger-Yoo test for
 	// seasonal unit roots at multiple frequencies simultaneously
-	// (Hylleberg, Engle, Granger, Yoo 1990, JoE 44, 215-238). R
-	// exposes this via `nsdiffs(x, test="hegy")`, but the actual
-	// implementation lives in the **`uroot` package**, not in
-	// `forecast` — calling it without `uroot` installed errors with
-	// "Using a hegy test requires the uroot package."
+	// (Hylleberg, Engle, Granger, Yoo 1990, JoE 44, 215-238 for
+	// quarterly; Beaulieu-Miron 1993 for monthly). Matches R's
+	// `forecast::nsdiffs(test="hegy")` which uses
+	// `uroot::hegy.test(deterministic=c(1,1,0), maxlag=3,
+	// lag.method="AIC")` and verdict-criterion `F_{2:m} p-value > α`.
 	//
-	// Goarima mirrors that gating: the constant exists so callers
-	// can ask for HEGY by name (matching R's API), but the
-	// implementation is currently a stub returning
-	// ErrHEGYNotImplemented. Implementation is non-trivial — HEGY
-	// requires per-(m, T, α) critical-value tables (Hylleberg et
-	// al.'s original paper tabulates only m∈{4, 12}) and the
-	// Beaulieu-Miron auxiliary-regression construction is easy to
-	// get wrong across m ≠ 12. Use NSDiffsSEAS (default), NSDiffsOCSB,
-	// or NSDiffsCH for production use; HEGY is reserved as a future
-	// add when there's empirical demand for a real workload it would
-	// help that the other three tests can't handle.
+	// **Currently supports m=4 (quarterly) and m=12 (monthly).** For
+	// other m, NSDiffs returns ErrHEGYNotSupportedForM. Adding
+	// support for arbitrary m would require simulated critical-value
+	// surfaces (à la `uroot::hegy.test`'s response-surface tables);
+	// not yet shipped.
 	NSDiffsHEGY
 )
-
-// ErrHEGYNotImplemented is returned by NSDiffs when the caller asks
-// for the Hylleberg-Engle-Granger-Yoo test. The constant is exposed
-// to match R's API surface (R also gates HEGY behind the optional
-// `uroot` package); the goarima implementation is deferred until
-// there's an empirical workload that needs it. See NSDiffsHEGY doc.
-var ErrHEGYNotImplemented = errors.New(
-	"NSDiffsHEGY (Hylleberg-Engle-Granger-Yoo) is not yet implemented in " +
-		"goarima — the constant exists to match R's nsdiffs(test=\"hegy\") " +
-		"API surface. Use NSDiffsSEAS (default), NSDiffsOCSB, or NSDiffsCH for " +
-		"seasonal differencing decisions. R's hegy.test similarly requires " +
-		"the optional `uroot` package and errors out without it.")
 
 // NSDiffsOpts groups the configuration for NSDiffs.
 type NSDiffsOpts struct {
@@ -880,7 +862,7 @@ func NSDiffs(x []float64, opts NSDiffsOpts) (int, error) {
 		case NSDiffsOCSB:
 			return OCSBTest(s, opts.M, opts.LagMethod, opts.MaxLag)
 		case NSDiffsHEGY:
-			return 0, ErrHEGYNotImplemented
+			return HEGYTest(s, opts.M)
 		default: // NSDiffsSEAS — zero value, matches R's auto.arima default
 			return SEASTest(s, opts.M)
 		}
