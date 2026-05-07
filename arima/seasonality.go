@@ -686,23 +686,16 @@ const (
 	NDiffsADF
 	// NDiffsPP uses the Phillips-Perron test.
 	//
-	// **Regression formulation: τ_τ (intercept + linear time trend).**
-	// Matches `tseries::pp.test`. R's `forecast::ndiffs(test="pp")`
-	// uses `urca::ur.pp(... model="constant")` — the τ_μ formulation
-	// (intercept only). Same root cause as the ADF divergence
-	// documented at NDiffsADF: different formulations have different
-	// critical-value tables and disagree on trending series.
+	// **Statistic + regression formulation: Z(τ) with intercept-only
+	// (τ_μ) by default.** Matches R's `forecast::ndiffs(test="pp")`,
+	// which uses `urca::ur.pp(type="Z-tau", model="constant")` internally.
+	// Verdicts match R 5/5 on canonical datasets (post-PG-110b).
 	//
-	// Empirical parity vs R 4.x + forecast 8.x (verified 2026-05-07):
-	// matches R on m5, m5_with_exog, sunspot_month; diverges on
-	// airpassengers (goarima τ_τ=0, R τ_μ=1) and co2 (goarima τ_τ=0,
-	// R τ_μ=1). Both verdicts are statistically defensible.
-	//
-	// Use NDiffsKPSS for R-aligned `auto.arima` defaults (this is what
-	// goarima's stepwise actually uses). NDiffsPP is here as an
-	// alternative for the τ_τ formulation. PG-110 tracks adding a
-	// Type field to PPTestOpts so callers can select τ_μ for strict
-	// R parity.
+	// To use the legacy Z(α) statistic with intercept + trend (the
+	// pre-PG-110b goarima default, matches Phillips-Perron 1988
+	// original) call `PPTest` directly with
+	// `PPTestOpts{Type: PPZAlphaTrend}`. To use Z(τ) with trend
+	// (matches `tseries::pp.test` default) use `Type: PPZTauTrend`.
 	NDiffsPP
 )
 

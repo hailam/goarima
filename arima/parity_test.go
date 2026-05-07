@@ -14,11 +14,11 @@ import (
 // document the divergence and assert the pmdarima value, since urca is not
 // in scope of this port.
 //
-// R published expectations:
+// R published expectations (matched 5/5 post-PG-110b):
 //
-//	ndiffs(AirPassengers, test = "kpss") == 1   ✓ matches us
-//	ndiffs(AirPassengers, test = "adf")  == 1   ✓ matches us post-PG-110 (default τ_μ)
-//	ndiffs(AirPassengers, test = "pp")   == 1   diverges — goarima PP still τ_τ
+//	ndiffs(AirPassengers, test = "kpss") == 1
+//	ndiffs(AirPassengers, test = "adf")  == 1   PG-110 τ_μ default
+//	ndiffs(AirPassengers, test = "pp")   == 1   PG-110b Z(τ) drift default
 func TestNDiffsParityAirPassengers(t *testing.T) {
 	ap := datasets.LoadAirPassengers()
 	cases := []struct {
@@ -27,7 +27,7 @@ func TestNDiffsParityAirPassengers(t *testing.T) {
 	}{
 		{NDiffsKPSS, 1},
 		{NDiffsADF, 1}, // PG-110: τ_μ default matches R's urca-based ndiffs
-		{NDiffsPP, 0},  // τ_τ still — PP τ_μ tracked as PG-110-followup
+		{NDiffsPP, 1},  // PG-110b: Z(τ) drift default matches R
 	}
 	for _, c := range cases {
 		got, err := NDiffs(ap, NDiffsOpts{Test: c.test, MaxD: 2, Alpha: 0.05})

@@ -188,7 +188,11 @@ func TestADFCorner(t *testing.T) {
 }
 
 // Mirrors test_pp for austres in lshort=true and lshort=false.
-// Expected values come from pmdarima on the same input.
+// Expected values come from pmdarima on the same input — pmdarima uses
+// the Z(α) statistic with intercept + trend (τ_τ formulation), which is
+// post-PG-110b accessible via Type=PPZAlphaTrend (was the only goarima
+// option pre-PG-110b). The new default Type=PPZTauDrift uses Z(τ) for
+// R `forecast::ndiffs(test="pp")` parity — see TestPPAustres_ZTauDrift.
 func TestPPAustres(t *testing.T) {
 	austres := datasets.LoadAustres()
 	cases := []struct {
@@ -199,7 +203,9 @@ func TestPPAustres(t *testing.T) {
 		{false, 0.9514588685512652},
 	}
 	for _, c := range cases {
-		res, err := PPTest(austres, PPTestOpts{Alpha: 0.05, LShort: c.lshort})
+		res, err := PPTest(austres, PPTestOpts{
+			Alpha: 0.05, LShort: c.lshort, Type: PPZAlphaTrend,
+		})
 		if err != nil {
 			t.Fatalf("lshort=%v: %v", c.lshort, err)
 		}

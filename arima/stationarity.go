@@ -365,11 +365,11 @@ var ppTable = [][]float64{
 	{-29.5, -25.1, -21.8, -18.3, -3.77, -2.66, -1.79, -0.87},
 }
 
-// PP τ_μ formulation is tracked as PG-110-followup. The Phillips-Perron
-// Z(α) statistic uses a different scale than the ADF t-statistic, so the
-// "drift-only" critical-value table needs careful sourcing (e.g.
-// extracting from `urca` or simulating). Until that table lands, PPTest
-// always uses the τ_τ formulation (matches `tseries::pp.test`).
+// PG-110b: PP Z(τ) form uses the same Dickey-Fuller asymptotic
+// distribution as the ADF t-stat, so we can reuse the ADF critical-
+// value tables (`adfTable` for τ_τ, `adfTableMu` for τ_μ). The Z(α)
+// form has its own scale and would need ppTable / a τ_μ Z(α) table —
+// goarima keeps Z(α) only as a non-default opt-in via PPZAlphaTrend.
 
 // ppTableT is the sample-size grid.
 var ppTableT = []float64{25, 50, 100, 250, 500, 100000}
@@ -384,13 +384,43 @@ type PPResult struct {
 	Stat       float64
 }
 
+// PPType selects the Phillips-Perron statistic and regression formulation.
+type PPType int
+
+const (
+	// PPZTauDrift uses the Z(τ) statistic with intercept-only regression
+	// (τ_μ). Matches R's `urca::ur.pp(type="Z-tau", model="constant")`,
+	// which is what `forecast::ndiffs(test="pp")` uses by default. Zero
+	// value, default — pre-PG-110b the only option was Z(α) with trend
+	// (now PPZAlphaTrend) and verdicts diverged from R on trending series.
+	PPZTauDrift PPType = iota
+	// PPZTauTrend uses the Z(τ) statistic with intercept + linear trend
+	// regression (τ_τ). Matches `tseries::pp.test` default.
+	PPZTauTrend
+	// PPZAlphaTrend uses the Z(α) statistic with intercept + linear trend
+	// regression. Pre-PG-110b goarima default. Kept as opt-in for users
+	// who specifically want this variant (the α form has historical
+	// significance — Phillips-Perron 1988 original); the Z(τ) form is
+	// what R's auto.arima path uses.
+	PPZAlphaTrend
+)
+
 // PPTestOpts groups the Phillips-Perron test parameters.
 type PPTestOpts struct {
 	Alpha  float64
 	LShort bool
+	// Type selects the statistic and regression formulation. Default
+	// PPZTauDrift (zero value) for R `forecast::ndiffs(test="pp")`
+	// parity. Pre-PG-110b goarima hardcoded what's now PPZAlphaTrend.
+	Type PPType
 }
 
-// PPTest implements the Phillips-Perron unit-root test (Z-alpha variant).
+// PPTest implements the Phillips-Perron unit-root test.
+//
+// Default Type=PPZTauDrift uses the Z(τ) statistic with intercept-only
+// regression — matches R's auto.arima path. Set Type=PPZAlphaTrend for
+// the legacy Z(α) statistic with trend (pre-PG-110b goarima default,
+// matches Phillips-Perron 1988 original).
 func PPTest(x []float64, opts PPTestOpts) (PPResult, error) {
 	if opts.Alpha == 0 {
 		opts.Alpha = 0.05
@@ -409,9 +439,17 @@ func PPTest(x []float64, opts PPTestOpts) (PPResult, error) {
 	for i := range tt {
 		tt[i] = float64(i+1) - float64(n)/2.0
 	}
+	// Branch on Type: τ_τ (PPZTauTrend, PPZAlphaTrend) includes intercept
+	// + trend + y_{t-1}; τ_μ (PPZTauDrift) drops the trend column. The
+	// y_{t-1} coefficient stays at the last position so the index used by
+	// olsStdErr below is always (len(X[0]) - 1).
 	X := make([][]float64, n)
 	for i := 0; i < n; i++ {
-		X[i] = []float64{1, tt[i], yt1[i]}
+		if opts.Type == PPZTauDrift {
+			X[i] = []float64{1, yt1[i]}
+		} else {
+			X[i] = []float64{1, tt[i], yt1[i]}
+		}
 	}
 	beta, err := olsFit(X, yt, false)
 	if err != nil {
@@ -452,22 +490,60 @@ func PPTest(x []float64, opts PPTestOpts) (PPResult, error) {
 	trm4 := (float64(n) * float64(n+1) * float64(2*n+1) * sumYt1 * sumYt1) / 6.0
 	dx := trm1 - trm2 + trm3 - trm4
 
-	alpha := beta[2]
-	stat := float64(n)*(alpha-1) - math.Pow(float64(n), 6)/(24.0*dx)*(ssqrtl-ssqru)
+	// alpha = OLS coefficient on y_{t-1} (last column of X).
+	alphaIdx := len(X[0]) - 1
+	alpha := beta[alphaIdx]
 
-	tableiPL := make([]float64, len(ppTableP))
-	for i := range ppTableP {
-		col := make([]float64, len(ppTable))
-		for r := range ppTable {
-			col[r] = ppTable[r][i]
+	var stat float64
+	var critTable [][]float64
+	var critP []float64
+	var critT []float64
+
+	switch opts.Type {
+	case PPZTauDrift, PPZTauTrend:
+		// PG-110b: Z(τ) statistic — t-stat form, matches R's
+		// `urca::ur.pp(type="Z-tau")`. Reuses ADF τ_μ / τ_τ critical-
+		// value tables since the Z(τ) asymptotic distribution is the
+		// same Dickey-Fuller distribution as ADF's t-stat.
+		//
+		// Z_τ = sqrt(σ²_u / σ²_l) * t̂_α - 0.5 * (σ²_l - σ²_u) *
+		//        sqrt(n) * SE(α̂) / (sqrt(σ²_l) * sqrt(σ²_u))
+		seAlpha, seErr := olsStdErr(X, resid, alphaIdx)
+		if seErr != nil {
+			return PPResult{}, seErr
 		}
-		out, err := Approx(ppTableT, col, []float64{float64(n)}, Linear, RuleClip)
+		tAlpha := (alpha - 1) / seAlpha
+		factor := math.Sqrt(ssqru / ssqrtl)
+		correction := 0.5 * (ssqrtl - ssqru) * math.Sqrt(float64(n)) * seAlpha /
+			(math.Sqrt(ssqrtl) * math.Sqrt(ssqru))
+		stat = factor*tAlpha - correction
+		if opts.Type == PPZTauDrift {
+			critTable = adfTableMu
+		} else {
+			critTable = adfTable
+		}
+		critP = adfTableP
+		critT = adfTableT
+	default: // PPZAlphaTrend — legacy Z(α) form with trend
+		stat = float64(n)*(alpha-1) - math.Pow(float64(n), 6)/(24.0*dx)*(ssqrtl-ssqru)
+		critTable = ppTable
+		critP = ppTableP
+		critT = ppTableT
+	}
+
+	tableiPL := make([]float64, len(critP))
+	for i := range critP {
+		col := make([]float64, len(critTable))
+		for r := range critTable {
+			col[r] = critTable[r][i]
+		}
+		out, err := Approx(critT, col, []float64{float64(n)}, Linear, RuleClip)
 		if err != nil {
 			return PPResult{}, err
 		}
 		tableiPL[i] = out[0]
 	}
-	out, err := Approx(tableiPL, ppTableP, []float64{stat}, Linear, RuleClip)
+	out, err := Approx(tableiPL, critP, []float64{stat}, Linear, RuleClip)
 	if err != nil {
 		return PPResult{}, err
 	}
