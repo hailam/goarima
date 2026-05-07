@@ -142,10 +142,11 @@ func TestADFPValueSmall(t *testing.T) {
 	}
 }
 
-// Mirrors test_adf for austres on k=1, 2, default.
-//
-// Expected p-values come from running pmdarima.ADFTest on the same input.
-// Tighter than R's published rounded values to catch silent numerical drift.
+// Mirrors test_adf for austres on k=1, 2, default — pmdarima-parity
+// values were captured with the τ_τ formulation (intercept + trend).
+// Post-PG-110 the default formulation is τ_μ (matches R), so this test
+// now sets `Type: ADFTrend` explicitly to keep the pmdarima-parity
+// assertions valid.
 func TestADFAustres(t *testing.T) {
 	austres := datasets.LoadAustres()
 	cases := []struct {
@@ -157,7 +158,7 @@ func TestADFAustres(t *testing.T) {
 		{2, true, 0.7060733181808536},
 	}
 	for _, c := range cases {
-		opts := ADFTestOpts{Alpha: 0.05, K: c.k, HasK: c.hasK}
+		opts := ADFTestOpts{Alpha: 0.05, K: c.k, HasK: c.hasK, Type: ADFTrend}
 		res, err := ADFTest(austres, opts)
 		if err != nil {
 			t.Fatalf("k=%d: %v", c.k, err)
@@ -169,8 +170,8 @@ func TestADFAustres(t *testing.T) {
 			t.Errorf("k=%d should diff (pval > alpha)", c.k)
 		}
 	}
-	// Default k uses trunc((n-1)^(1/3)); should match R's published value too.
-	res, err := ADFTest(austres, ADFTestOpts{Alpha: 0.05})
+	// Default k uses trunc((n-1)^(1/3)); pmdarima-equivalent (τ_τ) value.
+	res, err := ADFTest(austres, ADFTestOpts{Alpha: 0.05, Type: ADFTrend})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -172,8 +172,11 @@ func KPSSTest(x []float64, opts KPSSTestOpts) (KPSSResult, error) {
 	return KPSSResult{PValue: pval, ShouldDiff: pval < opts.Alpha, Stat: stat}, nil
 }
 
-// adfTable holds the augmented Dickey-Fuller critical-value matrix
-// (rows = sample sizes; cols = significance levels), per pmdarima/arima/stationarity.py.
+// adfTable holds the augmented Dickey-Fuller τ_τ critical-value matrix
+// (intercept + linear trend regression — the "ct" / "trend" formulation,
+// matching `tseries::adf.test`). Rows = sample sizes (adfTableT); cols =
+// p-values (adfTableP). Source: pmdarima/arima/stationarity.py /
+// Banerjee, Dolado, Galbraith, Hendry 1993 Table 4.2.
 var adfTable = [][]float64{
 	{-4.38, -3.95, -3.60, -3.24, -1.14, -0.80, -0.50, -0.15},
 	{-4.15, -3.80, -3.50, -3.18, -1.19, -0.87, -0.58, -0.24},
@@ -181,6 +184,24 @@ var adfTable = [][]float64{
 	{-3.99, -3.69, -3.43, -3.13, -1.23, -0.92, -0.64, -0.31},
 	{-3.98, -3.68, -3.42, -3.13, -1.24, -0.93, -0.65, -0.32},
 	{-3.96, -3.66, -3.41, -3.12, -1.25, -0.94, -0.66, -0.33},
+}
+
+// adfTableMu holds the τ_μ critical-value matrix for the ADF "drift"
+// formulation (intercept only, no trend — matches `urca::ur.df(...,
+// type="drift")` which is what R's `forecast::ndiffs(test="adf")` uses
+// by default). Source: Banerjee, Dolado, Galbraith, Hendry 1993
+// Table 4.1.
+//
+// Rows: n = 25, 50, 100, 250, 500, ∞ (same grid as adfTableT).
+// Cols: p = 0.01, 0.025, 0.05, 0.10, 0.90, 0.95, 0.975, 0.99
+//       (same grid as adfTableP).
+var adfTableMu = [][]float64{
+	{-3.75, -3.33, -3.00, -2.63, -0.37, 0.00, 0.34, 0.72},
+	{-3.58, -3.22, -2.93, -2.60, -0.40, -0.03, 0.29, 0.66},
+	{-3.51, -3.17, -2.89, -2.58, -0.42, -0.05, 0.26, 0.63},
+	{-3.46, -3.14, -2.88, -2.57, -0.42, -0.06, 0.24, 0.62},
+	{-3.44, -3.13, -2.87, -2.57, -0.43, -0.07, 0.24, 0.61},
+	{-3.43, -3.12, -2.86, -2.57, -0.44, -0.07, 0.23, 0.60},
 }
 
 // adfTableT is the row labels (sample sizes).
@@ -196,11 +217,36 @@ type ADFResult struct {
 	Stat       float64
 }
 
+// ADFType selects the ADF auxiliary-regression formulation.
+type ADFType int
+
+const (
+	// ADFDrift fits Δy_t = α + β·y_{t-1} + Σ φ_j·Δy_{t-j} + ε_t
+	// (intercept only, no trend — the τ_μ formulation). Matches R's
+	// `urca::ur.df(..., type="drift")`, which is what
+	// `forecast::ndiffs(test="adf")` uses by default. Critical values
+	// from `adfTableMu` (Banerjee et al. 1993 Table 4.1).
+	ADFDrift ADFType = iota
+	// ADFTrend fits Δy_t = α + β·y_{t-1} + γ·t + Σ φ_j·Δy_{t-j} + ε_t
+	// (intercept + linear time trend — the τ_τ formulation). Matches
+	// `tseries::adf.test`. Critical values from `adfTable` (Banerjee
+	// et al. 1993 Table 4.2). Pre-PG-110 this was the only goarima
+	// formulation.
+	ADFTrend
+)
+
 // ADFTestOpts groups the Augmented Dickey-Fuller parameters.
 type ADFTestOpts struct {
 	Alpha float64 // significance level (default 0.05)
 	K     int     // lag order; 0 → trunc((n-1)^(1/3))
 	HasK  bool    // explicit K supplied
+	// Type selects the auxiliary-regression formulation. **Default
+	// `ADFDrift` (the zero value) for R `forecast::ndiffs(test="adf")`
+	// parity** — pre-PG-110 the regression hardcoded τ_τ (drift +
+	// trend) which diverged from R on trending series like
+	// airpassengers. Set Type=ADFTrend to recover the pre-2026-05-07
+	// behaviour or to match `tseries::adf.test`'s default.
+	Type ADFType
 }
 
 // ADFTest implements the Augmented Dickey-Fuller stationarity test.
@@ -245,8 +291,18 @@ func ADFTest(x []float64, opts ADFTestOpts) (ADFResult, error) {
 	}
 	rows := len(yt)
 	X := make([][]float64, rows)
+	// Branch on Type: τ_τ (default pre-PG-110) includes intercept +
+	// y_{t-1} + time trend; τ_μ (default post-PG-110) drops the trend
+	// column for intercept-only regression. The y_{t-1} coefficient
+	// stays at index 1 either way so olsStdErr(X, resid, 1) below
+	// targets the correct column.
 	for i := 0; i < rows; i++ {
-		row := []float64{1, xt1[i], tt[i]}
+		var row []float64
+		if opts.Type == ADFTrend {
+			row = []float64{1, xt1[i], tt[i]}
+		} else { // ADFDrift (zero value, default)
+			row = []float64{1, xt1[i]}
+		}
 		if k > 1 {
 			row = append(row, zT[i][1:k]...)
 		}
@@ -271,12 +327,17 @@ func ADFTest(x []float64, opts ADFTestOpts) (ADFResult, error) {
 	}
 	stat := beta[1] / stdErr
 
+	// Pick the right critical-value table for the formulation.
+	useTable := adfTableMu // τ_μ for ADFDrift
+	if opts.Type == ADFTrend {
+		useTable = adfTable // τ_τ for ADFTrend
+	}
 	// Interpolate critical table column-by-column at the sample size.
 	tableiPL := make([]float64, len(adfTableP))
 	for i := range adfTableP {
-		col := make([]float64, len(adfTable))
-		for r := range adfTable {
-			col[r] = adfTable[r][i]
+		col := make([]float64, len(useTable))
+		for r := range useTable {
+			col[r] = useTable[r][i]
 		}
 		out, err := Approx(adfTableT, col, []float64{float64(n)}, Linear, RuleClip)
 		if err != nil {
@@ -292,7 +353,9 @@ func ADFTest(x []float64, opts ADFTestOpts) (ADFResult, error) {
 	return ADFResult{PValue: pval, ShouldDiff: pval > opts.Alpha, Stat: stat}, nil
 }
 
-// ppTable is the Phillips-Perron Z(alpha) critical-value matrix.
+// ppTable is the Phillips-Perron Z(alpha) critical-value matrix for the
+// τ_τ formulation (intercept + linear trend), matching `tseries::pp.test`.
+// Rows = sample sizes (ppTableT); cols = p-values (ppTableP).
 var ppTable = [][]float64{
 	{-22.5, -19.9, -17.9, -15.6, -3.66, -2.51, -1.53, -0.43},
 	{-25.7, -22.4, -19.8, -16.8, -3.71, -2.60, -1.66, -0.65},
@@ -301,6 +364,12 @@ var ppTable = [][]float64{
 	{-28.9, -24.8, -21.5, -18.1, -3.76, -2.65, -1.78, -0.84},
 	{-29.5, -25.1, -21.8, -18.3, -3.77, -2.66, -1.79, -0.87},
 }
+
+// PP τ_μ formulation is tracked as PG-110-followup. The Phillips-Perron
+// Z(α) statistic uses a different scale than the ADF t-statistic, so the
+// "drift-only" critical-value table needs careful sourcing (e.g.
+// extracting from `urca` or simulating). Until that table lands, PPTest
+// always uses the τ_τ formulation (matches `tseries::pp.test`).
 
 // ppTableT is the sample-size grid.
 var ppTableT = []float64{25, 50, 100, 250, 500, 100000}

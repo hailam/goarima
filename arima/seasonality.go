@@ -672,27 +672,17 @@ const (
 	NDiffsKPSS NDiffsTest = iota
 	// NDiffsADF uses the Augmented Dickey-Fuller test.
 	//
-	// **Regression formulation: type="trend" (intercept + linear time trend).**
-	// This is the so-called "τ_τ" form, matching `tseries::adf.test`.
+	// **Regression formulation: τ_μ (intercept only, no trend) by
+	// default.** Matches R's `forecast::ndiffs(test="adf")`, which
+	// uses `urca::ur.df(..., type="drift")` internally. Verdicts
+	// match R 5/5 on canonical datasets.
 	//
-	// R's `forecast::ndiffs(test="adf")` uses **`urca::ur.df`** (NOT
-	// `tseries::adf.test`), and ur.df defaults to **type="drift"**
-	// (intercept only, no trend) when `ndiffs(... type="level")` —
-	// which is the ndiffs default. The critical-value tables differ
-	// between τ_τ (trend) and τ_μ (drift) and so do the verdicts on
-	// trending series. On airpassengers (visibly trending), goarima
-	// τ_τ-ADF rejects the unit root because the trend regressor
-	// absorbs the trend; R τ_μ-ADF leaves the trend in the residual
-	// and fails to reject. Both verdicts are statistically defensible
-	// for the formulation chosen — goarima diverges from R on
-	// airpassengers (goarima=0, R=1) for this reason. Other canonical
-	// datasets agree.
-	//
-	// Use NDiffsKPSS for R-aligned `auto.arima` defaults (this is what
-	// goarima's stepwise actually uses). NDiffsADF is here as an
-	// alternative for users who explicitly want the τ_τ formulation.
-	// A future Type field (PG-110) would let callers select τ_μ for
-	// strict R parity; not yet implemented.
+	// To use the τ_τ (intercept + trend) formulation that
+	// `tseries::adf.test` defaults to, call `ADFTest` directly with
+	// `ADFTestOpts{Type: ADFTrend}` — the previous goarima default
+	// pre-PG-110. Both formulations are statistically defensible;
+	// they have different critical-value tables and disagree on
+	// trending series.
 	NDiffsADF
 	// NDiffsPP uses the Phillips-Perron test.
 	//
