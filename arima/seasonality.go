@@ -815,17 +815,16 @@ const (
 	NSDiffsCH
 	// NSDiffsHEGY uses the Hylleberg-Engle-Granger-Yoo test for
 	// seasonal unit roots at multiple frequencies simultaneously
-	// (Hylleberg, Engle, Granger, Yoo 1990, JoE 44, 215-238 for
-	// quarterly; Beaulieu-Miron 1993 for monthly). Matches R's
+	// (HEGY 1990 quarterly, Beaulieu-Miron 1993 monthly, response-
+	// surface p-values for general m). Matches R's
 	// `forecast::nsdiffs(test="hegy")` which uses
 	// `uroot::hegy.test(deterministic=c(1,1,0), maxlag=3,
 	// lag.method="AIC")` and verdict-criterion `F_{2:m} p-value > α`.
 	//
-	// **Currently supports m=4 (quarterly) and m=12 (monthly).** For
-	// other m, NSDiffs returns ErrHEGYNotSupportedForM. Adding
-	// support for arbitrary m would require simulated critical-value
-	// surfaces (à la `uroot::hegy.test`'s response-surface tables);
-	// not yet shipped.
+	// **Supports any m ≥ 2** via the response-surface coefficient
+	// table from uroot 2.x (`.HEGY.CM.tabs[["CFs_ct_AIC"]]`). Verdicts
+	// match R 5/5 on canonical threeway datasets including daily m=7
+	// (m5, m5_with_exog).
 	NSDiffsHEGY
 )
 

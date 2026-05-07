@@ -1,7 +1,6 @@
 package arima
 
 import (
-	"errors"
 	"math"
 	"testing"
 
@@ -125,33 +124,40 @@ func TestNSDiffsCornerCases(t *testing.T) {
 	}
 }
 
-// PG-106: NSDiffsHEGY runs the Hylleberg-Engle-Granger-Yoo seasonal
-// unit-root test for m∈{4, 12} (quarterly + monthly canonical cases).
-// Other m return ErrHEGYNotSupportedForM. Verdicts match R's
-// `forecast::nsdiffs(test="hegy")` on canonical datasets — see
-// threeway TestNSDiffsHEGYParityWithR for cross-impl assertions.
+// PG-106 / PG-106b: NSDiffsHEGY runs the Hylleberg-Engle-Granger-Yoo
+// seasonal unit-root test for arbitrary m via uroot's response-surface
+// p-value tables (CFs_ct_AIC). Verdicts match R's
+// `forecast::nsdiffs(test="hegy")` — see threeway
+// TestNSDiffsHEGYParityWithR for cross-impl assertions.
 func TestNSDiffsHEGY_BasicShape(t *testing.T) {
-	// Unsupported m on a real-world series → clear error.
+	// AirPassengers m=12: strong seasonality, R verdict D=1.
 	ap := datasets.LoadAirPassengers()
 	d, err := NSDiffs(ap, NSDiffsOpts{
-		M: 7, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
-	})
-	if err == nil {
-		t.Fatalf("NSDiffsHEGY at m=7 must return ErrHEGYNotSupportedForM; got d=%d", d)
-	}
-	if !errors.Is(err, ErrHEGYNotSupportedForM) {
-		t.Errorf("expected ErrHEGYNotSupportedForM; got %v", err)
-	}
-	// Supported m=12 on AirPassengers (real seasonal data).
-	d, err = NSDiffs(ap, NSDiffsOpts{
 		M: 12, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
 	})
 	if err != nil {
 		t.Fatalf("NSDiffsHEGY m=12 on airpassengers: %v", err)
 	}
-	// AirPassengers has strong seasonality; R verdict is D=1.
 	if d != 1 {
-		t.Errorf("HEGY airpassengers: got D=%d, want 1 (matches R)", d)
+		t.Errorf("HEGY airpassengers m=12: got D=%d, want 1 (matches R)", d)
+	}
+	// PG-106b: arbitrary m via response-surface — m=7 should now
+	// work without ErrHEGYNotSupportedForM (closes the legacy gate).
+	d, err = NSDiffs(ap, NSDiffsOpts{
+		M: 7, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
+	})
+	if err != nil {
+		t.Fatalf("NSDiffsHEGY m=7 on airpassengers (RS p-value): %v", err)
+	}
+	// Don't pin the specific verdict — m=7 on AP is unusual, but the
+	// path must succeed without errors.
+	_ = d
+	// m=1 should error — HEGY requires m>=2.
+	_, err = NSDiffs(ap, NSDiffsOpts{
+		M: 1, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
+	})
+	if err == nil {
+		t.Errorf("expected error on m=1")
 	}
 }
 
