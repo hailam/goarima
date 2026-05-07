@@ -1,6 +1,7 @@
 package arima
 
 import (
+	"errors"
 	"math"
 	"testing"
 
@@ -121,6 +122,29 @@ func TestNSDiffsCornerCases(t *testing.T) {
 				t.Errorf("test=%v m=%d should error", tst, mm)
 			}
 		}
+	}
+}
+
+// PG-105: NSDiffsHEGY is exposed as a constant to match R's
+// `nsdiffs(test="hegy")` API surface, but the implementation is a
+// stub returning ErrHEGYNotImplemented. R itself gates HEGY behind
+// the optional `uroot` package — calling it without the package
+// errors similarly. This test pins the stub-with-clear-error
+// contract so users who request HEGY get an actionable message
+// instead of a silent fallback.
+func TestNSDiffsHEGY_ReturnsClearError(t *testing.T) {
+	austres := datasets.LoadAustres()
+	d, err := NSDiffs(austres, NSDiffsOpts{
+		M: 4, MaxD: 1, Test: NSDiffsHEGY, MaxLag: 3,
+	})
+	if err == nil {
+		t.Fatalf("NSDiffsHEGY must return ErrHEGYNotImplemented; got d=%d, nil err", d)
+	}
+	if !errors.Is(err, ErrHEGYNotImplemented) {
+		t.Errorf("NSDiffsHEGY error must be ErrHEGYNotImplemented; got %v", err)
+	}
+	if d != 0 {
+		t.Errorf("NSDiffsHEGY error path must return d=0; got %d", d)
 	}
 }
 
