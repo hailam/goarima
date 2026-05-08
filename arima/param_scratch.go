@@ -70,6 +70,13 @@ type gardnerWorkspace struct {
 	rbar   []float64 // length nrbar (zeroed each call)
 	thetab []float64 // length np (zeroed each call)
 	Pbuf   []float64 // length np (zeroed each call by inclu2)
+
+	// GARD-OPT-1: Smith's doubling iteration scratch. Allocated lazily
+	// when the AR-large-r dispatch fires. r×r each.
+	smithT  []float64
+	smithT2 []float64
+	smithTP []float64
+	smithDP []float64
 }
 
 var paramScratchPool = sync.Pool{

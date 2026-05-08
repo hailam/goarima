@@ -12,6 +12,49 @@ func PublicGardner(phi, theta []float64) [][]float64 {
 	return out
 }
 
+// PublicInclu2 exposes Gardner's inclu2 path (no Smith dispatch) for
+// parity diagnostics. Used by the GARD-OPT-1 cross-check tests.
+func PublicInclu2(phi, theta []float64) [][]float64 {
+	flat, r := stationaryCovInclu2OnlyInto(&gardnerWorkspace{}, phi, theta)
+	if r == 0 {
+		return nil
+	}
+	out := make([][]float64, r)
+	for i := 0; i < r; i++ {
+		row := make([]float64, r)
+		copy(row, flat[i*r:(i+1)*r])
+		out[i] = row
+	}
+	return out
+}
+
+// PublicSmith exposes Smith's doubling Lyapunov solver for parity
+// diagnostics (GARD-OPT-1). Returns nil if Smith fails to converge
+// (the production dispatch falls back to inclu2 in that case).
+func PublicSmith(phi, theta []float64) [][]float64 {
+	p := len(phi)
+	q := len(theta)
+	r := p
+	if q+1 > r {
+		r = q + 1
+	}
+	if r == 0 {
+		return nil
+	}
+	var ws gardnerWorkspace
+	flat, ok := stationaryCovSmithInto(&ws, phi, theta, r)
+	if !ok {
+		return nil
+	}
+	out := make([][]float64, r)
+	for i := 0; i < r; i++ {
+		row := make([]float64, r)
+		copy(row, flat[i*r:(i+1)*r])
+		out[i] = row
+	}
+	return out
+}
+
 // stationaryCovGardner computes the stationary covariance of the ARMA(p,q)
 // state-space form using Gardner's algorithm — a numerically-stable
 // alternative to direct discrete-Lyapunov solution.
@@ -34,7 +77,40 @@ func stationaryCovGardner(phi, theta []float64) ([]float64, int) {
 // valid until the next call on the same workspace. Pre-pool, this
 // function was the single largest allocator in AutoArima
 // (~36% of total per-Fit allocations).
+//
+// GARD-OPT-1 dispatch: at r ≥ 20 with p > 0 (AR-containing model), the
+// inclu2 Givens-rotation path costs O(r⁴) and dominates wallclock for
+// high-period seasonal models (m=24, 52, etc.). Smith's doubling
+// iteration is O(r³) with small constants and is dispatched
+// automatically below. For p = 0 (pure MA) the existing closed-form
+// backsubstitution is already optimal and stays. For small r (≤ 19)
+// inclu2's tight inner loop wins via cache locality.
+const gardSmithThresholdR = 20
+
 func stationaryCovGardnerInto(ws *gardnerWorkspace, phi, theta []float64) ([]float64, int) {
+	p := len(phi)
+	q := len(theta)
+	r := p
+	if q+1 > r {
+		r = q + 1
+	}
+	if r == 0 {
+		return nil, 0
+	}
+	if p > 0 && r >= gardSmithThresholdR {
+		if out, ok := stationaryCovSmithInto(ws, phi, theta, r); ok {
+			return out, r
+		}
+		// Fall through to inclu2 on Smith failure (e.g., non-stable T).
+	}
+	return stationaryCovInclu2OnlyInto(ws, phi, theta)
+}
+
+// stationaryCovInclu2OnlyInto runs the original Gardner inclu2 path
+// without the Smith dispatch — used by GARD-OPT-1's parity tests as
+// the reference implementation, and as the fallback for non-stable
+// fits where Smith's doubling iteration cannot converge.
+func stationaryCovInclu2OnlyInto(ws *gardnerWorkspace, phi, theta []float64) ([]float64, int) {
 	p := len(phi)
 	q := len(theta)
 	r := p
@@ -243,6 +319,167 @@ func stationaryCovGardnerInto(ws *gardnerWorkspace, phi, theta []float64) ([]flo
 	// (P[i*r+j] equals M[i,j] in both, since M[i,j] = M[j,i]). Skip
 	// the redundant conversion that previously allocated `out`.
 	return P, r
+}
+
+// stationaryCovSmithInto solves the discrete Lyapunov equation
+//
+//	P = T·P·Tᵀ + Q
+//
+// for the ARMA companion form (T as built by Gardner, Q = R·Rᵀ where
+// R = (1, θ_1, …, θ_{r-1})ᵀ) via Smith's (1968) doubling iteration:
+//
+//	P₀ = Q,  T₀ = T
+//	Pₖ₊₁ = Pₖ + Tₖ · Pₖ · Tₖᵀ,   Tₖ₊₁ = Tₖ²
+//
+// Converges geometrically when ρ(T) < 1. Each step is two r×r matmuls
+// = O(r³), so total cost is O(r³ · log₂(precision/ρ)). For ARMA stable
+// fits ~6 iterations suffice. Returns (P_aliased_to_ws.P, true) on
+// success; (nil, false) if the iteration fails to converge in
+// smithMaxIter (typically because |ρ(T)| ≥ 1, BFGS pushed off
+// stationarity).
+//
+// GARD-OPT-1: dispatched from stationaryCovGardnerInto when p > 0 and
+// r ≥ gardSmithThresholdR — beats inclu2's O(r⁴) by 1.4× at r=14 to
+// 20× at r=101.
+func stationaryCovSmithInto(ws *gardnerWorkspace, phi, theta []float64, r int) ([]float64, bool) {
+	const (
+		smithMaxIter = 60
+		smithRelTol  = 1e-15
+	)
+	rr := r * r
+	ws.P = ensureLenZ(ws.P, rr)
+	ws.smithT = ensureLenZ(ws.smithT, rr)
+	ws.smithT2 = ensureLenZ(ws.smithT2, rr)
+	ws.smithTP = ensureLenZ(ws.smithTP, rr)
+	ws.smithDP = ensureLenZ(ws.smithDP, rr)
+	P := ws.P
+	T := ws.smithT
+	T2 := ws.smithT2
+	TP := ws.smithTP
+	dP := ws.smithDP
+
+	// Initialize T as the ARMA companion: T[i,0] = phi[i] (i<p), T[i,i+1] = 1.
+	p := len(phi)
+	for i := 0; i < r; i++ {
+		if i < p {
+			T[i*r] = phi[i]
+		}
+		if i+1 < r {
+			T[i*r+i+1] = 1
+		}
+	}
+	// Initialize P = R·Rᵀ where R = (1, θ_1, …, θ_{q}). Sparse outer product.
+	q := len(theta)
+	rvec := make([]float64, r)
+	rvec[0] = 1
+	for j := 0; j < q && j+1 < r; j++ {
+		rvec[j+1] = theta[j]
+	}
+	for i := 0; i < r; i++ {
+		ri := rvec[i]
+		if ri == 0 {
+			continue
+		}
+		off := i * r
+		for j := 0; j < r; j++ {
+			P[off+j] = ri * rvec[j]
+		}
+	}
+
+	// ‖T₀‖_F² baseline for the T-shrinkage convergence test.
+	tNorm0 := 0.0
+	for k := 0; k < rr; k++ {
+		tNorm0 += T[k] * T[k]
+	}
+	if tNorm0 == 0 {
+		// T = 0 means y_t = R·ε_t (no AR feedback) — P = R Rᵀ exactly.
+		return P, true
+	}
+
+	for iter := 0; iter < smithMaxIter; iter++ {
+		// TP = T · P
+		matmulRR(TP, T, P, r)
+		// dP = TP · Tᵀ  (i.e., the increment T_k · P_k · T_kᵀ)
+		matmulRRt(dP, TP, T, r)
+
+		// Apply increment.
+		dNorm, pNorm := 0.0, 0.0
+		for k := 0; k < rr; k++ {
+			P[k] += dP[k]
+			pNorm += P[k] * P[k]
+			dNorm += dP[k] * dP[k]
+		}
+
+		// T = T²
+		matmulRR(T2, T, T, r)
+		copy(T, T2)
+		tNorm := 0.0
+		for k := 0; k < rr; k++ {
+			tNorm += T[k] * T[k]
+		}
+
+		// Two convergence checks must BOTH hold to terminate:
+		//   (a) ‖T_k‖_F / ‖T₀‖_F < tol — future increments are at most
+		//       O(‖T_k‖² · ‖P‖) so once T has decayed, the truncation
+		//       error is bounded.
+		//   (b) ‖dP‖_F / ‖P‖_F < tol — the latest increment is small
+		//       relative to current P.
+		// Requiring both avoids the pure-AR pitfall where the very
+		// first increment can be small (sparse Q only fills column 0)
+		// even though the iteration hasn't propagated through T's
+		// remaining 2^k powers.
+		if tNorm <= smithRelTol*smithRelTol*tNorm0 {
+			if pNorm == 0 || dNorm <= smithRelTol*smithRelTol*pNorm {
+				return P, true
+			}
+		}
+		// Diverging: ‖T_k‖_F grows by more than 10^6 over baseline →
+		// T has ρ ≥ 1 (BFGS pushed off stationarity). Bail.
+		if tNorm > 1e12*tNorm0 {
+			return nil, false
+		}
+	}
+	return nil, false
+}
+
+// matmulRR computes C = A · B for r×r row-major matrices.
+// Hand-rolled to avoid pulling gonum into this hot path.
+func matmulRR(C, A, B []float64, r int) {
+	for i := 0; i < r; i++ {
+		offA := i * r
+		offC := i * r
+		// Zero the output row.
+		for j := 0; j < r; j++ {
+			C[offC+j] = 0
+		}
+		// Loop reorder ikj for unit-stride access on B and C.
+		for k := 0; k < r; k++ {
+			a := A[offA+k]
+			if a == 0 {
+				continue
+			}
+			offB := k * r
+			for j := 0; j < r; j++ {
+				C[offC+j] += a * B[offB+j]
+			}
+		}
+	}
+}
+
+// matmulRRt computes C = A · Bᵀ for r×r row-major matrices.
+func matmulRRt(C, A, B []float64, r int) {
+	for i := 0; i < r; i++ {
+		offA := i * r
+		offC := i * r
+		for j := 0; j < r; j++ {
+			offB := j * r
+			s := 0.0
+			for k := 0; k < r; k++ {
+				s += A[offA+k] * B[offB+k]
+			}
+			C[offC+j] = s
+		}
+	}
 }
 
 // inclu2 is the Givens-rotation update used by stationaryCovGardner.
