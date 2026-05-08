@@ -30,49 +30,144 @@ var ErrHEGYNotSupportedForM = errors.New(
 // **Acceptance (2026-05-08):** verdicts match R's
 // `nsdiffs(test="hegy")` 5/5 on the threeway canonical grid
 // (airpassengers/co2/sunspot m=12, m5/m5_with_exog m=7).
+//
+// For the per-frequency statistical breakdown (zero-frequency t-stat,
+// Nyquist t-stat, harmonic-pair F-stats), use HEGYTestFull.
 func HEGYTest(x []float64, m int) (int, error) {
+	res, err := HEGYTestFull(x, m)
+	if err != nil {
+		return 0, err
+	}
+	return res.Verdict, nil
+}
+
+// HEGYResult holds the per-frequency unit-root test statistics from a
+// HEGY auxiliary regression, returned by HEGYTestFull. The structure
+// mirrors uroot::hegy.test's return for inspection of *which*
+// seasonal frequencies have unit roots.
+//
+// Frequency layout (zero-indexed regressor cols 2..m+1 in the regression):
+//   - π_1   (col 2):       zero frequency, root at +1     → TStatZero
+//   - π_2   (col 3):       Nyquist frequency, root at -1  → TStatNyquist (m even only)
+//   - pairs (cosine, sine) at frequency 2π·j/M for j=1..K → PairFStats[j-1]
+//     where K = (M-2)/2 for even M, (M-1)/2 for odd M.
+//
+// Per-frequency p-values are not computed — those require uroot's
+// individual-statistic response-surface tables (PG-114). Users wanting
+// per-frequency verdicts can compare TStat* against asymptotic critical
+// values from HEGY (1990) / Beaulieu-Miron (1993) tables.
+type HEGYResult struct {
+	// Verdict is 1 if seasonal unit roots are detected (fail to reject
+	// H0 → apply seasonal differencing), 0 otherwise. Matches HEGYTest.
+	Verdict int
+
+	// M is the seasonal period.
+	M int
+
+	// BestLag is the AIC-selected lag-augmentation order (0..MaxLag).
+	BestLag int
+
+	// AIC is the regression's information criterion at BestLag.
+	AIC float64
+
+	// TStatZero is the t-statistic for π_1 (root at +1, zero frequency).
+	// Negative & large in magnitude rejects the unit root at that frequency.
+	TStatZero float64
+
+	// TStatNyquist is the t-statistic for π_2 (root at -1, Nyquist
+	// frequency). Only set when M is even; nil for odd M.
+	TStatNyquist *float64
+
+	// PairFStats[k] is the pair-F statistic for the k-th harmonic pair
+	// (cos, sin) at PairFrequencies[k]. Length is (M-2)/2 for even M,
+	// (M-1)/2 for odd M. Large F rejects H0 of unit roots at that pair.
+	PairFStats []float64
+
+	// PairFrequencies[k] = 2π·(k+1)/M (radians) — the angular frequency
+	// of the k-th pair, parallel to PairFStats.
+	PairFrequencies []float64
+
+	// JointSeasonalF is the joint F-statistic for (π_2..π_M) — the
+	// overall seasonal-unit-root statistic that drives Verdict.
+	JointSeasonalF float64
+
+	// JointSeasonalPValue is the p-value of JointSeasonalF via uroot's
+	// response-surface table (PG-106b).
+	JointSeasonalPValue float64
+}
+
+// HEGYTestFull runs the same auxiliary regression as HEGYTest and
+// returns the verdict together with per-frequency raw statistics.
+// See HEGYResult for the field documentation. Acceptance constraints
+// are the same as HEGYTest — the joint stat & verdict are unchanged.
+func HEGYTestFull(x []float64, m int) (*HEGYResult, error) {
 	if m < 2 {
-		return 0, errors.New("HEGY requires m >= 2")
+		return nil, errors.New("HEGY requires m >= 2")
 	}
 	if len(x) < 4*m {
-		return 0, errors.New("HEGY requires at least 4 full seasonal cycles")
+		return nil, errors.New("HEGY requires at least 4 full seasonal cycles")
 	}
 
-	// Build the m-column auxiliary regressor matrix. Each row t contains
-	// the m auxiliary values evaluated at time t. We then take Y_{i,t-1}
-	// (lag-1 of each column) as the regressors.
 	auxRows, err := hegyAuxRegressors(x, m)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-
-	// Δ^m y_t for the dependent variable, aligned to the auxiliary rows.
 	dmy := applyMSeasonalDiff(x, m)
 	if len(dmy) != len(auxRows) {
-		return 0, errors.New("HEGY: aux rows / dmy length mismatch")
+		return nil, errors.New("HEGY: aux rows / dmy length mismatch")
 	}
 
-	// AIC-based lag selection over {0, 1, 2, 3} matching R nsdiffs.
 	bestStats, bestLag, err := hegyFitWithBestLag(dmy, auxRows, m, 3)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
-	// PG-106b: response-surface p-value for arbitrary m, matching
-	// uroot::hegy.rs.pvalue. Replaces the m∈{4,12}-only critical-
-	// value lookup in PG-106 — same verdict logic, broader support.
-	pval := hegyRSpvalue(bestStats.fJointSeasonal, len(dmy), m, bestLag)
-	if pval > 0.05 {
-		// Fail to reject seasonal unit roots → apply seasonal diff.
-		return 1, nil
+	// Re-run the regression at the best lag to recover per-coefficient
+	// SEs and pair F-stats (cheap relative to the 4-lag search).
+	detailed, err := hegyOLSDetailed(dmy, auxRows, m, bestLag)
+	if err != nil {
+		return nil, err
 	}
-	return 0, nil
+
+	pval := hegyRSpvalue(bestStats.fJointSeasonal, len(dmy), m, bestLag)
+	verdict := 0
+	if pval > 0.05 {
+		verdict = 1
+	}
+
+	res := &HEGYResult{
+		Verdict:             verdict,
+		M:                   m,
+		BestLag:             bestLag,
+		AIC:                 bestStats.aic,
+		TStatZero:           detailed.tStatZero,
+		PairFStats:          detailed.pairFStats,
+		PairFrequencies:     detailed.pairFreqs,
+		JointSeasonalF:      bestStats.fJointSeasonal,
+		JointSeasonalPValue: pval,
+	}
+	if m%2 == 0 {
+		nyquist := detailed.tStatNyquist
+		res.TStatNyquist = &nyquist
+	}
+	return res, nil
 }
 
 // hegyResult holds the test statistics from one HEGY auxiliary regression.
 type hegyResult struct {
 	fJointSeasonal float64 // joint F on (π_2 .. π_m), used for D verdict
 	aic            float64 // AIC of the regression (for lag selection)
+}
+
+// hegyDetailedResult holds the full per-frequency breakdown — populated
+// once at the AIC-best lag for HEGYTestFull. Pair F-stats and t-stats
+// share the regression's (X'X)⁻¹ so they're cheap once the OLS solve
+// has run.
+type hegyDetailedResult struct {
+	tStatZero    float64
+	tStatNyquist float64 // valid only when m is even
+	pairFStats   []float64
+	pairFreqs    []float64
 }
 
 // hegyAuxRegressors constructs the m-column auxiliary-regressor matrix
@@ -287,6 +382,103 @@ func hegyOLS(dmy []float64, auxRows [][]float64, m, p int) (hegyResult, error) {
 	return hegyResult{fJointSeasonal: fSeason, aic: aic}, nil
 }
 
+// hegyOLSDetailed re-runs the regression at the (AIC-best) lag p and
+// returns the per-frequency breakdown:
+//   - t-stat for π_1 (col 2, zero frequency)
+//   - t-stat for π_2 (col 3, Nyquist) when m is even
+//   - F-stat for each (cos, sin) harmonic pair
+//
+// Frequency layout (cf. hegyAuxRegressors):
+//   - even m: cols 2,3 are π_1, π_2; cols (4,5),(6,7),... are pairs at j=1,2,...
+//   - odd m:  col 2 is π_1; cols (3,4),(5,6),... are pairs at j=1,2,...
+func hegyOLSDetailed(dmy []float64, auxRows [][]float64, m, p int) (hegyDetailedResult, error) {
+	nDmy := len(dmy)
+	startDmy := p
+	rows := nDmy - p
+	cols := 2 + m + p
+	if rows <= cols+1 {
+		return hegyDetailedResult{}, errors.New("HEGY: not enough observations for detailed regression")
+	}
+	X := make([][]float64, rows)
+	yt := make([]float64, rows)
+	for i := 0; i < rows; i++ {
+		row := make([]float64, cols)
+		row[0] = 1
+		row[1] = float64(startDmy + i + 1)
+		for j := 0; j < m; j++ {
+			row[2+j] = auxRows[startDmy+i][j]
+		}
+		for j := 0; j < p; j++ {
+			row[2+m+j] = dmy[startDmy+i-1-j]
+		}
+		X[i] = row
+		yt[i] = dmy[startDmy+i]
+	}
+	beta, err := olsFit(X, yt, false)
+	if err != nil {
+		return hegyDetailedResult{}, err
+	}
+	resid := make([]float64, rows)
+	for i := 0; i < rows; i++ {
+		pred := 0.0
+		for j, b := range beta {
+			pred += X[i][j] * b
+		}
+		resid[i] = yt[i] - pred
+	}
+	rss := 0.0
+	for _, r := range resid {
+		rss += r * r
+	}
+	if rss <= 0 || math.IsNaN(rss) {
+		return hegyDetailedResult{}, errors.New("HEGY: non-positive RSS in detailed regression")
+	}
+	sigma2 := rss / float64(rows-cols)
+
+	xtxInv, err := hegyXtxInverse(X)
+	if err != nil {
+		return hegyDetailedResult{}, err
+	}
+
+	// SE(β[k]) = sqrt(σ² · (X'X)⁻¹[k][k])
+	seAt := func(k int) float64 {
+		return math.Sqrt(sigma2 * xtxInv[k][k])
+	}
+
+	out := hegyDetailedResult{}
+	// π_1 t-stat is at col 2.
+	out.tStatZero = beta[2] / seAt(2)
+
+	isEven := m%2 == 0
+	// Pair-F count and column starting index.
+	var pairCount int
+	var pairStartCol int
+	if isEven {
+		// π_2 at col 3 (Nyquist); pairs start at col 4.
+		out.tStatNyquist = beta[3] / seAt(3)
+		pairCount = (m - 2) / 2
+		pairStartCol = 4
+	} else {
+		// no Nyquist; pairs start at col 3.
+		pairCount = (m - 1) / 2
+		pairStartCol = 3
+	}
+
+	out.pairFStats = make([]float64, pairCount)
+	out.pairFreqs = make([]float64, pairCount)
+	for k := 0; k < pairCount; k++ {
+		col := pairStartCol + 2*k
+		// Pair occupies (col, col+1).
+		fStat, err := hegyJointFStatFromInv(xtxInv, beta, sigma2, []int{col, col + 1})
+		if err != nil {
+			return hegyDetailedResult{}, err
+		}
+		out.pairFStats[k] = fStat
+		out.pairFreqs[k] = 2 * math.Pi * float64(k+1) / float64(m)
+	}
+	return out, nil
+}
+
 // hegyJointFStat computes the F-statistic for the joint hypothesis that
 // the coefficients at indices `idx` are zero. Uses the linear-restriction
 // form: F = (Rβ)' [R (X'X)⁻¹ R']⁻¹ (Rβ) / (q · σ²).
@@ -295,6 +487,13 @@ func hegyJointFStat(X [][]float64, beta []float64, sigma2 float64, idx []int) (f
 	if err != nil {
 		return 0, err
 	}
+	return hegyJointFStatFromInv(xtxInv, beta, sigma2, idx)
+}
+
+// hegyJointFStatFromInv is the inner core of hegyJointFStat for callers
+// that already hold a (X'X)⁻¹ — avoids redundant inversion when several
+// joint F's are needed from the same regression (per-pair stats).
+func hegyJointFStatFromInv(xtxInv [][]float64, beta []float64, sigma2 float64, idx []int) (float64, error) {
 	q := len(idx)
 	rb := make([]float64, q)
 	for i, k := range idx {
