@@ -7,7 +7,7 @@ import "fmt"
 // fetch tool with the exact command to run.
 func errDatasetNotFetched(name, fetchArg string) error {
 	return fmt.Errorf(
-		"dataset %q not fetched yet — run `go run ./tools/fetch_datasets %s` from the repo root to populate",
+		"dataset %q not fetched yet — run `go run ./cmd/fetch_datasets %s` from the repo root to populate",
 		name, fetchArg,
 	)
 }

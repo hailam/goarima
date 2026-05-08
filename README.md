@@ -10,24 +10,11 @@ when implementations diverge.
 Includes auto ARIMA, the exact-diffuse Kalman filter, unit-root tests
 (KPSS / OCSB / SEAS / CH), and a sklearn-style pipeline.
 
-## Divergence-decision policy
-
-When R `forecast::auto.arima`, pmdarima, and goarima disagree on a
-result, this project decides in this order:
-
-1. **R first.** R's `forecast::auto.arima` is the canonical Hyndman-
-   Khandakar reference. Behaviour aligns with R unless empirical
-   evidence on canonical datasets shows R is genuinely worse.
-2. **pmdarima second.** pmdarima models its API on R closely; we use
-   it as a tiebreaker reference and to keep the option / field names
-   familiar to Python users. We do not chase pmdarima compatibility
-   when it conflicts with R.
-3. **Empirical winner third.** When goarima's behaviour beats R on
-   the canonical threeway-tests-goarima grid (verified AICc / fit
-   diagnostics), we keep the divergence and document it.
-
-Specific currently-shipped divergences from R, with rationale, are
-tracked internally as PG-92 through PG-100.
+When R `forecast::auto.arima`, pmdarima, and goarima disagree, R
+wins by default — pmdarima is a secondary reference, and goarima
+keeps a divergence only when empirical evidence shows it's better.
+Full policy and the parity-mode table live at
+[`docs/policies/`](docs/policies/).
 
 ## Status
 
@@ -184,59 +171,21 @@ Models also implement `json.Marshaler` / `json.Unmarshaler`, so
 versioned (currently `1`); loading an unknown version fails fast with a
 clear error.
 
-## Module layout
+## Documentation
 
-| Package | Purpose |
+Architecture and implementation notes live under `docs/`:
+
+| Topic | Folder |
 |---|---|
-| `arima` | ARIMA / SARIMAX, AutoArima, ADF/KPSS/PP, CH/OCSB, exact-diffuse Kalman, decompose |
-| `preprocessing` | Box-Cox, Log, Fourier, DateFeaturizer |
-| `modelselection` | RollingForecastCV, SlidingWindowForecastCV, parallel CrossVal{Score,idate,Predict} |
-| `pipeline` | sklearn-style chain (transformers + ARIMA) |
-| `metrics` | SMAPE, MAE, MSE |
-| `utils` | ACF, PACF, diff, diff_inv, check_endog/exog |_
-| `datasets` | airpassengers, austres, wineind, woolyrnq, lynx, WWWusage, ausbeer, gasoline, heartrate, taylor, sunspots, msft |
-
-## Choosing a parity mode
-
-| You want to match... | Set |
-|---|---|
-| `pmdarima.auto_arima(y).predict(n)` | default |
-| `statsmodels.SARIMAX(y, simple_differencing=True)` | default |
-| `R::stats::arima(y, ...)` / `forecast::Arima` | `NonSimpleDifferencing = true` |
-| `statsmodels.SARIMAX(y, simple_differencing=False)` (default for that lib) | `NonSimpleDifferencing = true; DiffuseConvention = DiffuseStatsmodels` |
-
-The default path is fastest and matches the most common Python usage. The
-non-simple-differencing path uses an exact Kalman filter with Gardner-Harvey-
-Phillips stationary-cov initialization and is needed only when an exact match
-to R or to statsmodels' default is required.
-
-## Coming from pmdarima or R? API map
-
-goarima implements `forecast::auto.arima` (R) on top of a `stats::arima`-
-equivalent Kalman likelihood, with the API surface modelled on pmdarima
-so Python users find option names familiar. **When pmdarima and R
-disagree, R wins** (see "Divergence-decision policy" above). Where
-both references agree, goarima matches them. Where neither has a
-clear answer, goarima exposes a knob (e.g. `DiffuseConvention`,
-`Method`) and picks a sensible default. The table below lists the
-surface differences that bite users porting code over.
-
-| Concern | pmdarima | R | goarima |
-|---|---|---|---|
-| AR/MA/seasonal orders | `order=(p,d,q), seasonal_order=(P,D,Q,m)` | `order=c(p,d,q), seasonal=list(order=c(P,D,Q), period=m)` | `Order{P,D,Q}` (non-seasonal) and `Seasonal{P,D,Q,M}`. **`Order.P` is the non-seasonal AR order** (lowercase `p` in the math); `Seasonal.P` is the seasonal AR order. Capitalization is forced by Go visibility rules. |
-| Confidence interval | `alpha=0.05` (kwarg) | `level=95` | `Predict(n, alpha, futureExog)`. Pass `alpha=0` to skip CIs (returns `nil` for `lower`/`upper`). |
-| Fitted values | `predict_in_sample(...)` returns `len(y)` array | `fitted(model)` returns `ts` of length `n` (NA in warmup) | `m.FittedValues()` returns `len(yTrain)` slice with `math.NaN()` in the first `d + D*m` warmup entries. |
-| Residuals | `arima_res_.resid` length `len(y)` | `residuals(model)` length `n` (NA in warmup) | `m.Resid()` returns `len(yTrain)` slice with `math.NaN()` in warmup. Filter via `dropNaN()` before passing to non-NaN-aware stats (Ljung-Box, ACF). |
-| Update / refresh | `model.update(y, X)` warm-starts MLE on existing params | `Arima(model = existing, x = new_y, xreg = new_X)` warm-starts | `m.Update(y, x)` warm-starts (fast); `m.Refit(y, x)` does a full cold re-fit. Neither re-searches orders — call `AutoArima` fresh for that. |
-| Box-Cox | `lambda` kwarg | `lambda` arg in `Arima` | `m.Lambda *float64` (nil = off). `Predict`, `FittedValues`, `PredictBoot`, `Simulate` all inverse-transform automatically. |
-| Bootstrap CI | `predict(..., bootstrap=True, n_sims=...)` | not built-in | `m.PredictBoot(n, alpha, nSim, seed, futureExog)` |
-| Simulate | `simulate(...)` (burn-in hidden) | `simulate.Arima(...)` (burn-in hidden) | `m.Simulate(n, SimulateOpts{Seed: …, BurnIn: …})`. `BurnIn=0` → 100. |
-| Drift | `with_intercept=True` + `d=1` adds drift | `include.drift=TRUE` | `RArima(opts.IncludeDrift = true)` sets `m.DriftIncluded`; `Predict`/`PredictBoot`/`Simulate` auto-extend the drift column so callers don't reconstruct `[n+1, n+2, …]` manually. |
-| Seasonal differencing test | `nsdiffs(test='ocsb')` (default) | `nsdiffs(test='ocsb')` (default) | `AutoArimaOpts.SeasonalTest` defaults to `NSDiffsOCSB` (matches both); set to `NSDiffsCH` for legacy R behavior. |
-| Estimator | `method='lbfgs'/'css-mle'` | `method='CSS'/'ML'/'CSS-ML'` | `Method` enum: `MethodCSS`, `MethodML`, `MethodCSSML` (default — same as R). |
-| Save / load | pickle | `saveRDS` / `readRDS` | `m.Save(io.Writer)` / `arima.LoadARIMA(io.Reader)` write versioned JSON. `*ARIMA` also implements `json.Marshaler`/`json.Unmarshaler`. |
-| Forecast variance for integrated models | grows with horizon ✓ | grows with horizon ✓ | `Predict` CI bands grow correctly (cumulative-sum psi for each unit-root factor). |
+| Package map, top-level Fit() flow, where state lives | [`docs/architecture/`](docs/architecture/) |
+| Goroutines, sync.Pool, parallelGradient, locks | [`docs/concurrency/`](docs/concurrency/) |
+| The three Kalman variants and when each fires | [`docs/kalman/`](docs/kalman/) |
+| AutoArima search modes, differencing pipeline | [`docs/auto-arima/`](docs/auto-arima/) |
+| Joseph form, transparams, Smith vs inclu2 dispatch | [`docs/numerical-stability/`](docs/numerical-stability/) |
+| Coming from pmdarima or R? Field-by-field map | [`docs/api-mapping/`](docs/api-mapping/) |
+| Divergence-decision policy, parity modes | [`docs/policies/`](docs/policies/) |
+| Per-decision ADRs (Chen-Liu outliers, SIMD, …) | [`docs/decisions/`](docs/decisions/) |
 
 ## License
 
-MIT.
+MIT. Dataset attributions in `NOTICE`.

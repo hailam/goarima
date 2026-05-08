@@ -11,7 +11,7 @@ package datasets
 //   forecast::gasoline → 1378+ obs (continuously updated through 2017+) vs goarima 745 (pmdarima)
 //
 // These R-version variants are NOT bundled in the source tree. To populate
-// them, run `go run ./tools/fetch_datasets`. That tool fetches the canonical
+// them, run `go run ./cmd/fetch_datasets`. That tool fetches the canonical
 // values from the original publishers (Australian Bureau of Statistics for
 // ausbeer, US Energy Information Administration for gasoline), validates the
 // shape, and generates `datasets/ausbeer_r.go` / `datasets/gasoline_r.go`
@@ -24,7 +24,7 @@ package datasets
 // against.
 
 // loadAusbeerR is set by the generated ausbeer_r.go (created by
-// `go run ./tools/fetch_datasets`). When unset (the default state in a
+// `go run ./cmd/fetch_datasets`). When unset (the default state in a
 // fresh checkout), LoadAusbeerR returns a clear error.
 var loadAusbeerR func() []float64
 
@@ -37,7 +37,7 @@ var loadGasolineForecastR func() []float64
 // Returns nil + a clear error message until the fetch tool has populated
 // the data. To populate, run from repo root:
 //
-//	go run ./tools/fetch_datasets ausbeer
+//	go run ./cmd/fetch_datasets ausbeer
 //
 // For the shorter pmdarima-snapshot version (212 obs), use LoadAusbeer().
 func LoadAusbeerR() ([]float64, error) {
@@ -54,7 +54,7 @@ func LoadAusbeerR() ([]float64, error) {
 // Returns nil + a clear error until the fetch tool has populated the data.
 // To populate:
 //
-//	go run ./tools/fetch_datasets gasoline
+//	go run ./cmd/fetch_datasets gasoline
 //
 // For the shorter pmdarima-snapshot version (745 obs), use LoadGasoline().
 func LoadGasolineForecastR() ([]float64, error) {
