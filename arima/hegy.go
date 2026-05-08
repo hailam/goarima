@@ -46,16 +46,15 @@ func HEGYTest(x []float64, m int) (int, error) {
 // mirrors uroot::hegy.test's return for inspection of *which*
 // seasonal frequencies have unit roots.
 //
-// Frequency layout (zero-indexed regressor cols 2..m+1 in the regression):
-//   - π_1   (col 2):       zero frequency, root at +1     → TStatZero
-//   - π_2   (col 3):       Nyquist frequency, root at -1  → TStatNyquist (m even only)
+// Frequency layout (zero-indexed regressor cols in the regression):
+//   - π_1:       zero frequency, root at +1     → TStatZero
+//   - π_2:       Nyquist, root at -1            → TStatNyquist (m even only)
 //   - pairs (cosine, sine) at frequency 2π·j/M for j=1..K → PairFStats[j-1]
 //     where K = (M-2)/2 for even M, (M-1)/2 for odd M.
 //
-// Per-frequency p-values are not computed — those require uroot's
-// individual-statistic response-surface tables (PG-114). Users wanting
-// per-frequency verdicts can compare TStat* against asymptotic critical
-// values from HEGY (1990) / Beaulieu-Miron (1993) tables.
+// Per-frequency p-values (PG-114) use uroot's individual-statistic
+// response-surface tables; computed by HEGYTestFull alongside the
+// joint-F p-value.
 type HEGYResult struct {
 	// Verdict is 1 if seasonal unit roots are detected (fail to reject
 	// H0 → apply seasonal differencing), 0 otherwise. Matches HEGYTest.
@@ -64,7 +63,8 @@ type HEGYResult struct {
 	// M is the seasonal period.
 	M int
 
-	// BestLag is the AIC-selected lag-augmentation order (0..MaxLag).
+	// BestLag is the AIC/BIC-selected lag-augmentation order (or the
+	// fixed Lag if HEGYLagFixed was passed).
 	BestLag int
 
 	// AIC is the regression's information criterion at BestLag.
@@ -74,9 +74,17 @@ type HEGYResult struct {
 	// Negative & large in magnitude rejects the unit root at that frequency.
 	TStatZero float64
 
+	// TStatZeroPValue is the response-surface p-value for TStatZero
+	// (uroot Ct1 family). Small p rejects the unit root at frequency 0.
+	TStatZeroPValue float64
+
 	// TStatNyquist is the t-statistic for π_2 (root at -1, Nyquist
 	// frequency). Only set when M is even; nil for odd M.
 	TStatNyquist *float64
+
+	// TStatNyquistPValue is the p-value for TStatNyquist (uroot Ct2);
+	// nil for odd M (parallel to TStatNyquist).
+	TStatNyquistPValue *float64
 
 	// PairFStats[k] is the pair-F statistic for the k-th harmonic pair
 	// (cos, sin) at PairFrequencies[k]. Length is (M-2)/2 for even M,
@@ -87,20 +95,81 @@ type HEGYResult struct {
 	// of the k-th pair, parallel to PairFStats.
 	PairFrequencies []float64
 
+	// PairPValues[k] is the response-surface p-value for PairFStats[k]
+	// (uroot CF). Same length as PairFStats.
+	PairPValues []float64
+
 	// JointSeasonalF is the joint F-statistic for (π_2..π_M) — the
 	// overall seasonal-unit-root statistic that drives Verdict.
 	JointSeasonalF float64
 
 	// JointSeasonalPValue is the p-value of JointSeasonalF via uroot's
-	// response-surface table (PG-106b).
+	// response-surface table (PG-106b / CFs).
 	JointSeasonalPValue float64
+
+	// JointAllF is the joint F for (π_1..π_M) — the overall unit-root
+	// test (CFt). Differs from JointSeasonalF by including the
+	// zero-frequency coefficient.
+	JointAllF float64
+
+	// JointAllPValue is the p-value of JointAllF (CFt).
+	JointAllPValue float64
+}
+
+// HEGYOpts configures the HEGY auxiliary regression for HEGYTestFull.
+//
+// Defaults (zero-value) match forecast::nsdiffs(test="hegy"):
+// Deterministic = HEGYDetConstantTrend, LagMethod = HEGYLagAIC,
+// MaxLag = 3.
+type HEGYOpts struct {
+	// Deterministic chooses which deterministic terms enter the
+	// regression. Defaults to HEGYDetConstantTrend (uroot c(1,1,0)).
+	// Pass one of HEGYDetConstant, HEGYDetConstantTrend,
+	// HEGYDetConstantSeasDummies, HEGYDetConstantTrendSeasDummies.
+	Deterministic HEGYDeterministic
+
+	// LagMethod chooses how the lag-augmentation order is selected.
+	// Defaults to HEGYLagAIC.
+	LagMethod HEGYLagMethod
+
+	// MaxLag is the upper bound for the lag search (HEGYLagAIC /
+	// HEGYLagBIC). Defaults to 3 (uroot/forecast::nsdiffs default).
+	MaxLag int
+
+	// Lag is the fixed lag order used when LagMethod = HEGYLagFixed.
+	Lag int
 }
 
 // HEGYTestFull runs the same auxiliary regression as HEGYTest and
-// returns the verdict together with per-frequency raw statistics.
-// See HEGYResult for the field documentation. Acceptance constraints
-// are the same as HEGYTest — the joint stat & verdict are unchanged.
-func HEGYTestFull(x []float64, m int) (*HEGYResult, error) {
+// returns the verdict together with per-frequency raw statistics and
+// p-values. The variadic opts argument allows non-default
+// (deterministic, lag.method) configurations matching uroot::hegy.test.
+//
+// See HEGYResult for the field documentation. The Verdict field is
+// computed from JointSeasonalPValue at the conventional 0.05 level —
+// matching forecast::nsdiffs(test="hegy") for the default opts.
+func HEGYTestFull(x []float64, m int, opts ...HEGYOpts) (*HEGYResult, error) {
+	o := HEGYOpts{}
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+	// Apply defaults.
+	if o.Deterministic == (HEGYDeterministic{}) {
+		o.Deterministic = HEGYDetConstantTrend
+	}
+	if _, err := o.Deterministic.code(); err != nil {
+		return nil, err
+	}
+	if _, err := o.LagMethod.suffix(); err != nil {
+		return nil, err
+	}
+	if o.MaxLag <= 0 {
+		o.MaxLag = 3
+	}
+	if o.LagMethod == HEGYLagFixed && o.Lag < 0 {
+		return nil, errors.New("HEGY: HEGYLagFixed requires Lag >= 0")
+	}
+
 	if m < 2 {
 		return nil, errors.New("HEGY requires m >= 2")
 	}
@@ -117,21 +186,50 @@ func HEGYTestFull(x []float64, m int) (*HEGYResult, error) {
 		return nil, errors.New("HEGY: aux rows / dmy length mismatch")
 	}
 
-	bestStats, bestLag, err := hegyFitWithBestLag(dmy, auxRows, m, 3)
+	bestStats, bestLag, err := hegySelectLag(dmy, auxRows, m, o)
 	if err != nil {
 		return nil, err
 	}
 
-	// Re-run the regression at the best lag to recover per-coefficient
-	// SEs and pair F-stats (cheap relative to the 4-lag search).
-	detailed, err := hegyOLSDetailed(dmy, auxRows, m, bestLag)
+	detailed, err := hegyOLSDetailed2(dmy, auxRows, m, bestLag, o.Deterministic)
 	if err != nil {
 		return nil, err
 	}
 
-	pval := hegyRSpvalue(bestStats.fJointSeasonal, len(dmy), m, bestLag)
+	// uroot uses dfResid (residual df) as the "n" arg into the
+	// response-surface tables — see hegy.test source. The table
+	// features 1/n, 1/n², lag/n, etc. are calibrated against the
+	// simulation residual df, not the raw sample size.
+	n := bestStats.dfResid
+	jointSeasTab, err := hegyTableID(hegyStatJointSeasonal, o.Deterministic, o.LagMethod)
+	if err != nil {
+		return nil, err
+	}
+	jointSeasPval := hegyRSpvalueFromTable(bestStats.fJointSeasonal, n, m, bestLag, jointSeasTab, true)
+
+	jointAllTab, err := hegyTableID(hegyStatJointAll, o.Deterministic, o.LagMethod)
+	if err != nil {
+		return nil, err
+	}
+	jointAllPval := hegyRSpvalueFromTable(detailed.fJointAll, n, m, bestLag, jointAllTab, true)
+
+	zeroTab, err := hegyTableID(hegyStatZero, o.Deterministic, o.LagMethod)
+	if err != nil {
+		return nil, err
+	}
+	zeroPval := hegyRSpvalueFromTable(detailed.tStatZero, n, m, bestLag, zeroTab, false)
+
+	pairTab, err := hegyTableID(hegyStatPairF, o.Deterministic, o.LagMethod)
+	if err != nil {
+		return nil, err
+	}
+	pairPvals := make([]float64, len(detailed.pairFStats))
+	for i, f := range detailed.pairFStats {
+		pairPvals[i] = hegyRSpvalueFromTable(f, n, m, bestLag, pairTab, true)
+	}
+
 	verdict := 0
-	if pval > 0.05 {
+	if jointSeasPval > 0.05 {
 		verdict = 1
 	}
 
@@ -141,14 +239,24 @@ func HEGYTestFull(x []float64, m int) (*HEGYResult, error) {
 		BestLag:             bestLag,
 		AIC:                 bestStats.aic,
 		TStatZero:           detailed.tStatZero,
+		TStatZeroPValue:     zeroPval,
 		PairFStats:          detailed.pairFStats,
 		PairFrequencies:     detailed.pairFreqs,
+		PairPValues:         pairPvals,
 		JointSeasonalF:      bestStats.fJointSeasonal,
-		JointSeasonalPValue: pval,
+		JointSeasonalPValue: jointSeasPval,
+		JointAllF:           detailed.fJointAll,
+		JointAllPValue:      jointAllPval,
 	}
 	if m%2 == 0 {
-		nyquist := detailed.tStatNyquist
-		res.TStatNyquist = &nyquist
+		nyq := detailed.tStatNyquist
+		res.TStatNyquist = &nyq
+		nyqTab, err := hegyTableID(hegyStatNyquist, o.Deterministic, o.LagMethod)
+		if err != nil {
+			return nil, err
+		}
+		nyqPval := hegyRSpvalueFromTable(nyq, n, m, bestLag, nyqTab, false)
+		res.TStatNyquistPValue = &nyqPval
 	}
 	return res, nil
 }
@@ -157,10 +265,15 @@ func HEGYTestFull(x []float64, m int) (*HEGYResult, error) {
 type hegyResult struct {
 	fJointSeasonal float64 // joint F on (π_2 .. π_m), used for D verdict
 	aic            float64 // AIC of the regression (for lag selection)
+	bic            float64 // BIC of the regression (for HEGYLagBIC)
+	dfResid        int     // residual degrees of freedom (rows - cols).
+	// uroot's hegy.rs.pvalue receives dfResid as its "n" arg (NOT raw
+	// sample size) — it parameterises the response-surface features
+	// `1/n`, `1/n²`, etc. against simulation residual df.
 }
 
 // hegyDetailedResult holds the full per-frequency breakdown — populated
-// once at the AIC-best lag for HEGYTestFull. Pair F-stats and t-stats
+// once at the (AIC-)best lag for HEGYTestFull. Pair F-stats and t-stats
 // share the regression's (X'X)⁻¹ so they're cheap once the OLS solve
 // has run.
 type hegyDetailedResult struct {
@@ -168,6 +281,7 @@ type hegyDetailedResult struct {
 	tStatNyquist float64 // valid only when m is even
 	pairFStats   []float64
 	pairFreqs    []float64
+	fJointAll    float64 // joint F on (π_1..π_m), uroot CFt
 }
 
 // hegyAuxRegressors constructs the m-column auxiliary-regressor matrix
@@ -292,62 +406,129 @@ func applyMSeasonalDiff(y []float64, m int) []float64 {
 	return out
 }
 
-// hegyFitWithBestLag tries lag augmentation orders p ∈ {0..maxLag} on
-// the HEGY auxiliary regression and returns the AIC-best fit's
-// statistics + chosen lag order. Mirrors R's `lag.method="AIC",
-// maxlag=maxLag`.
-func hegyFitWithBestLag(dmy []float64, auxRows [][]float64, m, maxLag int) (hegyResult, int, error) {
-	bestAIC := math.Inf(1)
+// hegySelectLag picks the lag order according to opts.LagMethod and
+// returns the regression statistics at the chosen lag, for the given
+// deterministic configuration. AIC/BIC scan p ∈ [0, opts.MaxLag];
+// HEGYLagFixed runs a single OLS at opts.Lag.
+func hegySelectLag(dmy []float64, auxRows [][]float64, m int, opts HEGYOpts) (hegyResult, int, error) {
+	if opts.LagMethod == HEGYLagFixed {
+		stats, err := hegyOLSConfig(dmy, auxRows, m, opts.Lag, opts.Deterministic)
+		if err != nil {
+			return hegyResult{}, 0, err
+		}
+		return stats, opts.Lag, nil
+	}
+	bestScore := math.Inf(1)
 	var bestStats hegyResult
 	bestP := 0
 	var lastErr error
-	for p := 0; p <= maxLag; p++ {
-		stats, err := hegyOLS(dmy, auxRows, m, p)
+	for p := 0; p <= opts.MaxLag; p++ {
+		stats, err := hegyOLSConfig(dmy, auxRows, m, p, opts.Deterministic)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		if stats.aic < bestAIC {
-			bestAIC = stats.aic
+		score := stats.aic
+		if opts.LagMethod == HEGYLagBIC {
+			score = stats.bic
+		}
+		if score < bestScore {
+			bestScore = score
 			bestStats = stats
 			bestP = p
 		}
 	}
-	if math.IsInf(bestAIC, 1) {
+	if math.IsInf(bestScore, 1) {
 		return hegyResult{}, 0, errors.New("HEGY: no lag selection succeeded: " + lastErr.Error())
 	}
 	return bestStats, bestP, nil
 }
 
-// hegyOLS runs the HEGY auxiliary regression at a fixed lag order p.
-// Regression: Δ^m y_t = α + β·t + Σ π_i · Y_{i,t-1} + Σ φ_j · Δ^m y_{t-j} + ε.
-// Returns the joint F-stat on (π_2..π_m) and AIC.
-func hegyOLS(dmy []float64, auxRows [][]float64, m, p int) (hegyResult, error) {
+// hegyBuildXY constructs the design matrix and dependent vector for
+// the HEGY auxiliary regression at lag p with the given deterministic
+// configuration. Layout:
+//
+//	cols 0..ndet-1:        deterministic (constant, trend, seasonal dummies)
+//	cols ndet..ndet+m-1:   π_1..π_m  (the seasonal regressors)
+//	cols ndet+m..end:      p lag-augmentation terms Δ^m y_{t-j}
+//
+// Returns piStart = ndet (column index of π_1), useful for downstream
+// joint-F / per-coefficient stats.
+func hegyBuildXY(dmy []float64, auxRows [][]float64, m, p int, det HEGYDeterministic) (X [][]float64, yt []float64, piStart int, err error) {
 	nDmy := len(dmy)
 	if nDmy <= 0 {
-		return hegyResult{}, errors.New("dmy is empty")
+		err = errors.New("HEGY: dmy is empty")
+		return
 	}
 	startDmy := p
 	rows := nDmy - p
-	cols := 2 + m + p // intercept + trend + m auxiliary + p lag-aug
-	if rows <= cols+1 {
-		return hegyResult{}, errors.New("HEGY: not enough observations after lag augmentation")
+
+	ndet := 0
+	if det.hasConstant() {
+		ndet++
 	}
-	X := make([][]float64, rows)
-	yt := make([]float64, rows)
+	if det.hasTrend() {
+		ndet++
+	}
+	if det.hasSeasonalDummies() {
+		ndet += m - 1
+	}
+	cols := ndet + m + p
+	if rows <= cols+1 {
+		err = errors.New("HEGY: not enough observations after lag augmentation")
+		return
+	}
+
+	piStart = ndet
+	X = make([][]float64, rows)
+	yt = make([]float64, rows)
 	for i := 0; i < rows; i++ {
 		row := make([]float64, cols)
-		row[0] = 1                          // intercept
-		row[1] = float64(startDmy + i + 1)  // trend (1-indexed)
+		c := 0
+		if det.hasConstant() {
+			row[c] = 1
+			c++
+		}
+		if det.hasTrend() {
+			row[c] = float64(startDmy + i + 1)
+			c++
+		}
+		if det.hasSeasonalDummies() {
+			// (m-1) seasonal dummies: indicator I[(t mod m) == s] for
+			// s = 0..m-2. The s = m-1 dummy is dropped to avoid
+			// collinearity with the constant.
+			t1 := startDmy + i + 1
+			season := (t1 - 1) % m
+			for s := 0; s < m-1; s++ {
+				if season == s {
+					row[c] = 1
+				}
+				c++
+			}
+		}
 		for j := 0; j < m; j++ {
-			row[2+j] = auxRows[startDmy+i][j]
+			row[c] = auxRows[startDmy+i][j]
+			c++
 		}
 		for j := 0; j < p; j++ {
-			row[2+m+j] = dmy[startDmy+i-1-j]
+			row[c] = dmy[startDmy+i-1-j]
+			c++
 		}
 		X[i] = row
 		yt[i] = dmy[startDmy+i]
 	}
+	return
+}
+
+// hegyOLSConfig is the deterministic-config-aware variant of hegyOLS.
+// Returns the joint F on (π_2..π_m), AIC, and BIC.
+func hegyOLSConfig(dmy []float64, auxRows [][]float64, m, p int, det HEGYDeterministic) (hegyResult, error) {
+	X, yt, piStart, err := hegyBuildXY(dmy, auxRows, m, p, det)
+	if err != nil {
+		return hegyResult{}, err
+	}
+	rows := len(X)
+	cols := len(X[0])
 	beta, err := olsFit(X, yt, false)
 	if err != nil {
 		return hegyResult{}, err
@@ -368,52 +549,37 @@ func hegyOLS(dmy []float64, auxRows [][]float64, m, p int) (hegyResult, error) {
 		return hegyResult{}, errors.New("non-positive RSS in HEGY regression")
 	}
 	sigma2 := rss / float64(rows-cols)
-	aic := float64(rows)*math.Log(rss/float64(rows)) + 2*float64(cols)
+	nf := float64(rows)
+	aic := nf*math.Log(rss/nf) + 2*float64(cols)
+	bic := nf*math.Log(rss/nf) + math.Log(nf)*float64(cols)
 
-	// Joint F on (π_2..π_m): coefficient indices 3..m+1.
+	// Joint F on (π_2..π_m): indices piStart+1 .. piStart+m-1.
 	seasonalIdx := make([]int, m-1)
 	for i := range seasonalIdx {
-		seasonalIdx[i] = 3 + i
+		seasonalIdx[i] = piStart + 1 + i
 	}
 	fSeason, err := hegyJointFStat(X, beta, sigma2, seasonalIdx)
 	if err != nil {
 		return hegyResult{}, err
 	}
-	return hegyResult{fJointSeasonal: fSeason, aic: aic}, nil
+	return hegyResult{fJointSeasonal: fSeason, aic: aic, bic: bic, dfResid: rows - cols}, nil
 }
 
-// hegyOLSDetailed re-runs the regression at the (AIC-best) lag p and
-// returns the per-frequency breakdown:
-//   - t-stat for π_1 (col 2, zero frequency)
-//   - t-stat for π_2 (col 3, Nyquist) when m is even
-//   - F-stat for each (cos, sin) harmonic pair
+
+// hegyOLSDetailed2 re-runs the regression at the chosen lag p with the
+// given deterministic config and returns the per-frequency breakdown.
+// PG-114: generalized over deterministic; PG-115a: per-frequency stats.
 //
-// Frequency layout (cf. hegyAuxRegressors):
-//   - even m: cols 2,3 are π_1, π_2; cols (4,5),(6,7),... are pairs at j=1,2,...
-//   - odd m:  col 2 is π_1; cols (3,4),(5,6),... are pairs at j=1,2,...
-func hegyOLSDetailed(dmy []float64, auxRows [][]float64, m, p int) (hegyDetailedResult, error) {
-	nDmy := len(dmy)
-	startDmy := p
-	rows := nDmy - p
-	cols := 2 + m + p
-	if rows <= cols+1 {
-		return hegyDetailedResult{}, errors.New("HEGY: not enough observations for detailed regression")
+// Frequency layout (cf. hegyAuxRegressors), where piStart = column of π_1:
+//   - even m: cols piStart, piStart+1 are π_1, π_2; pairs start at piStart+2
+//   - odd m:  col piStart is π_1; pairs start at piStart+1
+func hegyOLSDetailed2(dmy []float64, auxRows [][]float64, m, p int, det HEGYDeterministic) (hegyDetailedResult, error) {
+	X, yt, piStart, err := hegyBuildXY(dmy, auxRows, m, p, det)
+	if err != nil {
+		return hegyDetailedResult{}, err
 	}
-	X := make([][]float64, rows)
-	yt := make([]float64, rows)
-	for i := 0; i < rows; i++ {
-		row := make([]float64, cols)
-		row[0] = 1
-		row[1] = float64(startDmy + i + 1)
-		for j := 0; j < m; j++ {
-			row[2+j] = auxRows[startDmy+i][j]
-		}
-		for j := 0; j < p; j++ {
-			row[2+m+j] = dmy[startDmy+i-1-j]
-		}
-		X[i] = row
-		yt[i] = dmy[startDmy+i]
-	}
+	rows := len(X)
+	cols := len(X[0])
 	beta, err := olsFit(X, yt, false)
 	if err != nil {
 		return hegyDetailedResult{}, err
@@ -440,35 +606,30 @@ func hegyOLSDetailed(dmy []float64, auxRows [][]float64, m, p int) (hegyDetailed
 		return hegyDetailedResult{}, err
 	}
 
-	// SE(β[k]) = sqrt(σ² · (X'X)⁻¹[k][k])
 	seAt := func(k int) float64 {
 		return math.Sqrt(sigma2 * xtxInv[k][k])
 	}
 
 	out := hegyDetailedResult{}
-	// π_1 t-stat is at col 2.
-	out.tStatZero = beta[2] / seAt(2)
+	// π_1 t-stat at col piStart.
+	out.tStatZero = beta[piStart] / seAt(piStart)
 
 	isEven := m%2 == 0
-	// Pair-F count and column starting index.
 	var pairCount int
 	var pairStartCol int
 	if isEven {
-		// π_2 at col 3 (Nyquist); pairs start at col 4.
-		out.tStatNyquist = beta[3] / seAt(3)
+		out.tStatNyquist = beta[piStart+1] / seAt(piStart + 1)
 		pairCount = (m - 2) / 2
-		pairStartCol = 4
+		pairStartCol = piStart + 2
 	} else {
-		// no Nyquist; pairs start at col 3.
 		pairCount = (m - 1) / 2
-		pairStartCol = 3
+		pairStartCol = piStart + 1
 	}
 
 	out.pairFStats = make([]float64, pairCount)
 	out.pairFreqs = make([]float64, pairCount)
 	for k := 0; k < pairCount; k++ {
 		col := pairStartCol + 2*k
-		// Pair occupies (col, col+1).
 		fStat, err := hegyJointFStatFromInv(xtxInv, beta, sigma2, []int{col, col + 1})
 		if err != nil {
 			return hegyDetailedResult{}, err
@@ -476,6 +637,17 @@ func hegyOLSDetailed(dmy []float64, auxRows [][]float64, m, p int) (hegyDetailed
 		out.pairFStats[k] = fStat
 		out.pairFreqs[k] = 2 * math.Pi * float64(k+1) / float64(m)
 	}
+
+	// Joint F on all m seasonal coefficients (CFt — π_1..π_m).
+	allIdx := make([]int, m)
+	for i := range allIdx {
+		allIdx[i] = piStart + i
+	}
+	fAll, err := hegyJointFStatFromInv(xtxInv, beta, sigma2, allIdx)
+	if err != nil {
+		return hegyDetailedResult{}, err
+	}
+	out.fJointAll = fAll
 	return out, nil
 }
 
@@ -597,30 +769,32 @@ func hegyInvertSym(A [][]float64) ([][]float64, error) {
 	return out, nil
 }
 
-// hegyRSpvalue computes the p-value of the joint F_{2:m} statistic via
-// uroot's response-surface regression. Direct port of
-// `uroot::hegy.rs.pvalue(type="seasall", deterministic=c(1,1,0),
-// lag.method="AIC")` for any m ≥ 2.
+// hegyRSpvalueFromTable is the table-driven core of uroot's
+// hegy.rs.pvalue (uroot 2.1.3). Selects between F-test and t-test
+// branches based on isFtest:
+//   - F-test (CF, CFs, CFt tables): qchisq(df=2) for Y, reverses Q1,
+//     pchisq lower.tail=FALSE for the final p-value.
+//   - t-test (Ct1, Ct2 tables): qnorm for Y, no Q1 reversal, pnorm
+//     lower.tail=TRUE for the final p-value.
+//
+// Returns the p-value in [0, 1]. Edge cases: F-test returns 1 if stat
+// is below all quantiles (high p-value, fail to reject H0=unit roots);
+// t-test returns 0 in that case (low p-value, reject H0=unit root).
 //
 // Algorithm (per Diaz-Emparanza & Carlomagno 2010 / uroot 2.x):
 //
-//   1. Compute features xeplc = [1, 1/n, 1/n², 1/n³, lag/n, ...,
-//      lag³/n³, S/n, S/n², S/n³] (16-dim).
-//   2. Q = C1 · xeplc — predicted F-statistic value at each of 221
-//      pre-computed quantile levels (rq).
-//   3. Find the local quantile bracket around the observed stat x.
-//   4. GLS-fit a cubic in qi (5-point window default 15-point) of
-//      qchisq(rq, df=2) → recover the χ² inverse-CDF approximation
-//      adjusted to the simulation noise (sdC1 columns).
-//   5. p-value = 1 - F_χ²(|cubic(x)|, df=2) for the F-test branch.
-//
-// Returns the p-value in [0, 1]. The function is conservative on the
-// extremes: returns 0 if x is greater than the largest quantile,
-// 1 if smaller than the smallest.
-func hegyRSpvalue(stat float64, n, m, lag int) float64 {
+//   1. xeplc = [1, 1/n, 1/n², 1/n³, lag/n, ..., lag³/n³, S/n, S/n², S/n³] (16-dim).
+//   2. Q1 = C1 · xeplc — predicted statistic at each of 221 quantile levels.
+//      Reversed iff isFtest.
+//   3. Find local 15-point window of (Q1, rq, sd) around stat.
+//   4. GLS-fit a cubic in qi of qchisq(df=2)/qnorm(pri).
+//   5. p-value from cubic(stat).
+func hegyRSpvalueFromTable(stat float64, n, m, lag int, tableID hegyRSTableID, isFtest bool) float64 {
 	const nobsreg = 15
 	const featureCount = 16
 	const nrq = 221
+
+	tab := &hegyRSTables[tableID]
 
 	// Build xeplc: [1, 1/n, 1/n², 1/n³, lag/n, lag/n², lag/n³,
 	//               lag²/n, lag²/n², lag²/n³,
@@ -638,52 +812,39 @@ func hegyRSpvalue(stat float64, n, m, lag int) float64 {
 		sf / nf, sf / (nf * nf), sf / (nf * nf * nf),
 	}
 
-	// Q1[i] = sum over features of C1[i, j] * xeplc[j], reversed for
-	// F-test (uroot does `Q1 <- rev(Q1); sdC1 <- rev(sdC1)`).
 	q1 := make([]float64, nrq)
 	sd := make([]float64, nrq)
 	for i := 0; i < nrq; i++ {
 		s := 0.0
 		for j := 0; j < featureCount; j++ {
-			s += hegyCFsCtAIC[i][j] * xeplc[j]
+			s += tab[i][j] * xeplc[j]
 		}
 		q1[i] = s
-		sd[i] = hegyCFsCtAIC[i][16]
+		sd[i] = tab[i][16]
 	}
-	// reverse both
-	reverseFloat64s(q1)
-	reverseFloat64s(sd)
-
-	// Build the corresponding rq grid (also reversed since uroot
-	// reverses Q1 but not rq directly — but the masque/mascer
-	// indexing uses sorted Q1).
-
-	// Sort Q1 to find min/max — but actually we just need to walk
-	// it; uroot uses the unsorted-but-monotonic Q1 (reversed for
-	// F-test it should be monotonic increasing in i).
-	// Edge cases:
-	if stat < q1[0] {
-		// F-test: stat below smallest predicted F → "more extreme
-		// upper tail" — uroot's branch returns 1 for F-test
-		// (high p-value, fail to reject H0=unit roots).
-		// Wait: we reversed Q1, so q1[0] is the LARGEST predicted F.
-		// Actually after reversing: q1[0] is the upper tail, q1[220]
-		// is the lower tail. uroot: `if (x < Q1s[1]) ... else if
-		// (x > tail(Q1s, 1))` where Q1s = sort(Q1). So we need to
-		// sort first. Simpler: branch on the sorted bounds.
+	if isFtest {
+		// uroot reverses Q1 + sdC1 for F-tests (rq remains unreversed
+		// but indexed differently).
+		reverseFloat64s(q1)
+		reverseFloat64s(sd)
 	}
+
 	q1Sorted := append([]float64(nil), q1...)
 	sortFloat64s(q1Sorted)
 	if stat < q1Sorted[0] {
-		// F-test branch: stat below all quantiles → p-value = 1
-		return 1
-	}
-	if stat > q1Sorted[nrq-1] {
+		// uroot: F-test → return 1; t-test → return 0.
+		if isFtest {
+			return 1
+		}
 		return 0
 	}
+	if stat > q1Sorted[nrq-1] {
+		if isFtest {
+			return 0
+		}
+		return 1
+	}
 
-	// Find masque = max index where stat > q1[i] (using the reversed-
-	// then-sorted axis). uroot uses the *unsorted* q1 for masque.
 	masque := -1
 	for i := 0; i < nrq; i++ {
 		if stat > q1[i] {
@@ -693,7 +854,6 @@ func hegyRSpvalue(stat float64, n, m, lag int) float64 {
 	if masque < 0 {
 		masque = 0
 	}
-	// Decide mascer (closer of masque vs masque+1).
 	mascer := masque
 	if masque < nrq-1 {
 		if math.Abs(stat-q1[masque]) > math.Abs(q1[masque+1]-stat) {
@@ -709,13 +869,11 @@ func hegyRSpvalue(stat float64, n, m, lag int) float64 {
 		mascer = centroup
 	}
 
-	// Build local 15-point window around mascer.
 	qi := make([]float64, nobsreg)
 	pri := make([]float64, nobsreg)
 	si := make([]float64, nobsreg)
 	for i := 0; i < nobsreg; i++ {
 		j := mascer - centro + i
-		// j is 1-indexed from R; convert to 0-index by j-1.
 		idx := j - 1
 		if idx < 0 {
 			idx = 0
@@ -724,19 +882,24 @@ func hegyRSpvalue(stat float64, n, m, lag int) float64 {
 			idx = nrq - 1
 		}
 		qi[i] = q1[idx]
-		// rq is also reversed for F-test — uroot reverses Q1 + sdC1
-		// but iterates rq via index. The rq we have is the original
-		// (unreversed); after reversing Q1 the "rq" effectively used
-		// is rq[nrq-1-idx].
-		pri[i] = hegyRSQuantiles[nrq-1-idx]
+		// uroot pairs Q1[j] (whether reversed or not) with rq[j]
+		// directly — see hegy.rs.pvalue source. Same indexing for
+		// both F- and t-test branches.
+		pri[i] = hegyRSQuantiles[idx]
 		si[i] = sd[idx]
 	}
 
-	// Y = qchisq(pri, df=2) (we approximate this via -2*ln(1-p) for
-	// chi² df=2 quantile — exact: qchisq(p, df=2) = -2*ln(1-p)).
 	Y := make([]float64, nobsreg)
-	for i := 0; i < nobsreg; i++ {
-		Y[i] = -2.0 * math.Log(1.0-pri[i])
+	if isFtest {
+		// qchisq(p, df=2) = -2·ln(1 - p) — exact for χ² df=2.
+		for i := 0; i < nobsreg; i++ {
+			Y[i] = -2.0 * math.Log(1.0-pri[i])
+		}
+	} else {
+		// qnorm — standard normal inverse CDF.
+		for i := 0; i < nobsreg; i++ {
+			Y[i] = qnormInvCDF(pri[i])
+		}
 	}
 
 	// X = [1, qi, qi², qi³] — design matrix for cubic fit.
@@ -769,7 +932,7 @@ func hegyRSpvalue(stat float64, n, m, lag int) float64 {
 	L, err := hegyCholesky(sigma)
 	if err != nil {
 		// Cholesky failed → fall back to ordinary least squares.
-		return hegyOLSCubicPvalue(qi, Y, stat)
+		return hegyOLSCubicPvalue(qi, Y, stat, isFtest)
 	}
 	// Solve L · z = b for z (forward substitution), then L' · y = z
 	// (back substitution). For our purposes: PY = L^(-1) · Y, PX =
@@ -792,15 +955,19 @@ func hegyRSpvalue(stat float64, n, m, lag int) float64 {
 	// OLS: β = (PX' · PX)^(-1) · PX' · PY.
 	co, err := hegyOLSCoefs(PX, PY)
 	if err != nil {
-		return hegyOLSCubicPvalue(qi, Y, stat)
+		return hegyOLSCubicPvalue(qi, Y, stat, isFtest)
 	}
 	// valorcomp = β · [1, x, x², x³]
 	xs := stat
 	valorcomp := co[0] + co[1]*xs + co[2]*xs*xs + co[3]*xs*xs*xs
-	// p-value = pchisq(|valorcomp|, df=2, lower.tail=FALSE)
-	//        = exp(-|valorcomp|/2)  for χ² df=2.
-	abs := math.Abs(valorcomp)
-	p := math.Exp(-abs / 2.0)
+	// F-test:  pchisq(|valorcomp|, df=2, lower.tail=FALSE) = exp(-|x|/2).
+	// t-test:  pnorm(valorcomp, lower.tail=TRUE).
+	var p float64
+	if isFtest {
+		p = math.Exp(-math.Abs(valorcomp) / 2.0)
+	} else {
+		p = pnormCDF(valorcomp)
+	}
 	if p < 0 {
 		p = 0
 	}
@@ -811,19 +978,88 @@ func hegyRSpvalue(stat float64, n, m, lag int) float64 {
 }
 
 // hegyOLSCubicPvalue is the fallback when Cholesky fails — fits a
-// plain OLS cubic and returns the χ² df=2 p-value.
-func hegyOLSCubicPvalue(qi, Y []float64, stat float64) float64 {
+// plain OLS cubic and returns the F-test χ² df=2 or t-test pnorm p-value.
+func hegyOLSCubicPvalue(qi, Y []float64, stat float64, isFtest bool) float64 {
 	X := make([][]float64, len(qi))
 	for i := range qi {
 		X[i] = []float64{1, qi[i], qi[i] * qi[i], qi[i] * qi[i] * qi[i]}
 	}
 	co, err := hegyOLSCoefs(X, Y)
 	if err != nil {
-		return 0.5 // unknown — neutral
+		return 0.5
 	}
 	xs := stat
 	valorcomp := co[0] + co[1]*xs + co[2]*xs*xs + co[3]*xs*xs*xs
-	return math.Exp(-math.Abs(valorcomp) / 2.0)
+	if isFtest {
+		return math.Exp(-math.Abs(valorcomp) / 2.0)
+	}
+	return pnormCDF(valorcomp)
+}
+
+// qnormInvCDF returns the inverse standard-normal CDF (the quantile
+// function). Direct port of the Wichura (1988) AS241 algorithm —
+// double-precision accurate (~16 digits) over (0, 1). uroot uses
+// R's qnorm() which calls qnorm_DPQ → AS241.
+func qnormInvCDF(p float64) float64 {
+	if p <= 0 {
+		return math.Inf(-1)
+	}
+	if p >= 1 {
+		return math.Inf(1)
+	}
+	q := p - 0.5
+	var r, val float64
+	if math.Abs(q) <= 0.425 {
+		// Central region: AS241 uses r = 0.180625 - q² (NOT q²).
+		r = 0.180625 - q*q
+		val = q * (((((((2509.0809287301226727*r+33430.575583588128105)*r+
+			67265.770927008700853)*r+45921.953931549871457)*r+
+			13731.693765509461125)*r+1971.5909503065514427)*r+
+			133.14166789178437745)*r + 3.387132872796366608) /
+			(((((((5226.495278852854561*r+28729.085735721942674)*r+
+				39307.89580009271061)*r+21213.794301586595867)*r+
+				5394.1960214247511077)*r+687.1870074920579083)*r+
+				42.313330701600911252)*r + 1.0)
+		return val
+	}
+	// Tail region.
+	if q < 0 {
+		r = p
+	} else {
+		r = 1 - p
+	}
+	r = math.Sqrt(-math.Log(r))
+	if r <= 5 {
+		r -= 1.6
+		val = (((((((7.74545014278341407640e-4*r+0.0227238449892691845833)*r+
+			0.24178072517745061177)*r+1.27045825245236838258)*r+
+			3.64784832476320460504)*r+5.7694972214606914055)*r+
+			4.6303378461565452959)*r + 1.42343711074968357734) /
+			(((((((1.05075007164441684324e-9*r+5.475938084995344946e-4)*r+
+				0.0151986665636164571966)*r+0.14810397642748007459)*r+
+				0.68976733498510000455)*r+1.6763848301838038494)*r+
+				2.05319162663775882187)*r + 1.0)
+	} else {
+		r -= 5
+		val = (((((((2.01033439929228813265e-7*r+2.71155556874348757815e-5)*r+
+			0.0012426609473880784386)*r+0.026532189526576123093)*r+
+			0.29656057182850489123)*r+1.7848265399172913358)*r+
+			5.4637849111641143699)*r + 6.6579046435011037772) /
+			(((((((2.04426310338993978564e-15*r+1.4215117583164458887e-7)*r+
+				1.8463183175100546818e-5)*r+7.868691311456132591e-4)*r+
+				0.0148753612908506148525)*r+0.13692988092273580531)*r+
+				0.59983220655588793769)*r + 1.0)
+	}
+	if q < 0 {
+		val = -val
+	}
+	return val
+}
+
+// pnormCDF returns the standard-normal CDF Φ(x) — used for the t-test
+// branch's p-value (uroot: pnorm(valorcomp, lower.tail=TRUE)).
+func pnormCDF(x float64) float64 {
+	return 0.5 * math.Erfc(-x/math.Sqrt2)
 }
 
 // hegyCholesky returns the lower-triangular L such that L · L' = A.
