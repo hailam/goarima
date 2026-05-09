@@ -777,19 +777,28 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// users who want parallel-inside-candidate (large-n series where
 	// the coordination cost amortises) set `GradientWorkers > 1`
 	// explicitly via AutoArimaOpts.
+	// STORM-1 (2026-05-10): use full GOMAXPROCS for inner gradient when
+	// outer fit dispatch is parallel. The previous gp / nParallelFits
+	// split was conservative — it kept total goroutines at NumCPU but
+	// under-utilised the scheduler. Empirically (m4/m5_with_exog/sunspot,
+	// AirPassengers), letting the runtime oversubscribe (nJobs × NumCPU
+	// goroutines) is 1.2-1.5× faster than the conservative split. The
+	// Go scheduler's M:N model handles oversubscription via parking
+	// idle G's; the worry was scheduler latency but profile evidence
+	// shows the work parallelism dominates the sync cost.
+	//
+	// PG-2's nParallelFits<=1 path stays — sequential outer with
+	// parallel inner DID storm at small n. With outer parallelism in
+	// place, scheduler can interleave inner gradient workers across
+	// outer fits to keep cores hot.
 	gradientBudget := func(nParallelFits int) int {
 		if opts.GradientWorkers > 0 {
 			return opts.GradientWorkers
 		}
 		if nParallelFits <= 1 {
-			return 1 // PG-2 fix: serial gradient by default for sequential dispatch
+			return 1 // PG-2 preserved
 		}
-		gp := runtime.GOMAXPROCS(0)
-		w := gp / nParallelFits
-		if w < 1 {
-			w = 1
-		}
-		return w
+		return runtime.GOMAXPROCS(0)
 	}
 
 	// independentFit fits a single candidate without touching the cache.
