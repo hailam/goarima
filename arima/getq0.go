@@ -1,5 +1,10 @@
 package arima
 
+import (
+	"gonum.org/v1/gonum/blas"
+	"gonum.org/v1/gonum/blas/blas64"
+)
+
 // PublicGardner exposes Gardner's stationary cov for parity diagnostics.
 func PublicGardner(phi, theta []float64) [][]float64 {
 	flat, r := stationaryCovGardner(phi, theta)
@@ -442,44 +447,28 @@ func stationaryCovSmithInto(ws *gardnerWorkspace, phi, theta []float64, r int) (
 	return nil, false
 }
 
-// matmulRR computes C = A · B for r×r row-major matrices.
-// Hand-rolled to avoid pulling gonum into this hot path.
+// matmulRR computes C = A · B for r×r row-major matrices via gonum's
+// BLAS DGEMM. SIMD-MATMUL-1 (2026-05-10): the previous hand-rolled
+// ikj loop was 1.26-2.68× slower than gonum's hand-tuned asm across
+// r ∈ {14, 27, 51, 101}. Gain compounds inside Smith doubling
+// (GARD-OPT-1) which calls this 2× per iteration × ~10 iterations.
+//
+// Per-call overhead at r=14 is sub-µs; the dispatch cost is
+// dominated by the actual matmul work even at small r, so no
+// threshold is needed.
 func matmulRR(C, A, B []float64, r int) {
-	for i := 0; i < r; i++ {
-		offA := i * r
-		offC := i * r
-		// Zero the output row.
-		for j := 0; j < r; j++ {
-			C[offC+j] = 0
-		}
-		// Loop reorder ikj for unit-stride access on B and C.
-		for k := 0; k < r; k++ {
-			a := A[offA+k]
-			if a == 0 {
-				continue
-			}
-			offB := k * r
-			for j := 0; j < r; j++ {
-				C[offC+j] += a * B[offB+j]
-			}
-		}
-	}
+	gA := blas64.General{Rows: r, Cols: r, Stride: r, Data: A}
+	gB := blas64.General{Rows: r, Cols: r, Stride: r, Data: B}
+	gC := blas64.General{Rows: r, Cols: r, Stride: r, Data: C}
+	blas64.Gemm(blas.NoTrans, blas.NoTrans, 1.0, gA, gB, 0.0, gC)
 }
 
 // matmulRRt computes C = A · Bᵀ for r×r row-major matrices.
 func matmulRRt(C, A, B []float64, r int) {
-	for i := 0; i < r; i++ {
-		offA := i * r
-		offC := i * r
-		for j := 0; j < r; j++ {
-			offB := j * r
-			s := 0.0
-			for k := 0; k < r; k++ {
-				s += A[offA+k] * B[offB+k]
-			}
-			C[offC+j] = s
-		}
-	}
+	gA := blas64.General{Rows: r, Cols: r, Stride: r, Data: A}
+	gB := blas64.General{Rows: r, Cols: r, Stride: r, Data: B}
+	gC := blas64.General{Rows: r, Cols: r, Stride: r, Data: C}
+	blas64.Gemm(blas.NoTrans, blas.Trans, 1.0, gA, gB, 0.0, gC)
 }
 
 // inclu2 is the Givens-rotation update used by stationaryCovGardner.
