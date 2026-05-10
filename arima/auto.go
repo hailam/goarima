@@ -209,40 +209,38 @@ type AutoArimaOpts struct {
 	// model selection and accept the wallclock cost. Default false.
 	StepwiseDiagonals bool
 
-	// MultiStart, when true, fits the four Hyndman-Khandakar initial
-	// seeds at the start of stepwise search (per R `newarima2.R:489-625`),
-	// picks the lowest-IC seed, and runs stepwise from there:
+	// MultiStart toggles the four Hyndman-Khandakar initial-seed search
+	// at the start of stepwise (per R `newarima2.R:489-625`). When
+	// enabled, fits the four canonical seeds, picks the lowest-IC one,
+	// and runs stepwise from there:
 	//
 	//   1. (start.p, d, start.q)(start.P, D, start.Q) — defaults to (2,2,1,1)
 	//   2. (0, d, 0)(0, D, 0)                          — null model
 	//   3. (1, d, 0)(1, D, 0)                          — basic AR
 	//   4. (0, d, 1)(0, D, 1)                          — basic MA
 	//
-	// **Off by default** because R's "pick best initial by standalone
-	// IC" heuristic isn't reliable: on noisy daily intermittent-demand
-	// data (m5 fast), the seed with lowest standalone IC leads to a
-	// stepwise basin that's catastrophically worse than goarima's
-	// default-seed basin (+579 AICc on m5 fast in the 2026-05-07
-	// empirical study). The "best of 4 stepwise outcomes" oracle would
-	// avoid this, but capturing it requires running all 4 paths
-	// (4× search work).
+	// **Default (nil) is ENABLED** for R `forecast::auto.arima` parity —
+	// R's stepwise=TRUE always runs the four seeds. Pre-2026-05-10 the
+	// goarima default was off because a 2026-05-07 empirical study saw
+	// a +579 AICc regression on m5 fast under multi-start. Re-running
+	// that study post-KPSS-NDIFFS-1 / SIMD-MATMUL-1 / STORM-1 (2026-05-10)
+	// shows the m5 catastrophe gone — across the seven canonical
+	// threeway-tests-goarima datasets in both modes (14 cells):
 	//
-	// Empirical study (2026-05-07, post-PG-98 SEAS) on canonical
-	// threeway-tests-goarima datasets, comparing PG-104's R-style
-	// "pick best initial" to goarima's default single-seed:
+	//   - 4 wins for multi-start: airpassengers default (-0.40),
+	//     airpassengers fast (-7.73), co2 fast (-1.75), m5_with_exog
+	//     fast (-14.35) AICc
+	//   - 8 ties (no change)
+	//   - 1 small loss: co2 default (+1.12)
+	//   - 1 larger loss: sunspot_month fast (+77.75) — but this matches
+	//     R's own pick (R's sunspot_month fast AICc = 30182.89, multi
+	//     30183.67); single-start was just getting lucky with a better
+	//     basin than R itself finds.
 	//
-	//   - Wins: co2 fast (−2.86 AICc), m5_with_exog default (−30 AICc)
-	//   - Ties: airpassengers default/fast, co2 default, m5 default,
-	//     sunspot default
-	//   - **Catastrophic loss**: m5 fast (+579 AICc)
-	//
-	// Set true if your input series are unlikely to have m5-shaped
-	// (daily, intermittent, noisy) characteristics and you want the
-	// co2 fast / m5_with_exog default wins. Cost: 4 standalone initial
-	// fits at the start of each AutoArima call. The "run all 4 paths"
-	// alternative is tracked as a follow-up if/when there's enough
-	// real-world demand.
-	MultiStart bool
+	// To pin pre-2026-05-10 behaviour, set `MultiStart: BoolPtr(false)`.
+	// Cost: 4 standalone initial fits at the start of each call (small
+	// vs the stepwise expansion that follows).
+	MultiStart *bool
 
 	// Approximation, when true, runs the candidate search with MethodCSS
 	// (fast, biased likelihood) regardless of the Method field, then
@@ -643,7 +641,8 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 	// only stepwise-neighbour expansion later respects MaxOrder.
 	// Goarima follows the same pattern: seeds are fit unclamped, then
 	// the picked seed is clamped to MaxOrder for stepwise compatibility.
-	if opts.MultiStart && !opts.FullSearch {
+	multiStartEnabled := opts.MultiStart == nil || *opts.MultiStart
+	if multiStartEnabled && !opts.FullSearch {
 		type hkSeed struct{ p, q, P, Q int }
 		// Default H-K seed1 uses (start.p=2, start.q=2, start.P=1,
 		// start.Q=1) per R; overridden by explicit user values.
@@ -1039,8 +1038,14 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		return best, nil
 	}
 
-	// Stepwise neighbor exploration.
-	best, bestScore, err := tryOrder(p, q, P, Q, 0)
+	// Stepwise neighbor exploration. Use gradientBudget(1) for the
+	// sequential initial fit so opts.GradientWorkers (when set) also
+	// propagates to the case where stepwise stops at the seed (e.g.
+	// the H-K initial-seed pick is already a local optimum). Pre-fix,
+	// passing 0 here meant the initial fit's ARIMA got
+	// GradientWorkers=0 → fell through to GOMAXPROCS at Fit time,
+	// dropping the user's override.
+	best, bestScore, err := tryOrder(p, q, P, Q, gradientBudget(1))
 	if err != nil {
 		if e := handleErr(err); e != nil {
 			return nil, fmt.Errorf("initial fit failed: %w", e)
@@ -1135,8 +1140,9 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		gradBudget := gradientBudget(nJobs)
 		if nJobs == 1 {
 			// Sequential — preserves zero goroutine overhead at small parallelism.
+			seqGrad := gradientBudget(1)
 			for i, n := range neighbors {
-				cand, score, line, err := tryOrderTraced(n.p, n.q, n.P, n.Q, 0)
+				cand, score, line, err := tryOrderTraced(n.p, n.q, n.P, n.Q, seqGrad)
 				results[i] = stepResult{cand, score, line, err}
 			}
 		} else {
