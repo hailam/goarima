@@ -56,6 +56,30 @@ type kalmanWorkspace struct {
 	// need innovations use the legacy kalmanARMALikelihood entry point.)
 
 	gardner gardnerWorkspace // pooled buffers for stationaryCovGardnerInto
+
+	// REVERSE-AD-2: tape buffers for reverse-mode AD on the Kalman
+	// likelihood. Allocated lazily on first use; sized to fit the
+	// largest (n, r) seen. For (n, r) = (700, 51), pTape ≈ 14 MB.
+	adTape adTape
+}
+
+// adTape holds the per-timestep checkpointing buffers used by
+// kalmanARMALikelihoodGradAD's forward+backward sweep.
+type adTape struct {
+	aHist []float64 // (n+1) × r — state mean per timestep
+	pHist []float64 // (n+1) × r² — state covariance per timestep
+	kHist []float64 // n × r — Kalman gain per timestep
+	vHist []float64 // n — innovation per timestep
+	fHist []float64 // n — innovation variance per timestep
+
+	// Backward-pass scratch (per-step, r and r² sized).
+	dA, dAin, dap, dK     []float64 // r
+	dP, dPin, dPp         []float64 // r²
+	TtdP, TPp             []float64 // r²
+	dT                    []float64 // r² (accumulator)
+	dR                    []float64 // r  (accumulator)
+	apScratch, row0Scratch []float64 // r
+	PpScratch              []float64 // r²
 }
 
 // gardnerWorkspace holds the 7 reusable buffers that stationaryCovGardner

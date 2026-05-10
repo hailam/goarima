@@ -392,6 +392,9 @@ func stationaryCovSmithInto(ws *gardnerWorkspace, phi, theta []float64, r int) (
 	}
 
 	// ‖T₀‖_F² baseline for the T-shrinkage convergence test.
+	// VEC-AUDIT (2026-05-10): floats.Dot tested but REGRESSED these
+	// inner-loop benches by 17-22% — function-call overhead breaks
+	// inlining and dominates at r² ≤ 2601. Hand-rolled stays.
 	tNorm0 := 0.0
 	for k := 0; k < rr; k++ {
 		tNorm0 += T[k] * T[k]

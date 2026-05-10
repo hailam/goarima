@@ -410,8 +410,18 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 			copy(x0[off:off+q], raw)
 		}
 		off += q
-		// Seasonal AR/MA stay zero — pure-seasonal HR is rarely a big win and
-		// adds complexity. The CSS warm-up step further refines them.
+		// WARMSTART-1 attempted seasonal HR (lag-m subsample) — both
+		// unguarded and guarded variants tested 2026-05-10. Unguarded:
+		// +9-27% wall regression on AutoArima micro/end-to-end and
+		// changed picked model AICc on multiple datasets. Guarded
+		// (nSeas≥50 AND coefs in (-0.5, 0.5)): m5_with_exog default
+		// regressed 5% wall AND picked (1,0,2)(2,1,2) AICc=36178 vs
+		// the no-warmstart (1,0,3)(2,1,1) AICc=36174 — different BFGS
+		// basin, worse optimum. Conclusion: seasonal HR seed perturbs
+		// BFGS's path enough that it lands at different (sometimes
+		// worse) local optima; the comment that previously said
+		// "rarely a big win" was right. Leave seasonal at zero; CSS
+		// warm-up refines them adequately.
 		off += P + Q
 		if m.WithIntercept {
 			off++
@@ -981,6 +991,17 @@ func (m *ARIMA) gradientWorkers() int {
 	return runtime.GOMAXPROCS(0)
 }
 
+// minimize runs the same BFGS+NM optimizer as minimizeNM, with
+// warmStarted=false (so NM is always run after BFGS).
+//
+// CSS-EARLY-1 (2026-05-10) tested two variants and BOTH regressed
+// AICc on canonical datasets:
+//   • Halve CSS MaxIter: m4 fast +20% wall (under-convergence; same
+//     pick but BFGS retread).
+//   • Skip NM in CSS phase: sunspot default AICc 30564→30644 (+80!),
+//     m5x default +15.8, m5x fast +7.6. CSS NM does global-search
+//     work the ML phase cannot recover from a poor warm-start.
+// Default (NM-after-BFGS in CSS) is empirically optimal.
 func minimize(f func([]float64) float64, x0 []float64, maxIter, nWorkers, dataLen int) []float64 {
 	return minimizeNM(f, x0, maxIter, nWorkers, false, dataLen)
 }
@@ -1020,6 +1041,17 @@ func minimizeNM(f func([]float64) float64, x0 []float64, maxIter, nWorkers int, 
 	// warmStarted=true and BFGS converges cleanly, we DO skip NM — the
 	// CSS phase has already done the global search.
 	bfgsConverged := false
+	// TR-BFGS-1 (2026-05-10): tested two alternatives to default BFGS:
+	//   • MoreThuente line search: catastrophic — m5_with_exog default
+	//     6.4s→104.4s (+16×), sunspot fast 2.6s→69.8s (+26×). ARIMA
+	//     likelihood plateaus confuse strict curvature conditions.
+	//   • LBFGS: mixed — m5x default 24% faster + better AICc, but
+	//     m4/m5 fast regressed 15-25% AND picked model changed.
+	//   • LBFGS + CSS-EARLY-1 combo (CSS_EARLY-1 task 125): combination
+	//     tested 2026-05-10; airpassengers default +69%, m4 fast +37%
+	//     wall regression, sunspot default AICc 76 units WORSE
+	//     (30565→30640). Different basin even with shorter CSS phase.
+	// Default BFGS + Backtracking is empirically optimal for ARIMA.
 	if res, err := optimize.Minimize(prob, x0, settings, &optimize.BFGS{}); err == nil && res != nil {
 		if res.F < bestF {
 			bestF = res.F
