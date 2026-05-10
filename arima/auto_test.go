@@ -499,16 +499,22 @@ func TestGAP3_StationaryConstrainsDifferencing(t *testing.T) {
 // GAP-4: AllowDrift=BoolPtr(true) on a d>0 series must include the drift
 // term even though the default for d>0 is no-intercept. Symmetric for
 // AllowMean on d=0 series.
+//
+// Uses M=0 (non-seasonal) so the picked model has D=0; drift is only
+// meaningful when d+D=1 (matches R's auto.arima rule
+// `if (d+D > 1) allowdrift <- FALSE`). With seasonal differencing
+// active (M=12, D=1) and a non-stationary residual, AutoArima now
+// matches R in picking (0,1,1)(0,1,1)[12] with d+D=2, where R also
+// quietly disables drift even when allowdrift=TRUE.
 func TestGAP4_AllowDriftOverride(t *testing.T) {
 	ap := datasets.LoadAirPassengers()
 	logAp := make([]float64, len(ap))
 	for i, v := range ap {
 		logAp[i] = math.Log(v)
 	}
-	// Force drift on a (0,1,1)(0,1,1) candidate that defaults to no-intercept.
 	m, err := AutoArima(logAp, nil, AutoArimaOpts{
-		M: 12, MaxP: 1, MaxQ: 1, MaxCapP: 1, MaxCapQ: 1,
-		MaxOrder:   3,
+		M: 0, MaxP: 2, MaxQ: 2,
+		MaxOrder:   4,
 		MaxIter:    50,
 		IC:         AICc,
 		AllowDrift: BoolPtr(true),
@@ -516,8 +522,12 @@ func TestGAP4_AllowDriftOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if d := m.Order.D; d == 0 {
+		t.Fatalf("expected d>0 to test AllowDrift; got Order=%v", m.Order)
+	}
 	if !m.WithIntercept {
-		t.Errorf("AllowDrift=true on d>0 model: WithIntercept must be true; got %v", m.WithIntercept)
+		t.Errorf("AllowDrift=true on d>0 model: WithIntercept must be true; got %v (Order=%v)",
+			m.WithIntercept, m.Order)
 	}
 }
 

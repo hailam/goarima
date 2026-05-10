@@ -118,6 +118,36 @@ func TestParityLynx(t *testing.T) {
 	}
 }
 
+// KPSS-NDIFFS-1 acceptance test: airpassengers training (n=120)
+// seasonally-differenced at lag 12 (n=108) sits right at the KPSS 5%
+// threshold. The bug was that `NDiffs(KPSS)` used `tseries::kpss.test`'s
+// `lshort=TRUE` lag formula `trunc(4*(n/100)^0.25)` (= 4 here, stat
+// 0.328 — below 5% crit 0.463 → ndiffs=0), while
+// `forecast::ndiffs(test="kpss")` calls `urca::ur.kpss` with
+// `use.lag = trunc(3*sqrt(n)/13)` (= 2 here, stat 0.473 — above 5%
+// crit → ndiffs=1).
+//
+// R reference values (verified 2026-05-10):
+//
+//	urca::ur.kpss(diff(AirPassengers[1:120], lag=12), type="mu",
+//	              use.lag=2)@teststat == 0.4733
+//	forecast::ndiffs(diff(AirPassengers[1:120], lag=12), test="kpss") == 1
+func TestNDiffsParity_AirPassengersTrainSeasonallyDiffed(t *testing.T) {
+	ap := datasets.LoadAirPassengers()
+	train := ap[:120]
+	sd := make([]float64, len(train)-12)
+	for i := range sd {
+		sd[i] = train[i+12] - train[i]
+	}
+	got, err := NDiffs(sd, NDiffsOpts{Test: NDiffsKPSS, MaxD: 2, Alpha: 0.05})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Errorf("ndiffs(airpassengers train sd-12, kpss) = %d want 1 (matches forecast::ndiffs)", got)
+	}
+}
+
 // SARIMA fit on wineind — mirrors `test_that("tests for a ts with the seasonal
 // component", ...)` from forecast/test-arima.R. Asserts the model fits and
 // produces forecasts of the expected length.
