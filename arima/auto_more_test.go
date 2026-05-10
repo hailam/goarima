@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/hailam/goarima/datasets"
+	"github.com/hailam/goarima/metrics"
 )
 
 // FullSearch must enumerate every combination and find at least the same or
@@ -98,6 +99,79 @@ func TestAutoArimaOutOfSample(t *testing.T) {
 	// Model should still be a valid AR-ish fit after holdout-based selection.
 	if mdl.Order.P > 2 {
 		t.Errorf("p=%d should be <=2", mdl.Order.P)
+	}
+}
+
+// AUTOSEL-1 acceptance test: on co2 (n=468, m=12), AutoArima with
+// OutOfSampleSize=24 and MASE scoring must reach a holdout MASE
+// competitive with R's auto.arima (≤ 0.30 on the last 24 months).
+//
+// The bug report claimed goarima's default-AICc pick gave MASE=0.301
+// vs Python pmdarima's MASE=0.217 — a 0.084 gap. After KPSS-NDIFFS-1
+// shipped, the default pick already gives MASE ≈ 0.216 (proper
+// seasonal-12 MASE), and OutOfSampleSize=24 + MASE scoring picks a
+// neighbor with marginally better holdout MASE (≈ 0.215).
+//
+// This test asserts BOTH paths land below 0.30, with the OOS path
+// not regressing more than 5% vs the default. R's auto.arima on the
+// same train gives MASE ≈ 0.258.
+func TestAutoArimaCO2HoldoutMASE(t *testing.T) {
+	co2 := datasets.LoadCO2()
+	const k = 24
+	train := co2[:len(co2)-k]
+	test := co2[len(co2)-k:]
+
+	// Default-AICc path.
+	mDefault, err := AutoArima(train, nil, AutoArimaOpts{
+		M: 12, IC: AICc, MaxIter: 50,
+	})
+	if err != nil {
+		t.Fatalf("default AutoArima: %v", err)
+	}
+	fcDefault, _, _, err := mDefault.Predict(k, 0, nil)
+	if err != nil {
+		t.Fatalf("default Predict: %v", err)
+	}
+	maseDefault, err := metrics.MASE(test, fcDefault, train, 12)
+	if err != nil {
+		t.Fatalf("default MASE: %v", err)
+	}
+
+	// OutOfSampleSize=24 + MASE scoring path.
+	mOOS, err := AutoArima(co2, nil, AutoArimaOpts{
+		M: 12, IC: AICc, MaxIter: 50,
+		OutOfSampleSize: k,
+		Scoring:         metrics.MASEScoring(train, 12),
+	})
+	if err != nil {
+		t.Fatalf("OOS AutoArima: %v", err)
+	}
+	fcOOS, _, _, err := mOOS.Predict(k, 0, nil)
+	if err != nil {
+		t.Fatalf("OOS Predict: %v", err)
+	}
+	maseOOS, err := metrics.MASE(test, fcOOS, train, 12)
+	if err != nil {
+		t.Fatalf("OOS MASE: %v", err)
+	}
+
+	t.Logf("co2 default-AICc: Order=%v Seasonal=%v MASE=%.4f",
+		mDefault.Order, mDefault.Seasonal, maseDefault)
+	t.Logf("co2 OOS=24 MASE:  Order=%v Seasonal=%v MASE=%.4f",
+		mOOS.Order, mOOS.Seasonal, maseOOS)
+
+	const maseCeiling = 0.30
+	if maseDefault > maseCeiling {
+		t.Errorf("default MASE %.4f > ceiling %.4f", maseDefault, maseCeiling)
+	}
+	if maseOOS > maseCeiling {
+		t.Errorf("OOS MASE %.4f > ceiling %.4f", maseOOS, maseCeiling)
+	}
+	// Tolerance: OOS must not be more than 5% worse than default
+	// (different picks; small jitter expected, large regressions are
+	// a genuine selector bug).
+	if maseOOS > maseDefault*1.05 {
+		t.Errorf("OOS MASE %.4f regressed > 5%% vs default %.4f", maseOOS, maseDefault)
 	}
 }
 
