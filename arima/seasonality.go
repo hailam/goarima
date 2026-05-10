@@ -758,7 +758,22 @@ func runDiffTest(x []float64, opts NDiffsOpts) (pval float64, doDiff bool, err e
 		if null == "" {
 			null = "level"
 		}
-		res, e := KPSSTest(x, KPSSTestOpts{Alpha: opts.Alpha, Null: null, LShort: opts.LShort || true})
+		// KPSS-NDIFFS-1 (2026-05-10): match `forecast::ndiffs(test="kpss")`
+		// which calls `urca::ur.kpss` with `use.lag = trunc(3*sqrt(n)/13)`.
+		// The previous LShort-derived formula `trunc(4*(n/100)^0.25)` is
+		// what `tseries::kpss.test` uses by default and gave divergent
+		// verdicts vs R near the 5% threshold (e.g., airpassengers train
+		// seasonally-diffed at lag 12, n=108: lshort l=4 stat=0.328
+		// → ndiffs=0; forecast l=2 stat=0.473 → ndiffs=1, matching R).
+		useLag := int(math.Trunc(3 * math.Sqrt(float64(len(x))) / 13))
+		if useLag < 1 {
+			useLag = 1
+		}
+		res, e := KPSSTest(x, KPSSTestOpts{
+			Alpha:  opts.Alpha,
+			Null:   null,
+			UseLag: useLag,
+		})
 		return res.PValue, res.ShouldDiff, e
 	case NDiffsADF:
 		res, e := ADFTest(x, ADFTestOpts{Alpha: opts.Alpha})

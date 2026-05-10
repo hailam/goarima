@@ -89,6 +89,12 @@ type KPSSTestOpts struct {
 	Alpha  float64 // significance level (default 0.05)
 	Null   string  // "level" or "trend" (default "level")
 	LShort bool    // truncation rule (default true)
+	// UseLag, when > 0, sets the Newey-West lag truncation explicitly,
+	// overriding LShort. This is the knob R's `urca::ur.kpss` exposes
+	// (`use.lag`); `forecast::ndiffs(test="kpss")` calls into it with
+	// `trunc(3 * sqrt(n) / 13)` rather than the tseries `lshort` rule.
+	// Direct callers wanting tseries-style behaviour can leave UseLag=0.
+	UseLag int
 }
 
 // KPSSTest implements the Kwiatkowski-Phillips-Schmidt-Shin stationarity test.
@@ -157,9 +163,12 @@ func KPSSTest(x []float64, opts KPSSTestOpts) (KPSSResult, error) {
 	}
 	s2 /= float64(n)
 	var l int
-	if opts.LShort {
+	switch {
+	case opts.UseLag > 0:
+		l = opts.UseLag
+	case opts.LShort:
 		l = int(math.Trunc(4 * math.Pow(float64(n)/100, 0.25)))
-	} else {
+	default:
 		l = int(math.Trunc(12 * math.Pow(float64(n)/100, 0.25)))
 	}
 	s2 = tseriesPpSum(resid, n, l, s2)
