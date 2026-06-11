@@ -1072,7 +1072,30 @@ func minimizeNM(f func([]float64) float64, x0 []float64, maxIter, nWorkers int, 
 	//     wall regression, sunspot default AICc 76 units WORSE
 	//     (30565→30640). Different basin even with shorter CSS phase.
 	// Default BFGS + Backtracking is empirically optimal for ARIMA.
-	if res, err := optimize.Minimize(prob, x0, settings, &optimize.BFGS{}); err == nil && res != nil {
+	// LINESEARCH-1 (2026-06-12): explicit Armijo Backtracking linesearch.
+	// gonum's default BFGS linesearcher is Bisection, which enforces the
+	// strong-Wolfe CURVATURE condition — with noisy central-difference
+	// gradients on flat ARMA likelihood plateaus that condition is
+	// unsatisfiable and the linesearch errors out ("linesearch: failed
+	// to converge"), aborting BFGS entirely. Measured on the sunspot
+	// (1,0,2)(1,0,0)[12] CSSML refit: 12/12 BFGS calls failed, leaving
+	// Nelder-Mead (600-1400 SERIAL evals) to do all the work — the
+	// whole optimizer pipeline was NM-only in disguise. Backtracking
+	// checks only the Armijo sufficient-decrease condition, which is
+	// robust to gradient noise. (The pre-existing comment below already
+	// said "BFGS + Backtracking is empirically optimal" — the code just
+	// never actually selected Backtracking.)
+	resB, errB := optimize.Minimize(prob, x0, settings, &optimize.BFGS{
+		Linesearcher: &optimize.Backtracking{},
+	})
+	if resB != nil && errB != nil && !math.IsNaN(resB.F) && !math.IsInf(resB.F, 0) && resB.F < bestF {
+		// LINESEARCH-1: keep BFGS partial progress even when the
+		// linesearch ultimately fails — it seeds the NM fallback from
+		// a lower point instead of restarting at x0.
+		bestF = resB.F
+		copy(bestX, resB.X)
+	}
+	if res, err := resB, errB; err == nil && res != nil {
 		if res.F < bestF {
 			bestF = res.F
 			copy(bestX, res.X)
