@@ -649,7 +649,16 @@ func olsStdErr(X [][]float64, resid []float64, idx int) (float64, error) {
 	if err := inv.Inverse(&XtX); err != nil {
 		return 0, err
 	}
-	return math.Sqrt(sigma2 * inv.At(idx, idx)), nil
+	// UNITROOT-SE-1: near-singular X'X can yield a (numerically)
+	// negative diagonal in the computed inverse — clamp to 0 so the
+	// standard error degrades to 0 instead of NaN-poisoning the test
+	// statistic. Only reachable on near-constant series; exactly-
+	// constant input is rejected upstream by IsConstantSlice.
+	diag := inv.At(idx, idx)
+	if diag < 0 {
+		diag = 0
+	}
+	return math.Sqrt(sigma2 * diag), nil
 }
 
 func boolToInt(b bool) int {

@@ -806,11 +806,31 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 		negLL, sigma2 = ll, s2
 	case m.Method == MethodCSS:
 		// MethodCSS optimizes the conditional sum-of-squares profile
-		// likelihood; report the same family of stats so logL/IC align with
-		// the estimator that produced the parameters. Mirrors R's
-		// stats::arima(method="CSS") convention. Note AIC under CSS is not
-		// directly comparable to AIC under ML across estimators.
+		// likelihood. CSS-NSTAR-1 (2026-06-12): report logL on a FIXED
+		// sample-size scale, negLL = (nstar/2)·log(σ²) with
+		// nstar = len(r) (n − d − D·m), instead of armaCSS's
+		// count-based (count/2)·log(σ²) where count = n − max(p̂, q̂)
+		// varies per model. The count-based form made CSS ICs
+		// incomparable ACROSS candidates: a model with larger
+		// max(p_expanded, q_expanded) conditions away more
+		// observations, and each dropped observation removes
+		// ~log(σ²)/2 from negLL — on sunspot fast (n=3250) this
+		// manufactured a phantom 114-point CSS-AICc advantage for a
+		// (2,0,3)(0,0,2)[12] pick (q̂=27, drops 27 obs) over R's
+		// (1,0,2)(1,0,0)[12] (drops 13), even though after ML refit
+		// the two are tied. R's auto.arima approximation mode scores
+		// candidates as offset + nstar·log(σ²_css) + penalty with
+		// nstar CONSTANT across the search (newarima2.R) — only σ²
+		// comes from the CSS fit. We mirror that. Within one model
+		// the optimizer still minimizes the count-based objective
+		// (same argmin — monotone in SSE); only the reported logL/IC
+		// changes. Note stats::arima(method="CSS") reports aic=NA —
+		// there is no R convention to break here; the search is the
+		// only consumer that compares CSS ICs across models.
 		ll, s2, _ := armaCSS(r, fullPhi, fullTheta)
+		if !math.IsInf(ll, 0) && !math.IsNaN(ll) && s2 > 0 {
+			ll = 0.5 * float64(len(r)) * math.Log(s2)
+		}
 		negLL, sigma2 = ll, s2
 	default:
 		ll, s2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)

@@ -700,12 +700,18 @@ const (
 )
 
 // NDiffsOpts groups the configuration for NDiffs.
+//
+// NDIFFS-LSHORT-1 (2026-06-12): the former `LShort bool` field was
+// removed — it had no effect on any path. The KPSS branch derives its
+// lag from `trunc(3·√n/13)` (forecast::ndiffs parity, KPSS-NDIFFS-1)
+// and the PP branch always uses the short truncation rule, matching
+// `urca::ur.pp`'s default that R's ndiffs relies on. Callers needing
+// explicit lag control should use KPSSTest / PPTest directly.
 type NDiffsOpts struct {
-	Alpha  float64
-	Test   NDiffsTest
-	MaxD   int
-	Null   string // KPSS only: "level" or "trend"
-	LShort bool   // KPSS / PP
+	Alpha float64
+	Test  NDiffsTest
+	MaxD  int
+	Null  string // KPSS only: "level" or "trend"
 }
 
 // NDiffs estimates the non-seasonal differencing term d.
@@ -779,7 +785,11 @@ func runDiffTest(x []float64, opts NDiffsOpts) (pval float64, doDiff bool, err e
 		res, e := ADFTest(x, ADFTestOpts{Alpha: opts.Alpha})
 		return res.PValue, res.ShouldDiff, e
 	case NDiffsPP:
-		res, e := PPTest(x, PPTestOpts{Alpha: opts.Alpha, LShort: opts.LShort || true})
+		// Short truncation always — matches `urca::ur.pp`'s default
+		// (lags="short"), which is what forecast::ndiffs(test="pp")
+		// uses. (The pre-NDIFFS-LSHORT-1 form `opts.LShort || true`
+		// was a tautology — the option never had any effect.)
+		res, e := PPTest(x, PPTestOpts{Alpha: opts.Alpha, LShort: true})
 		return res.PValue, res.ShouldDiff, e
 	}
 	return math.NaN(), false, errors.New("unknown test")

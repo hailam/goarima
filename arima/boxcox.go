@@ -39,6 +39,15 @@ func boxCoxInvert(y []float64, lam1, lam2 float64) []float64 {
 // boxCoxInvertInto is the in-place variant: writes inverse-Box-Cox of
 // y into dst. dst and y may alias (dst === y is safe since each output
 // element depends only on the corresponding input element).
+//
+// BOXCOX-INV-1 (2026-06-12): mirrors R's `forecast::InvBoxCox` signed-
+// power convention, `sign(xx)·|xx|^(1/λ)` with xx = λ·y+1. The previous
+// plain `Pow(xx, 1/λ)` diverged whenever xx < 0 — which happens on the
+// LOWER prediction-interval bound of a Box-Cox model: NaN for
+// fractional 1/λ, silently wrong SIGN when 1/λ lands on an even
+// integer (λ=0.5: Pow(-0.5, 2) = +0.25 vs R's -0.25). For λ < 0, R
+// additionally marks y > -1/λ as NA (the inverse is undefined there);
+// we emit NaN for that region.
 func boxCoxInvertInto(dst, y []float64, lam1, lam2 float64) {
 	if math.Abs(lam1) < 1e-12 {
 		for i, v := range y {
@@ -46,8 +55,13 @@ func boxCoxInvertInto(dst, y []float64, lam1, lam2 float64) {
 		}
 		return
 	}
+	invLam := 1 / lam1
 	for i, v := range y {
-		num := v*lam1 + 1
-		dst[i] = math.Pow(num, 1/lam1) - lam2
+		if lam1 < 0 && v > -invLam {
+			dst[i] = math.NaN()
+			continue
+		}
+		xx := v*lam1 + 1
+		dst[i] = math.Copysign(math.Pow(math.Abs(xx), invLam), xx) - lam2
 	}
 }

@@ -1038,14 +1038,15 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		return best, nil
 	}
 
-	// Stepwise neighbor exploration. Use gradientBudget(1) for the
-	// sequential initial fit so opts.GradientWorkers (when set) also
-	// propagates to the case where stepwise stops at the seed (e.g.
-	// the H-K initial-seed pick is already a local optimum). Pre-fix,
-	// passing 0 here meant the initial fit's ARIMA got
-	// GradientWorkers=0 → fell through to GOMAXPROCS at Fit time,
-	// dropping the user's override.
-	best, bestScore, err := tryOrder(p, q, P, Q, gradientBudget(1))
+	// Stepwise neighbor exploration. Pass opts.GradientWorkers directly
+	// (0 = let Fit default to full GOMAXPROCS) so a user override
+	// propagates to the case where stepwise stops at the seed, WITHOUT
+	// changing the no-override default. A 2026-06-12 fix briefly used
+	// gradientBudget(1) here, which forced the initial fit to a SERIAL
+	// gradient for everyone — a wall regression on large-n datasets
+	// (the initial fit is the only fit running; parallel gradients are
+	// strictly beneficial there, per STORM-1).
+	best, bestScore, err := tryOrder(p, q, P, Q, opts.GradientWorkers)
 	if err != nil {
 		if e := handleErr(err); e != nil {
 			return nil, fmt.Errorf("initial fit failed: %w", e)
@@ -1054,6 +1055,24 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		bestScore = math.Inf(1)
 	}
 	bestKey := orderKey{p, q, P, Q}
+
+	// PG-100b (2026-06-12): memoize intercept-toggle fits. The toggle
+	// step refits bestKey with the flipped intercept once per stepwise
+	// iteration; when bestKey is stable across iterations (the common
+	// case near convergence) the un-memoized form repeated the SAME
+	// full fit every iteration. Keyed by (orderKey, intercept) the
+	// entries stay valid across intercept flips — order + intercept
+	// fully determine the fit — so this cache is never cleared.
+	type toggleKey struct {
+		k         orderKey
+		intercept bool
+	}
+	type toggleVal struct {
+		mdl   *ARIMA
+		score float64
+		err   error
+	}
+	toggleCache := map[toggleKey]toggleVal{}
 
 	improved := true
 	for iter := 0; iter < opts.MaxSteps && improved; iter++ {
@@ -1139,10 +1158,13 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 
 		gradBudget := gradientBudget(nJobs)
 		if nJobs == 1 {
-			// Sequential — preserves zero goroutine overhead at small parallelism.
-			seqGrad := gradientBudget(1)
+			// Sequential — preserves zero goroutine overhead at small
+			// parallelism. opts.GradientWorkers passes a user override
+			// through; 0 lets each Fit default to full GOMAXPROCS
+			// (pre-2026-06-12 behavior — the brief gradientBudget(1)
+			// form here serialized gradients for explicit NJobs=1 runs).
 			for i, n := range neighbors {
-				cand, score, line, err := tryOrderTraced(n.p, n.q, n.P, n.Q, seqGrad)
+				cand, score, line, err := tryOrderTraced(n.p, n.q, n.P, n.Q, opts.GradientWorkers)
 				results[i] = stepResult{cand, score, line, err}
 			}
 		} else {
@@ -1211,7 +1233,13 @@ func AutoArima(y []float64, exog [][]float64, opts AutoArimaOpts) (*ARIMA, error
 		}
 		if toggleAllowed {
 			flipped := !withIntercept
-			toggleMdl, toggleScore, toggleErr := independentFit(bestKey, 0, flipped)
+			tk := toggleKey{bestKey, flipped}
+			tv, hit := toggleCache[tk]
+			if !hit {
+				tv.mdl, tv.score, tv.err = independentFit(bestKey, opts.GradientWorkers, flipped)
+				toggleCache[tk] = tv
+			}
+			toggleMdl, toggleScore, toggleErr := tv.mdl, tv.score, tv.err
 			if toggleErr == nil && toggleMdl != nil {
 				emit(fmt.Sprintf("ARIMA(%d,%d,%d)(%d,%d,%d)[%d] [intercept=%v] : score=%.4f",
 					bestKey.p, d, bestKey.q, bestKey.P, D, bestKey.Q, opts.M, flipped, toggleScore))
