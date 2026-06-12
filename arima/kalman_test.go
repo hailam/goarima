@@ -94,3 +94,64 @@ func BenchmarkKalmanLongNearUnit(b *testing.B) {
 	phi[1] = -0.6005 // roots just outside unit circle — never freezes
 	benchKalmanLong(b, phi)
 }
+
+// GARD-COL-1: the series-form column-0 solve must match Gardner's full
+// stationary covariance column to high precision across random models.
+func TestStationaryCovColumn0Parity(t *testing.T) {
+	rng := rand.New(rand.NewPCG(7, 77))
+	checked := 0
+	for trial := 0; trial < 80; trial++ {
+		p := rng.IntN(4)
+		q := rng.IntN(4)
+		if p+q == 0 {
+			p = 1
+		}
+		scale := 0.5
+		if trial%4 == 3 {
+			scale = 1.4
+		}
+		phi := make([]float64, p)
+		theta := make([]float64, q)
+		// PACF-style stationary draw.
+		mk := func(out []float64) {
+			cur := make([]float64, 0, len(out))
+			for j := range out {
+				a := math.Tanh(rng.NormFloat64() * scale)
+				next := make([]float64, j+1)
+				for i := 0; i < j; i++ {
+					next[i] = cur[i] - a*cur[j-1-i]
+				}
+				next[j] = a
+				cur = next
+			}
+			copy(out, cur)
+		}
+		mk(phi)
+		mk(theta)
+		r := p
+		if q+1 > r {
+			r = q + 1
+		}
+		if r < 3 {
+			continue
+		}
+		col := make([]float64, r)
+		vb := make([]float64, r)
+		tb := make([]float64, r)
+		if !stationaryCovColumn0Into(col, vb, tb, phi, theta, p, r) {
+			continue // slow-converging draw — fallback path, fine
+		}
+		checked++
+		full := PublicGardner(phi, theta)
+		for i := 0; i < r; i++ {
+			want := full[i][0]
+			if d := math.Abs(col[i] - want); d > 1e-9*(1+math.Abs(want)) {
+				t.Errorf("trial %d (p=%d q=%d r=%d) col[%d]: got %.14g want %.14g",
+					trial, p, q, r, i, col[i], want)
+			}
+		}
+	}
+	if checked < 20 {
+		t.Fatalf("only %d column solves converged — termination too strict", checked)
+	}
+}

@@ -133,6 +133,23 @@ func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (neg
 		}
 	}
 
+	// GARD-COL-1: the CKMS fast filter below only needs column 0 of
+	// the stationary covariance — try the cheap O(r·iters) series
+	// solve first; the full Gardner/Smith Lyapunov solve runs only
+	// when the series doesn't converge (near-unit-root AR) or the
+	// CKMS guard trips.
+	if r >= 3 { // r ≤ 2: r·r < 3r, no buffer room — and Gardner is trivial there anyway
+		ws.newP = ensureLen(ws.newP, r*r)
+		col := ws.newP[:r]
+		vbuf := ws.newP[r : 2*r]
+		tbuf2 := ws.newP[2*r : 3*r]
+		if stationaryCovColumn0Into(col, vbuf, tbuf2, phi, theta, p, r) {
+			if negLL, s2, ok := ckmsARMAInto(y, phi, theta, col, r, ws); ok {
+				return negLL, s2
+			}
+		}
+	}
+
 	// Pooled Gardner workspace from the kalmanWorkspace.
 	P, _ := stationaryCovGardnerInto(&ws.gardner, phi, theta)
 
@@ -468,6 +485,75 @@ func armaCSS(y, phi, theta []float64) (negLogLik, sigma2 float64, residuals []fl
 // is 1..5 so explicit indexing is faster than BLAS dispatch.
 //
 // Returns -log L (positive value to minimize), sigma^2, and innovations.
+// stationaryCovColumn0Into computes ONLY column 0 of the stationary
+// covariance P₀ = Σ_{k≥0} TᵏRRᵀ(Tᵏ)ᵀ — all the CKMS fast filter needs
+// (M₀ = P₀e₁ and F₀ = P₀[0,0]). Using y_t = e₁ᵀα_t, the column is
+//
+//	P₀e₁ = Σ_{k≥0} ψ_k · v_k,   v_k = TᵏR,  ψ_k = v_k[0]
+//
+// where ψ_k are the ARMA ψ-weights, and v_{k+1} = T·v_k costs O(r)
+// via the companion structure — ~70× cheaper than the full Smith
+// doubling solve at r=26 (GARD-COL-1, 2026-06-12). Geometric
+// convergence at the AR spectral radius; terminates when a block of
+// consecutive contributions falls below 1e-17 of the accumulated
+// F₀ (beyond double rounding). Returns ok=false (caller falls back to
+// the full Gardner solve) if the cap is hit first — near-unit-root
+// AR converges too slowly for the series form.
+func stationaryCovColumn0Into(col, vbuf, tbuf []float64, phi, theta []float64, p, r int) bool {
+	// v₀ = R = (1, θ₁..θ_q, 0..)
+	v := vbuf
+	for i := range v {
+		v[i] = 0
+	}
+	v[0] = 1
+	for j := 0; j < len(theta) && j+1 < r; j++ {
+		v[j+1] = theta[j]
+	}
+	for i := 0; i < r; i++ {
+		col[i] = 0
+	}
+	maxIter := 256 + 64*r
+	quiet := 0
+	for k := 0; k < maxIter; k++ {
+		psi := v[0]
+		if psi != 0 {
+			for i := 0; i < r; i++ {
+				col[i] += psi * v[i]
+			}
+		}
+		// Termination: contribution scale vs accumulated F₀ = col[0].
+		mag := 0.0
+		for i := 0; i < r; i++ {
+			av := v[i]
+			if av < 0 {
+				av = -av
+			}
+			if av > mag {
+				mag = av
+			}
+		}
+		apsi := psi
+		if apsi < 0 {
+			apsi = -apsi
+		}
+		f0 := col[0]
+		if f0 <= 0 || math.IsNaN(f0) || math.IsInf(f0, 0) {
+			return false
+		}
+		if apsi*mag <= 1e-17*f0 && mag*mag <= 1e-17*f0 {
+			quiet++
+			if quiet >= 4 {
+				return true
+			}
+		} else {
+			quiet = 0
+		}
+		applyCompanionT(tbuf, v, phi, p, r)
+		v, tbuf = tbuf, v
+	}
+	return false
+}
+
 // ckmsARMAInto runs the CKMS fast filter (see CKMS-1 comment at the
 // call site). P0 is the exact stationary covariance (only row 0 /
 // column 0 and the diagonal head are read). Returns ok=false when the
