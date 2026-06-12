@@ -175,9 +175,31 @@ func invertARTransform(phi []float64) []float64 {
 	}
 	out := make([]float64, p)
 	for i, a := range pacf {
-		out[i] = math.Atanh(a)
+		out[i] = clampedAtanh(a)
 	}
 	return out
+}
+
+// clampedAtanh maps a partial autocorrelation to the optimizer's
+// transformed space, clamping the OUTPUT to ±4 (tanh(4) ≈ 0.99933).
+//
+// HR-CLAMP-1 (2026-06-12): the previous input clamp to ±(1−1e-9)
+// produced atanh values of ±10.7 — a numerically DEAD coordinate for
+// the optimizer: sech²(10.7) ≈ 2e-9, so a central-difference step of
+// eps=1e-7 moves tanh(x) by ~2e-16 and the gradient is exactly zero
+// in that coordinate. Near-unit-root Hannan-Rissanen seeds (common on
+// persistent series like sunspot) handed BFGS a flat, unrecoverable
+// start. ±4 keeps the seed very persistent (|pacf| ≤ 0.99933) while
+// the coordinate stays alive (sech²(4) ≈ 1.3e-3).
+func clampedAtanh(a float64) float64 {
+	v := math.Atanh(a)
+	if v > 4 {
+		return 4
+	}
+	if v < -4 {
+		return -4
+	}
+	return v
 }
 
 // invertMATransform inverts the MA partial-autocorrelation transformation.
@@ -213,7 +235,7 @@ func invertMATransform(theta []float64) []float64 {
 	}
 	out := make([]float64, q)
 	for i, a := range pacf {
-		out[i] = math.Atanh(a)
+		out[i] = clampedAtanh(a)
 	}
 	return out
 }
