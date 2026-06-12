@@ -1,6 +1,7 @@
 package arima
 
 import (
+	"math"
 	"math/rand/v2"
 	"testing"
 )
@@ -121,11 +122,16 @@ func TestKalmanARMALikelihoodInto_Equivalence(t *testing.T) {
 		wantNeg, wantSig, _ := kalmanARMALikelihood(y, phi, theta)
 		gotNeg, gotSig := kalmanARMALikelihoodInto(y, phi, theta, &scratch.kalman)
 
-		if gotNeg != wantNeg {
+		// CKMS-1 (2026-06-12): Into now runs the Chandrasekhar fast
+		// filter — algebraically identical to the legacy Riccati loop
+		// but a different float-op ordering, so the old bit-exact
+		// contract no longer holds. Observed deltas are ulp-level
+		// (~3e-14 absolute); assert a 1e-10 relative bound.
+		if d := math.Abs(gotNeg - wantNeg); d > 1e-10*(1+math.Abs(wantNeg)) {
 			t.Errorf("trial %d (p=%d q=%d n=%d): negLL got %g want %g (Δ=%g)",
 				trial, p, q, n, gotNeg, wantNeg, gotNeg-wantNeg)
 		}
-		if gotSig != wantSig {
+		if d := math.Abs(gotSig - wantSig); d > 1e-10*(1+math.Abs(wantSig)) {
 			t.Errorf("trial %d: sigma² got %g want %g", trial, gotSig, wantSig)
 		}
 	}

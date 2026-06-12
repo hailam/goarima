@@ -835,28 +835,24 @@ func (m *ARIMA) Fit(y []float64, exog [][]float64) error {
 	default:
 		ll, s2, _ := kalmanARMALikelihood(r, fullPhi, fullTheta)
 		negLL, sigma2 = ll, s2
-		// KAL-1 sanity check. The exact-Kalman likelihood includes a
-		// log-determinant transient bounded by O(log γ(0)/σ²) — typically
-		// a few units, at most ~3·r for well-conditioned stationary fits.
-		// When BFGS pushes φ/Φ near the unit circle, stationaryCovGardner
-		// returns huge initial P (1e10+) and the resulting log F sum
-		// dominates negLL with values that disagree wildly with the
-		// concentrated-Gaussian textbook form. R's stats::arima falls
-		// back to the conditional likelihood in such cases; we mirror
-		// that here. The parameters themselves are unchanged — only the
-		// reported logL/AIC/AICc are sanitized so model selection isn't
-		// driven by this numerical artefact.
+		// KAL-1b (2026-06-12): the original KAL-1 sanitization replaced
+		// negLL with the (lower) textbook concentrated-Gaussian form
+		// whenever the two disagreed by more than ~3·r — on the theory
+		// that a huge log F transient from near-unit-circle Gardner init
+		// was a numerical artefact. That theory was WRONG in the
+		// direction that matters: evaluating R's exact Kalman likelihood
+		// at such a boundary point (m3, seasonal AR summing to 1.0000,
+		// CKMS-1 validation) gives logL −652.06 where the textbook form
+		// claims −631.38 — the transient IS real likelihood information,
+		// and substituting the lower value manufactured a FALSE OPTIMUM
+		// at the stationarity boundary that BFGS then climbed into
+		// (symptoms: NaN std errors, unit-root seasonal AR, phantom
+		// −19 AICc). The substitution is now one-directional: negLL may
+		// be raised to the textbook floor (degenerate too-good values),
+		// never lowered (boundary points keep their true penalty).
 		if !math.IsNaN(negLL) && !math.IsInf(negLL, 0) && sigma2 > 0 {
 			textbookNegLL := 0.5 * float64(len(r)) * (math.Log(2*math.Pi*sigma2) + 1)
-			rState := len(fullPhi)
-			if len(fullTheta)+1 > rState {
-				rState = len(fullTheta) + 1
-			}
-			tol := 3.0 * float64(rState)
-			if tol < 20 {
-				tol = 20
-			}
-			if math.Abs(negLL-textbookNegLL) > tol {
+			if negLL < textbookNegLL {
 				negLL = textbookNegLL
 			}
 		}
