@@ -156,7 +156,64 @@ func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (neg
 	// reads come from Gardner's full output (which is symmetric anyway).
 	// Reads of "first column" P[i, 0] are remapped to P[0, i] by symmetry.
 
+	// SS-KALMAN-1 (2026-06-12): steady-state freeze. For a stationary,
+	// invertible ARMA (transparams guarantees both), the predicted
+	// covariance P converges to the fixed point of the Riccati
+	// recursion; from then on F = P[0,0] and K are constants and the
+	// O(r²) Joseph-update + P-predict work is pure waste — only the
+	// O(r) state-mean recursion still depends on t. We detect
+	// convergence with a bit-tight relative test (max |ΔP| over the
+	// upper triangle ≤ 1e-14·(1+max|P|) on two consecutive steps —
+	// statsmodels uses the same construct with tolerance=1e-19) and
+	// then freeze K, log F, and 1/F. Likelihood impact is bounded by
+	// the tolerance (≪ 1e-9 cumulative over n in the worst case);
+	// near-unit-root candidates simply never satisfy the test and run
+	// the full recursion as before. Mirrors statsmodels'
+	// KalmanFilter.converged shortcut (Harvey 1989 §3.3.3).
+	// Freeze requires EXACT bitwise stability of the predicted
+	// covariance across consecutive steps (ssRelTol = 0): at a bitwise
+	// fixed point the unfrozen recursion would reproduce P, K, F, and
+	// the per-step logF/sumVF contributions exactly, so the frozen
+	// shortcut is bit-identical to the full loop (the Into-vs-legacy
+	// equivalence test stays bit-exact). A 1e-14 relative tolerance
+	// was tried first: it froze earlier but leaked ~1e-13 likelihood
+	// drift, which both broke bit-exactness and wiggled BFGS
+	// trajectories (±5 AICc on m5-family picks). Contracting Riccati
+	// maps in float64 typically reach an exact fixed point; if one
+	// settles into a 1-2 ulp limit cycle instead, the freeze simply
+	// never fires and the full recursion runs as before.
+	const ssRelTol = 0.0
+	frozen := false
+	ssArmed := false // prev full upper-triangle snapshot is valid
+	ssStable := 0
+	var ssInvF, ssLogF float64
+	ssPrevTop := make([]float64, r)  // previous PREDICTED top row
+	ssPrevP := []float64(nil)        // previous PREDICTED upper triangle (lazily allocated)
+	copy(ssPrevTop, P[:r])
+
 	for t := 0; t < n; t++ {
+		if frozen {
+			v := y[t] - a[0]
+			for i := 0; i < r; i++ {
+				a[i] += K[i] * v
+			}
+			// Predict step for the state mean only (companion shift +
+			// phi broadcast) — same algebra as the full path below.
+			a0 := a[0]
+			for i := 0; i+1 < r; i++ {
+				newA[i] = a[i+1]
+			}
+			newA[r-1] = 0
+			for i := 0; i < p; i++ {
+				if pi := phi[i]; pi != 0 {
+					newA[i] += pi * a0
+				}
+			}
+			copy(a, newA)
+			logF += ssLogF
+			sumVF += v * v * ssInvF
+			continue
+		}
 		v := y[t] - a[0]
 		F := P[0]
 		if F <= 0 || math.IsNaN(F) {
@@ -247,6 +304,87 @@ func kalmanARMALikelihoodInto(y, phi, theta []float64, ws *kalmanWorkspace) (neg
 			}
 		}
 		P, newP = newP, P
+
+		// SS-KALMAN-1 convergence test, two-tier so the never-freezing
+		// case (near-unit-root candidates — common among auto.arima
+		// survivors) pays ~nothing. Compares the PREDICTED covariance
+		// entering step t+1 against the predicted covariance that
+		// entered step t (NOT against `newP`, which after the in-place
+		// Joseph update + swap holds this step's FILTERED matrix — a
+		// different fixed point; a v1 that compared against it never
+		// fired). Tier 1: O(r) top-row gate vs a retained copy. Tier 2:
+		// once the gate passes, snapshot the full upper triangle and
+		// require two consecutive full-matrix matches.
+		gate := true
+		for i := 0; i < r; i++ {
+			d := P[i] - ssPrevTop[i]
+			if d < 0 {
+				d = -d
+			}
+			av := P[i]
+			if av < 0 {
+				av = -av
+			}
+			if d > ssRelTol*(1+av) {
+				gate = false
+				break
+			}
+		}
+		copy(ssPrevTop, P[:r])
+		if !gate {
+			ssArmed = false
+			ssStable = 0
+			continue
+		}
+		if ssPrevP == nil {
+			ssPrevP = make([]float64, r*r)
+		}
+		if !ssArmed {
+			for i := 0; i < r; i++ {
+				off := i * r
+				copy(ssPrevP[off+i:off+r], P[off+i:off+r])
+			}
+			ssArmed = true
+			continue
+		}
+		full := true
+		for i := 0; i < r && full; i++ {
+			off := i * r
+			for j := i; j < r; j++ {
+				d := P[off+j] - ssPrevP[off+j]
+				if d < 0 {
+					d = -d
+				}
+				av := P[off+j]
+				if av < 0 {
+					av = -av
+				}
+				if d > ssRelTol*(1+av) {
+					full = false
+					break
+				}
+			}
+		}
+		for i := 0; i < r; i++ {
+			off := i * r
+			copy(ssPrevP[off+i:off+r], P[off+i:off+r])
+		}
+		if !full {
+			ssStable = 0
+			continue
+		}
+		ssStable++
+		if ssStable >= 2 {
+			F := P[0]
+			if F > 0 && !math.IsNaN(F) {
+				ssInvF = 1.0 / F
+				ssLogF = math.Log(F)
+				for i := 0; i < r; i++ {
+					K[i] = P[i] * ssInvF
+				}
+				frozen = true
+			}
+		}
 	}
 
 	if sumVF <= 0 {
